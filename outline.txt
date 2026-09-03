@@ -1,0 +1,13 @@
+ship5/
+├── __init__.py     # controls docstring
+├── __main__.py     # entry point: pygame setup + main loop
+├── config.py       # all tuning knobs + colors (one place to tweak feel)
+├── ship.py         # Ship
+├── asteroid.py     # Asteroid
+├── enemy.py        # EnemyShip
+├── bullets.py      # Bullet, EnemyBullet
+├── particles.py    # Particle, burst()
+├── spawning.py     # spawn_wave, spawn_enemy, make_stars
+├── fog.py          # light texture + fog-of-war rendering
+├── hud.py          # HUD + game-over screen
+└── game.py         # Game class: state, collisions, update/draw

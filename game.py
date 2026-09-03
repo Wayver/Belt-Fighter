@@ -199,10 +199,15 @@ class Game:
                     break
 
 
-        # enemy bullet vs ship
+        # enemy bullet vs ship (shield surface if up, else hull)
         if self.protect_timer <= 0:
             for b in self.enemy_bullets[:]:
-                if b.pos.distance_to(self.ship.pos) < SHIP_RADIUS + 4:
+                if self.ship.shield_on:
+                    if self.ship.shield_contains(b.pos):
+                        self.enemy_bullets.remove(b)
+                        if not self._handle_ship_hit(b.pos):
+                            break
+                elif b.pos.distance_to(self.ship.pos) < SHIP_RADIUS + 4:
                     self.enemy_bullets.remove(b)
                     if not self._handle_ship_hit(b.pos):
                         break

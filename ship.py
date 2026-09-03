@@ -91,6 +91,7 @@ class Ship:
         self.shield_charge = (self.shield_comp.shield_max_charge
                               if self.shield_comp else 0.0)
         self.shield_dump = 0.0
+        self.shield_clock = 0.0
 
         # Phase 2: power/compute budgets, derived from the fitted parts
         self.power_supply = sum(c.power_supply for c in self.components.values())
@@ -139,6 +140,15 @@ class Ship:
         dx, dy = d.dot(fwd), d.dot(right)
         t = 1.0 / math.sqrt((dx / SHIELD_OVAL_A) ** 2 + (dy / SHIELD_OVAL_B) ** 2)
         return self.pos + fwd * (t * dx) + right * (t * dy)
+
+    def shield_contains(self, world_pos):
+        """True if world_pos is inside the shield oval."""
+        if self.shield_comp is None:
+            return False
+        d = world_pos - self.pos
+        fwd, right = self.axes()
+        lx, ly = d.dot(fwd), d.dot(right)
+        return (lx / SHIELD_OVAL_A) ** 2 + (ly / SHIELD_OVAL_B) ** 2 <= 1.0
 
     def axes(self):
         fwd = pygame.Vector2(math.cos(self.angle), math.sin(self.angle))
@@ -312,7 +322,11 @@ class Ship:
                                      self.shield_charge
                                      + self.shield_comp.shield_recharge_rate * dt)
         if self.shield_dump > 0:
+            self.shield_clock += dt
             self.shield_dump = max(0.0, self.shield_dump - SHIELD_DUMP_DECAY * dt)
+        else:
+            self.shield_clock = 0.0
+
 
     def register_hit(self):
         """Register a hit on the shield. Returns True if it absorbed the hit."""
@@ -326,6 +340,7 @@ class Ship:
         if self.shield_comp is not None:
             self.shield_charge = self.shield_comp.shield_max_charge
             self.shield_dump = 0.0
+            self.shield_clock = 0.0
 
 
     # --- rendering (reads geometry from self.hull) ---
@@ -379,14 +394,20 @@ class Ship:
         pygame.draw.line(screen, FLAME_IN, base, base + (tip - base) * 0.5, 1)
 
     def _draw_shield(self, screen, cam, pos, angle):
-        """Draw the shield oval: faint when armed, flashing bright after a hit."""
-        if self.shield_comp is None or not self.shield_on:
+        """Draw the shield flash: invisible until hit, then flashes + flickers."""
+        if self.shield_comp is None or self.shield_dump <= 0:
             return
         fwd = pygame.Vector2(math.cos(angle), math.sin(angle))
         right = pygame.Vector2(-fwd.y, fwd.x)
-        flash = min(1.0, self.shield_dump / self.shield_comp.power_hit)
-        color = _lerp_color(SHIELD_COLOR_DIM, SHIELD_COLOR_BRIGHT,
-                            0.35 + 0.65 * flash)
+        # envelope: 1 at the hit, decays to 0 over the dump
+        env = min(1.0, self.shield_dump / self.shield_comp.power_hit)
+        # flicker: ~6Hz oscillation with a little per-frame jitter
+        flicker = 0.6 + 0.4 * math.sin(self.shield_clock * 40.0)
+        flicker *= (0.8 + 0.2 * random.random())
+        alpha = env * flicker
+        if alpha <= 0.02:
+            return
+        color = _lerp_color(SHIELD_COLOR_DIM, SHIELD_COLOR_BRIGHT, alpha)
         pts = []
         for i in range(32):
             th = 2 * math.pi * i / 32

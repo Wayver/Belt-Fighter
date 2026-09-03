@@ -40,6 +40,13 @@ SPAWN_PROTECT = 3.5      # seconds of shield after (re)start
 
 SHIELD_DUMP_DECAY = 50.0  # power/s, rate the hit-dump decays
 
+# --- shield visual ---
+SHIELD_OVAL_A = 24.0    # oval semi-axis along ship length (local x)
+SHIELD_OVAL_B = 16.0    # oval semi-axis across ship (local y)
+SHIELD_COLOR_DIM = (50, 100, 170)
+SHIELD_COLOR_BRIGHT = (120, 200, 255)
+SHIELD_SPARK_COLORS = [(120, 200, 255), (180, 230, 255), (255, 255, 255)]
+
 # --- asteroid knobs ---
 ROCK_SIZES = {
     'large':  {'radius': 50, 'score': 20,  'speed': (20, 60),  'spin': (0.2, 0.8)},

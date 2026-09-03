@@ -4,7 +4,7 @@ import random
 
 import pygame
 
-from .config import PARTICLE_COLORS
+from .config import PARTICLE_COLORS, SHIELD_SPARK_COLORS
 
 
 class Particle:
@@ -34,3 +34,12 @@ def burst(particles, pos, radius, big=False):
         vel = pygame.Vector2(math.cos(a) * speed, math.sin(a) * speed)
         particles.append(Particle(pos, vel, random.choice(PARTICLE_COLORS),
                                   random.uniform(0.4, 0.9)))
+
+def shield_burst(particles, pos, n=16):
+    """Blue spark burst where a projectile hits the shield."""
+    for _ in range(n):
+        a = random.uniform(0, 2 * math.pi)
+        speed = random.uniform(60, 200)
+        vel = pygame.Vector2(math.cos(a) * speed, math.sin(a) * speed)
+        particles.append(Particle(pos, vel, random.choice(SHIELD_SPARK_COLORS),
+                                  random.uniform(0.3, 0.6)))

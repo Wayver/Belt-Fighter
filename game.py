@@ -19,7 +19,7 @@ from .ship import Ship
 from .intent import ShipInput
 from .asteroid import Asteroid
 from .bullets import Bullet
-from .particles import burst
+from .particles import burst, shield_burst
 from .spawning import spawn_enemy, make_stars, update_field
 from .fog import draw_fog
 from .hud import draw_hud, draw_game_over
@@ -138,15 +138,15 @@ class Game:
         if not self.game_over:
             self._collisions()
 
-    def _handle_ship_hit(self):
+    def _handle_ship_hit(self, source_pos):
         """Handle a hit on the ship. Returns True if the ship survives."""
         if self.ship.register_hit():
-            burst(self.particles, self.ship.pos, 10)
+            impact = self.ship.shield_impact_point(source_pos)
+            shield_burst(self.particles, impact)
             return True
         self.game_over = True
         burst(self.particles, self.ship.pos, 30, big=True)
         return False
-
 
     def _collisions(self):
         # player bullet vs enemy
@@ -198,27 +198,29 @@ class Game:
                     self.enemy_bullets.remove(b)
                     break
 
+
         # enemy bullet vs ship
         if self.protect_timer <= 0:
             for b in self.enemy_bullets[:]:
                 if b.pos.distance_to(self.ship.pos) < SHIP_RADIUS + 4:
                     self.enemy_bullets.remove(b)
-                    if not self._handle_ship_hit():
+                    if not self._handle_ship_hit(b.pos):
                         break
 
         # ship vs enemy (ram)
         if self.protect_timer <= 0 and not self.game_over:
             for e in self.enemies:
                 if self.ship.pos.distance_to(e.pos) < ENEMY_RADIUS + SHIP_RADIUS:
-                    if not self._handle_ship_hit():
+                    if not self._handle_ship_hit(e.pos):
                         break
 
         # ship vs asteroid
         if self.protect_timer <= 0 and not self.game_over:
             for a in self.asteroids:
                 if self.ship.pos.distance_to(a.pos) < a.collision_radius + SHIP_RADIUS:
-                    if not self._handle_ship_hit():
+                    if not self._handle_ship_hit(a.pos):
                         break
+
 
         # enemy vs asteroid (rocks are hazards for everyone)
         for i, e in enumerate(self.enemies[:]):

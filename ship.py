@@ -31,7 +31,9 @@ import pygame
 from .config import (WIDTH, HEIGHT, ROT_SPEED, MAX_SPEED,
                      STOP_GAIN, MAX_STOP_ACCEL, STOP_DEADBAND,
                      SHIP_COLOR, SHIP_EDGE, FLAME_OUT, FLAME_IN,
-                     POWER_HYSTERESIS, AUTO_STOP_COMPUTE, SHIELD_DUMP_DECAY)
+                     POWER_HYSTERESIS, AUTO_STOP_COMPUTE, SHIELD_DUMP_DECAY,
+                     SHIELD_OVAL_A, SHIELD_OVAL_B, SHIELD_COLOR_DIM,
+                     SHIELD_COLOR_BRIGHT)
 
 from .hulls import DEFAULT_HULL, default_loadout, Slot, ComponentType
 
@@ -57,6 +59,12 @@ class Thruster:
     allocation: float = 1.0
     force: float = 0.0
 
+def _lerp_color(c1, c2, t):
+    return tuple(int(c1[i] + (c2[i] - c1[i]) * t) for i in range(3))
+
+
+def _dim_color(c, f):
+    return tuple(int(ch * f) for ch in c)
 
 class Ship:
     def __init__(self, ship_id=0, hull=None, loadout=None):
@@ -119,6 +127,19 @@ class Ship:
     def shield_on(self):
         return self.shield_comp is not None and self.shield_charge > 0
 
+    def shield_impact_point(self, world_pos):
+        """Point on the shield oval in the direction of world_pos."""
+        if self.shield_comp is None:
+            return world_pos
+        d = world_pos - self.pos
+        if d.length_squared() < 1e-6:
+            return self.pos
+        d = d.normalize()
+        fwd, right = self.axes()
+        dx, dy = d.dot(fwd), d.dot(right)
+        t = 1.0 / math.sqrt((dx / SHIELD_OVAL_A) ** 2 + (dy / SHIELD_OVAL_B) ** 2)
+        return self.pos + fwd * (t * dx) + right * (t * dy)
+
     def axes(self):
         fwd = pygame.Vector2(math.cos(self.angle), math.sin(self.angle))
         right = pygame.Vector2(-fwd.y, fwd.x)
@@ -151,6 +172,7 @@ class Ship:
         self.prev_pos = self.pos.copy()
         self.prev_angle = self.angle
         self.dampening = inp.stop
+        self._update_shield(dt)
         self._apply_rotation(dt, inp)
         self._set_demands(inp)
         self._allocate()
@@ -346,6 +368,8 @@ class Ship:
                 nx, ny = slot.position
                 pygame.draw.circle(screen, SHIP_EDGE, cam.to_screen(w(nx, ny)), 3)
 
+        self._draw_shield(screen, cam, pos, angle)
+
     def _flame(self, screen, cam, fwd, right, base_world, dx, dy, mag,
                scale=1.0, width=3):
         base = cam.to_screen(base_world)
@@ -353,3 +377,21 @@ class Ship:
         tip = base + fwd * (dx * length) + right * (dy * length)
         pygame.draw.line(screen, FLAME_OUT, base, tip, width)
         pygame.draw.line(screen, FLAME_IN, base, base + (tip - base) * 0.5, 1)
+
+    def _draw_shield(self, screen, cam, pos, angle):
+        """Draw the shield oval: faint when armed, flashing bright after a hit."""
+        if self.shield_comp is None or not self.shield_on:
+            return
+        fwd = pygame.Vector2(math.cos(angle), math.sin(angle))
+        right = pygame.Vector2(-fwd.y, fwd.x)
+        flash = min(1.0, self.shield_dump / self.shield_comp.power_hit)
+        color = _lerp_color(SHIELD_COLOR_DIM, SHIELD_COLOR_BRIGHT,
+                            0.35 + 0.65 * flash)
+        pts = []
+        for i in range(32):
+            th = 2 * math.pi * i / 32
+            world = pos + fwd * (SHIELD_OVAL_A * math.cos(th)) \
+                         + right * (SHIELD_OVAL_B * math.sin(th))
+            pts.append(cam.to_screen(world))
+        pygame.draw.polygon(screen, _dim_color(color, 0.5), pts, 5)  # glow
+        pygame.draw.polygon(screen, color, pts, 2)                   # core

@@ -28,6 +28,8 @@ from dataclasses import dataclass
 
 import pygame
 
+from .bullets import Shot
+
 from .config import (WIDTH, HEIGHT, ROT_SPEED, MAX_SPEED,
                      STOP_GAIN, MAX_STOP_ACCEL, STOP_DEADBAND,
                      SHIP_COLOR, SHIP_EDGE, FLAME_OUT, FLAME_IN,
@@ -59,6 +61,18 @@ class Thruster:
     allocation: float = 1.0
     force: float = 0.0
 
+@dataclass
+class Weapon:
+    """Runtime state for one fitted weapon (one per weapon slot).
+
+    cooldown:   seconds until it can fire again
+    allocation: 0..1 power allocation this tick (0 = can't fire)
+    """
+    slot: Slot
+    comp: ComponentType
+    cooldown: float = 0.0
+    allocation: float = 1.0
+
 def _lerp_color(c1, c2, t):
     return tuple(int(c1[i] + (c2[i] - c1[i]) * t) for i in range(3))
 
@@ -80,6 +94,15 @@ class Ship:
                 t = Thruster(slot, self.components[slot.name])
                 self.thrusters.append(t)
                 self.thrusters_by_name[slot.name] = t
+        # runtime weapon instances (weapon slots only)
+        self.weapons = []
+        self.weapons_by_name = {}
+        for slot in self.hull.slots:
+            if slot.slot_type == 'weapon' and slot.name in self.components:
+                w = Weapon(slot, self.components[slot.name])
+                self.weapons.append(w)
+                self.weapons_by_name[slot.name] = w
+
         # shield runtime state
         self.shield_slot = None
         self.shield_comp = None
@@ -178,16 +201,22 @@ class Ship:
     # --- simulation: per-thruster pipeline ---
 
     def update(self, dt, inp):
-        """Advance one fixed timestep. dt must be the fixed step size."""
+        """Advance one fixed timestep. dt must be the fixed step size.
+
+        Returns the list of Shot events fired this tick (world pos/vel +
+        owner id); the caller routes them into its bullet lists.
+        """
         self.prev_pos = self.pos.copy()
         self.prev_angle = self.angle
         self.dampening = inp.stop
         self._update_shield(dt)
         self._apply_rotation(dt, inp)
         self._set_demands(inp)
-        self._allocate()
+        self._allocate(inp)
         accel = self._resolve_forces()
+        shots = self._fire(dt, inp)
         self._integrate(dt, accel)
+        return shots
 
     def _apply_rotation(self, dt, inp):
         self.angle += inp.turn * ROT_SPEED * dt
@@ -247,7 +276,7 @@ class Ship:
         for t in aligned:
             t.demand = max(t.demand, d)
 
-    def _allocate(self):
+    def _allocate(self,inp):
         """Resolve each thruster's allocation (0..1) from power/compute.
 
         Power: fixed priority with a latched brownout. When total demand
@@ -261,6 +290,7 @@ class Ship:
         # --- power ---
         idle = sum(c.power_idle for c in self.components.values())
         active = [(t, t.comp.power_active * t.demand) for t in self.thrusters]
+        active += [(w, w.comp.power_active) for w in self.weapons if inp.fire]
         shield_active = 0.0
         if self.shield_on:
             shield_active = self.shield_comp.power_active + self.shield_dump
@@ -279,6 +309,8 @@ class Ship:
         else:
             for t in self.thrusters:
                 t.allocation = 1.0
+            for w in self.weapons:
+                w.allocation = 1.0
 
         # --- compute (guidance) ---
         comp_demand = sum(t.comp.compute_demand * t.demand for t in self.thrusters)
@@ -304,6 +336,26 @@ class Ship:
                 self.flame_mags[t.slot.flame_key] = max(
                     self.flame_mags.get(t.slot.flame_key, 0.0), mag)
         return accel
+
+    def _fire(self, dt, inp):
+        """Execution stage: tick weapon cooldowns, fire ready weapons.
+
+        A weapon fires when the input is held, its cooldown has elapsed,
+        and it has power allocation. The cooldown advances only for shots
+        that actually fire, so a ship that can't fire (capped by the
+        caller, or browned out) fires the instant it can.
+        """
+        shots = []
+        for w in self.weapons:
+            w.cooldown -= dt
+            if inp.fire and w.cooldown <= 0 and w.allocation > 0:
+                fwd, right = self.axes()
+                ox, oy = w.slot.orientation
+                vel = (fwd * ox + right * oy) * w.comp.bullet_speed
+                shots.append(Shot(self.to_world(*w.slot.position), vel, self.id))
+                w.cooldown = w.comp.fire_cooldown
+        return shots
+
 
     def _integrate(self, dt, accel):
         self.vel += accel * dt

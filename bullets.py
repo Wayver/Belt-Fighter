@@ -2,6 +2,19 @@
 import pygame
 from .config import BULLET_LIFE, ENEMY_BULLET_LIFE
 
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Shot:
+    """A fired projectile in world space.
+
+    Produced by Ship._fire(); the Game routes it into the right bullet
+    list (player vs enemy). The ship stays agnostic of bullet classes.
+    """
+    pos: pygame.Vector2
+    vel: pygame.Vector2
+    owner: int
+
 
 class Bullet:
     def __init__(self, pos, vel, owner=0):

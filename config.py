@@ -59,7 +59,7 @@ STARTING_WAVE = 2        # large rocks in wave 1; +1 per wave
 # --- enemy ship knobs ---
 ENEMY_ACCEL = 240.0
 ENEMY_MAX_SPEED = 500.0
-ENEMY_ROT_SPEED = 3.4
+ENEMY_ROT_SPEED = 5.4
 ENEMY_RADIUS = 11.0
 ENEMY_HP = 1
 ENEMY_SCORE = 250
@@ -67,7 +67,7 @@ ENEMY_BULLET_SPEED = 720.0
 ENEMY_BULLET_LIFE = 1.5
 ENEMY_FIRE_COOLDOWN = .15
 ENEMY_FIRE_SPREAD = 0.16
-ENEMY_ENGAGE_RANGE = 1200.0  # only chase/fire within this range
+ENEMY_ENGAGE_RANGE = 2400.0  # only chase/fire within this range
 ENEMY_ORBIT_OFFSET = 140.0  # aim offset so it circles instead of ramming
 ENEMY_AVOID_RADIUS = 400.0  # how far ahead the enemy "sees" rocks
 ENEMY_AVOID_WEIGHT = 3.2    # strength of the avoidance steering

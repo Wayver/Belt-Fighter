@@ -8,11 +8,12 @@ Networked-ready:
 """
 import math
 import random
+from dataclasses import replace
 
 import pygame
 
 from .config import (WIDTH, HEIGHT, SHIP_RADIUS, SPAWN_PROTECT, MAX_BULLETS,
-                     BULLET_SPEED, FIRE_COOLDOWN, ENEMY_RADIUS, ENEMY_SCORE,
+                     ENEMY_RADIUS, ENEMY_SCORE,
                      ROCK_SPLIT, ROCK_SIZES, BG, STAR_COLOR,
                      BULLET_COLOR, ENEMY_BULLET_COLOR, WAVE_INTERVAL)
 from .ship import Ship
@@ -56,7 +57,6 @@ class Game:
         self.wave_timer = 0.0
         self.game_over = False
         self.protect_timer = SPAWN_PROTECT
-        self.fire_timer = 0.0
         self.acc = 0.0
 
         self.reset()
@@ -82,6 +82,7 @@ class Game:
         self.cam.pos = self.ship.pos.copy()
         update_field(self.asteroids, [self.ship.pos], self.wave, 0)
         spawn_enemy(self.enemies, self.ship)
+        spawn_enemy(self.enemies, self.ship)
 
     def handle_events(self):
         """Returns False when the window should close."""
@@ -105,18 +106,16 @@ class Game:
 
     def _step(self, dt, inp):
         if not self.game_over:
-            self.ship.update(dt, inp)
+            if inp.fire and len(self.bullets) >= MAX_BULLETS:
+                inp = replace(inp, fire=False)   # world cap: no room, no shot
+            for shot in self.ship.update(dt, inp):
+                self.bullets.append(Bullet(shot.pos, shot.vel, owner=shot.owner))
             self.protect_timer -= dt
-            self.fire_timer -= dt
-            self.wave_timer += dt
+            self.wave_timer += dt           
             if self.wave_timer >= WAVE_INTERVAL:
                 self.wave_timer = 0.0
                 self.wave += 1
             update_field(self.asteroids, [self.ship.pos], self.wave, dt)
-            if inp.fire and self.fire_timer <= 0 and len(self.bullets) < MAX_BULLETS:
-                fwd, _ = self.ship.axes()
-                self.bullets.append(Bullet(self.ship.to_world(*self.ship.muzzle), fwd * BULLET_SPEED))
-                self.fire_timer = FIRE_COOLDOWN
             for e in self.enemies:
                 e.update(dt, self.ship, self.enemy_bullets, self.asteroids)
 

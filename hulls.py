@@ -17,7 +17,7 @@ the tuning surface.
 """
 from dataclasses import dataclass
 
-from .config import SHIP_ACCEL
+from .config import SHIP_ACCEL, FIRE_COOLDOWN, BULLET_SPEED
 
 
 @dataclass(frozen=True)
@@ -83,6 +83,8 @@ class ComponentType:
     power_hit: float = 0.0
     shield_max_charge: float = 0.0
     shield_recharge_rate: float = 0.0
+    fire_cooldown: float = 0.0   # seconds between shots
+    bullet_speed: float = 0.0    # px/s, expressed off config below
 
 
 # --- The current ship, as data ---
@@ -139,7 +141,7 @@ DEFAULT_HULL = HullType(
 ## Stock power/compute budget (deliberately generous — feel must not change):
 #   power idle:   2*1 + 1 + 2*1 + 2 + 5 + 2 = 14
 #   power steady: + 10 (shield) = 24 at rest
-#   power max:    + 2*20 + 15 + 2*5 = 89  (of 100)  -> never brownouts
+#   power max:    + 2*20 + 15 + 2*5 + 5 = 94  (of 100)  -> never brownouts
 #   hit dump:     + 25 (transient, decays 50/s) -> brief brownout at full thrust
 #
 # Priority: RCS (1) is fine control near rocks, mains (2) propulsion,
@@ -155,9 +157,11 @@ RCS           = ComponentType('rcs', 'RCS', ('thruster',),
                               power_idle=1.0, power_active=5.0,
                               compute_demand=5.0, priority=1)
 GUN_TYPE      = ComponentType('gun', 'Pulse Gun', ('weapon',), mass=1.0,
-                              power_idle=2.0)
+                              power_idle=2.0, power_active=5.0,
+                              fire_cooldown=FIRE_COOLDOWN,
+                              bullet_speed=BULLET_SPEED, priority=2)
 REACTOR_TYPE  = ComponentType('reactor', 'Reactor', ('reactor',),
-                              mass=3.0, power_supply=100.0)
+                              mass=3.0, power_supply=70.0)
 COMPUTER_TYPE = ComponentType('computer', 'Computer', ('computer',),
                               mass=2.0, compute_supply=50.0)
 SHIELD_TYPE = ComponentType('shield', 'Shield', ('shield',),

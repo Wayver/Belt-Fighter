@@ -29,10 +29,11 @@ class Bullet:
 
 
 class EnemyBullet:
-    def __init__(self, pos, vel):
+    def __init__(self, pos, vel, owner=0):
         self.pos = pos
         self.vel = vel
         self.life = ENEMY_BULLET_LIFE
+        self.owner = owner
 
     def update(self, dt):
         self.pos += self.vel * dt

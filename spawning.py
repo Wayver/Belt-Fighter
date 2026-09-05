@@ -21,7 +21,7 @@ from .config import (WIDTH, HEIGHT, SECTOR_SIZE, ACTIVE_SECTORS,
                      MAX_SPAWNS_PER_TICK)
 from .asteroid import Asteroid
 from .enemy import EnemyShip
-
+from .ai_enemy import AIEnemy
 
 def _far_pos(ship, min_dist, tries=20):
     """Pick a random position at least min_dist from the ship."""
@@ -33,9 +33,11 @@ def _far_pos(ship, min_dist, tries=20):
     return pygame.Vector2(random.uniform(-WIDTH, 2 * WIDTH),
                           random.uniform(-HEIGHT, 2 * HEIGHT))
 
-
+# old enemy
+#def spawn_enemy(enemies, ship, min_dist=400):
+#    enemies.append(EnemyShip(_far_pos(ship, min_dist)))
 def spawn_enemy(enemies, ship, min_dist=400):
-    enemies.append(EnemyShip(_far_pos(ship, min_dist)))
+    enemies.append(AIEnemy(_far_pos(ship, min_dist)))
 
 
 def make_stars(n=90):

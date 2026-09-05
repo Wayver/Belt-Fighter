@@ -148,6 +148,11 @@ class Ship:
         return self.hull.nose
 
     @property
+    def collision_radius(self):
+        """Collision radius from the hull (per-hull, not a global)."""
+        return self.hull.collision_radius
+
+    @property
     def shield_on(self):
         return self.shield_comp is not None and self.shield_charge > 0
 
@@ -396,10 +401,20 @@ class Ship:
 
 
     # --- rendering (reads geometry from self.hull) ---
-
-    def draw(self, screen, cam, pos=None, angle=None):
+    def draw(self, screen, cam, pos=None, angle=None, fill=None, edge=None,
+             flame_out=None, flame_in=None):
+        if fill is None:
+            fill = SHIP_COLOR
+        if edge is None:
+            edge = SHIP_EDGE
+        if flame_out is None:
+            flame_out = FLAME_OUT
+        if flame_in is None:
+            flame_in = FLAME_IN
         if pos is None:
-            pos, angle = self.pos, self.angle
+            pos = self.pos
+        if angle is None:
+            angle = self.angle
         fwd = pygame.Vector2(math.cos(angle), math.sin(angle))
         right = pygame.Vector2(-fwd.y, fwd.x)
 
@@ -412,6 +427,7 @@ class Ship:
         for slot in self.hull.slots:
             if slot.slot_type == 'thruster' and slot.flame_key:
                 by_key.setdefault(slot.flame_key, []).append(slot)
+        
         for key, slots in by_key.items():
             mag = self.flame_mags.get(key, 0.0)
             if mag <= 0:
@@ -420,30 +436,35 @@ class Ship:
                 lx, ly = slot.position
                 dx, dy = slot.flame_dir
                 self._flame(screen, cam, fwd, right, w(lx, ly), dx, dy, mag,
-                            scale=slot.flame_scale, width=slot.flame_width)
+                        scale=slot.flame_scale, width=slot.flame_width,
+                        flame_out=flame_out, flame_in=flame_in)
 
         # Hull.
         pts = [cam.to_screen(w(*p)) for p in self.hull.polygon]
-        pygame.draw.polygon(screen, SHIP_COLOR, pts)
-        pygame.draw.polygon(screen, SHIP_EDGE, pts, 2)
+        pygame.draw.polygon(screen, fill, pts)
+        pygame.draw.polygon(screen, edge, pts, 2)
 
-        # Cockpit + engine nozzles.
+        # Cockpit + engine nozzles + gun muzzles.
         cx, cy = self.hull.cockpit
-        pygame.draw.circle(screen, SHIP_EDGE, cam.to_screen(w(cx, cy)), 2)
+        pygame.draw.circle(screen, edge, cam.to_screen(w(cx, cy)), 2)
         for slot in self.hull.slots:
             if slot.slot_type == 'thruster' and slot.flame_key == 'forward':
                 nx, ny = slot.position
-                pygame.draw.circle(screen, SHIP_EDGE, cam.to_screen(w(nx, ny)), 3)
+                pygame.draw.circle(screen, edge, cam.to_screen(w(nx, ny)), 3)
+            elif slot.slot_type == 'weapon':
+                gx, gy = slot.position
+                pygame.draw.circle(screen, edge, cam.to_screen(w(gx, gy)), 2)
 
         self._draw_shield(screen, cam, pos, angle)
 
+
     def _flame(self, screen, cam, fwd, right, base_world, dx, dy, mag,
-               scale=1.0, width=3):
+           scale=1.0, width=3, flame_out=FLAME_OUT, flame_in=FLAME_IN):
         base = cam.to_screen(base_world)
         length = (6 + 14 * mag) * scale + random.random() * 5 * scale
         tip = base + fwd * (dx * length) + right * (dy * length)
-        pygame.draw.line(screen, FLAME_OUT, base, tip, width)
-        pygame.draw.line(screen, FLAME_IN, base, base + (tip - base) * 0.5, 1)
+        pygame.draw.line(screen, flame_out, base, tip, width)
+        pygame.draw.line(screen, flame_in, base, base + (tip - base) * 0.5, 1)
 
     def _draw_shield(self, screen, cam, pos, angle):
         """Draw the shield flash: invisible until hit, then flashes + flickers."""

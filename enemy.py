@@ -24,6 +24,7 @@ class EnemyShip:
         self.vel = pygame.Vector2(0, 0)
         self.angle = random.uniform(0, 2 * math.pi)
         self.hp = ENEMY_HP
+        self.collision_radius = ENEMY_RADIUS
         self.fire_timer = random.uniform(0.5, ENEMY_FIRE_COOLDOWN)
         self.thrusting = False
 

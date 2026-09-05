@@ -17,8 +17,8 @@ the tuning surface.
 """
 from dataclasses import dataclass
 
-from .config import SHIP_ACCEL, FIRE_COOLDOWN, BULLET_SPEED
-
+from .config import (SHIP_ACCEL, FIRE_COOLDOWN, BULLET_SPEED,
+                     ENEMY_FIRE_COOLDOWN, ENEMY_BULLET_SPEED)
 
 @dataclass(frozen=True)
 class Slot:
@@ -181,6 +181,68 @@ def default_loadout():
         'to_left': RCS,
         'to_right': RCS,
         'gun': GUN_TYPE,
+        'reactor': REACTOR_TYPE,
+        'computer': COMPUTER_TYPE,
+        'shield'  : SHIELD_TYPE,
+    }
+
+
+# --- Enemy hull: slender dart body + forward wing gun pods ---
+# Standard thruster slot names (forward_s/forward_p) so Ship._set_demands
+# works unchanged. The wings carry the guns (gun_s/gun_p), not RCS.
+
+E_FORWARD_S = Slot('forward_s', 'thruster', (-14, 2.5), (1, 0), flame_key='forward')
+E_FORWARD_P = Slot('forward_p', 'thruster', (-14, -2.5), (1, 0), flame_key='forward')
+E_GUN_S     = Slot('gun_s', 'weapon', (21, 11), (1, 0))
+E_GUN_P     = Slot('gun_p', 'weapon', (21, -11), (1, 0))
+E_REACTOR   = Slot('reactor', 'reactor', (-4, 0))
+E_COMPUTER  = Slot('computer', 'computer', (2, 0))
+E_SHIELD    = Slot('shield', 'shield', (0, 0))
+
+ENEMY_HULL = HullType(
+    id='interceptor',
+    polygon=(
+        (28, 0),     # nose tip (extended)
+        (12, 3),     # fuselage shoulder (slender body)
+        (10, 6),     # wing root leading edge (notch before the pod)
+        (22, 9),     # starboard gun pod leading edge (extended)
+        (22, 13),    # starboard gun pod front outer (extended)
+        (4, 13),     # starboard wingtip (pod outer rear)
+        (-0, 9),     # starboard wing trailing edge
+        (-7, 7),    # starboard wingtip rear
+        (-10, 3),    # fuselage rear corner (starboard)
+        (-10, -3),   # fuselage rear corner (port)
+        (-7, -7),   # port wingtip rear
+        (-0, -9),    # port wing trailing edge
+        (4, -13),    # port wingtip (pod outer rear)
+        (22, -13),   # port gun pod front outer (extended)
+        (22, -9),    # port gun pod leading edge (extended)
+        (10, -6),    # port wing root leading edge
+        (12, -3),    # fuselage shoulder (port)
+    ),
+    slots=(E_FORWARD_S, E_FORWARD_P, E_GUN_S, E_GUN_P, E_REACTOR, E_COMPUTER, E_SHIELD),
+    base_mass=3.0,
+    collision_radius=16.0,
+    nose=(28, 0),
+    cockpit=(10, 0),
+)
+
+# Enemy guns use the enemy's own config values (not the player's) — see notes.
+ENEMY_GUN = ComponentType('enemy_gun', 'Enemy Gun', ('weapon',), mass=1.0,
+                          power_idle=2.0, power_active=5.0,
+                          fire_cooldown=ENEMY_FIRE_COOLDOWN,
+                          bullet_speed=ENEMY_BULLET_SPEED, priority=2)
+
+
+def enemy_loadout():
+    """Twin mains, twin wing guns, generators. Engines/generators reuse the
+    player's component types so the enemy flies exactly like the current
+    AIEnemy; only the silhouette + twin-gun layout is new."""
+    return {
+        'forward_s': MAIN_ENGINE,
+        'forward_p': MAIN_ENGINE,
+        'gun_s': ENEMY_GUN,
+        'gun_p': ENEMY_GUN,
         'reactor': REACTOR_TYPE,
         'computer': COMPUTER_TYPE,
         'shield'  : SHIELD_TYPE,

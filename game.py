@@ -12,14 +12,14 @@ from dataclasses import replace
 
 import pygame
 
-from .config import (WIDTH, HEIGHT, SHIP_RADIUS, SPAWN_PROTECT, MAX_BULLETS,
-                     ENEMY_RADIUS, ENEMY_SCORE,
-                     ROCK_SPLIT, ROCK_SIZES, BG, STAR_COLOR,
-                     BULLET_COLOR, ENEMY_BULLET_COLOR, WAVE_INTERVAL)
+from .config import (WIDTH, HEIGHT, SPAWN_PROTECT, MAX_BULLETS,
+                    ENEMY_SCORE,
+                    ROCK_SPLIT, ROCK_SIZES, BG, STAR_COLOR,
+                    BULLET_COLOR, ENEMY_BULLET_COLOR, WAVE_INTERVAL)
 from .ship import Ship
 from .intent import ShipInput
 from .asteroid import Asteroid
-from .bullets import Bullet
+from .bullets import Bullet, EnemyBullet
 from .particles import burst, shield_burst
 from .spawning import spawn_enemy, make_stars, update_field
 from .fog import draw_fog
@@ -39,13 +39,14 @@ class Game:
         self.light_surf = light_surf
         self.stars = make_stars()
 
-        self.shield = pygame.Surface((int(SHIP_RADIUS * 2 + 10), int(SHIP_RADIUS * 2 + 10)),
+        self.ship = Ship()
+        r = self.ship.collision_radius
+        self.shield = pygame.Surface((int(r * 2 + 10), int(r * 2 + 10)),
                                      pygame.SRCALPHA)
         pygame.draw.circle(self.shield, (120, 200, 255, 100),
                            (self.shield.get_width() // 2, self.shield.get_height() // 2),
-                           SHIP_RADIUS + 5, 2)
+                           r + 5, 2)
 
-        self.ship = Ship()
         self.cam = Camera(self.ship.pos)
         self.bullets = []
         self.enemy_bullets = []
@@ -82,7 +83,7 @@ class Game:
         self.cam.pos = self.ship.pos.copy()
         update_field(self.asteroids, [self.ship.pos], self.wave, 0)
         spawn_enemy(self.enemies, self.ship)
-        spawn_enemy(self.enemies, self.ship)
+        #spawn_enemy(self.enemies, self.ship)
 
     def handle_events(self):
         """Returns False when the window should close."""
@@ -111,13 +112,16 @@ class Game:
             for shot in self.ship.update(dt, inp):
                 self.bullets.append(Bullet(shot.pos, shot.vel, owner=shot.owner))
             self.protect_timer -= dt
-            self.wave_timer += dt           
+            self.wave_timer += dt
             if self.wave_timer >= WAVE_INTERVAL:
                 self.wave_timer = 0.0
                 self.wave += 1
             update_field(self.asteroids, [self.ship.pos], self.wave, dt)
-            for e in self.enemies:
-                e.update(dt, self.ship, self.enemy_bullets, self.asteroids)
+            
+        #
+        for e in self.enemies:
+            for shot in e.update(dt, self.ship, self.asteroids):
+                self.enemy_bullets.append(EnemyBullet(shot.pos, shot.vel, owner=shot.owner))
 
         for b in self.bullets:
             b.update(dt)
@@ -151,15 +155,15 @@ class Game:
         # player bullet vs enemy
         for b in self.bullets[:]:
             for i, e in enumerate(self.enemies):
-                if b.pos.distance_to(e.pos) < ENEMY_RADIUS + 4:
+                if b.pos.distance_to(e.pos) < e.collision_radius + 4:
                     self.bullets.remove(b)
-                    e.hp -= 1
-                    burst(self.particles, b.pos, 6)
-                    if e.hp <= 0:
+                    if e.register_hit(b.pos):
+                        burst(self.particles, b.pos, 6)
+                    else:
                         self.score += ENEMY_SCORE
                         burst(self.particles, e.pos, 20, big=True)
                         self.enemies.pop(i)
-                        spawn_enemy(self.enemies, self.ship)   # instant respawn
+                        spawn_enemy(self.enemies, self.ship)
                     break
 
         # bullet vs asteroid
@@ -197,7 +201,6 @@ class Game:
                     self.enemy_bullets.remove(b)
                     break
 
-
         # enemy bullet vs ship (shield surface if up, else hull)
         if self.protect_timer <= 0:
             for b in self.enemy_bullets[:]:
@@ -206,7 +209,7 @@ class Game:
                         self.enemy_bullets.remove(b)
                         if not self._handle_ship_hit(b.pos):
                             break
-                elif b.pos.distance_to(self.ship.pos) < SHIP_RADIUS + 4:
+                elif b.pos.distance_to(self.ship.pos) < self.ship.collision_radius + 4:
                     self.enemy_bullets.remove(b)
                     if not self._handle_ship_hit(b.pos):
                         break
@@ -214,22 +217,21 @@ class Game:
         # ship vs enemy (ram)
         if self.protect_timer <= 0 and not self.game_over:
             for e in self.enemies:
-                if self.ship.pos.distance_to(e.pos) < ENEMY_RADIUS + SHIP_RADIUS:
+                if self.ship.pos.distance_to(e.pos) < e.collision_radius + self.ship.collision_radius:
                     if not self._handle_ship_hit(e.pos):
                         break
 
         # ship vs asteroid
         if self.protect_timer <= 0 and not self.game_over:
             for a in self.asteroids:
-                if self.ship.pos.distance_to(a.pos) < a.collision_radius + SHIP_RADIUS:
+                if self.ship.pos.distance_to(a.pos) < a.collision_radius + self.ship.collision_radius:
                     if not self._handle_ship_hit(a.pos):
                         break
-
 
         # enemy vs asteroid (rocks are hazards for everyone)
         for i, e in enumerate(self.enemies[:]):
             for a in self.asteroids:
-                if e.pos.distance_to(a.pos) < a.collision_radius + ENEMY_RADIUS:
+                if e.pos.distance_to(a.pos) < a.collision_radius + e.collision_radius:
                     burst(self.particles, e.pos, 20, big=True)
                     self.score += ENEMY_SCORE
                     self.enemies.pop(i)

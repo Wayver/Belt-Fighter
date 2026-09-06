@@ -11,7 +11,7 @@ def main():
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
     pygame.display.set_caption("Asteroids — 4-thruster ship")
     clock = pygame.time.Clock()
-    font = pygame.font.SysFont("consolas,menlo,monospace", 14)
+    font = pygame.font.SysFont("consolas,menlo,monospace", 18)
     big_font = pygame.font.SysFont("consolas,menlo,monospace", 40)
 
     light_tex = make_light_texture()

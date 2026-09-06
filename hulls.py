@@ -161,7 +161,7 @@ GUN_TYPE      = ComponentType('gun', 'Pulse Gun', ('weapon',), mass=1.0,
                               fire_cooldown=FIRE_COOLDOWN,
                               bullet_speed=BULLET_SPEED, priority=2)
 REACTOR_TYPE  = ComponentType('reactor', 'Reactor', ('reactor',),
-                              mass=3.0, power_supply=70.0)
+                              mass=3.0, power_supply=100.0)
 COMPUTER_TYPE = ComponentType('computer', 'Computer', ('computer',),
                               mass=2.0, compute_supply=50.0)
 SHIELD_TYPE = ComponentType('shield', 'Shield', ('shield',),
@@ -170,6 +170,13 @@ SHIELD_TYPE = ComponentType('shield', 'Shield', ('shield',),
                             power_hit=25.0,
                             shield_max_charge=3.0,
                             shield_recharge_rate=0.5)
+
+E_SHIELD_TYPE = ComponentType('shield', 'Shield', ('shield',),
+                             mass=2.0,
+                             power_idle=2.0, power_active=10.0,
+                             power_hit=45.0,
+                             shield_max_charge=2.0,
+                             shield_recharge_rate=0.5)
 
 
 def default_loadout():
@@ -193,11 +200,22 @@ def default_loadout():
 
 E_FORWARD_S = Slot('forward_s', 'thruster', (-14, 2.5), (1, 0), flame_key='forward')
 E_FORWARD_P = Slot('forward_p', 'thruster', (-14, -2.5), (1, 0), flame_key='forward')
+# braking/strafing: same slot names the player uses, so Ship._set_demands
+# and auto-stop work unchanged
+E_REVERSE   = Slot('reverse', 'thruster', (24, 0), (-1, 0), flame_key='reverse')
+E_RCS_L     = Slot('to_left', 'thruster', (-7, -8), (0, -1),
+                   flame_dir=(0, -1), flame_key='to_left',
+                   flame_scale=0.5, flame_width=2)
+E_RCS_R     = Slot('to_right', 'thruster', (-7, 8), (0, 1),
+                   flame_dir=(0, 1), flame_key='to_right',
+                   flame_scale=0.5, flame_width=2)
 E_GUN_S     = Slot('gun_s', 'weapon', (21, 11), (1, 0))
 E_GUN_P     = Slot('gun_p', 'weapon', (21, -11), (1, 0))
 E_REACTOR   = Slot('reactor', 'reactor', (-4, 0))
+E_REACTOR_2 = Slot('reactor2', 'reactor', (-8, 0))
 E_COMPUTER  = Slot('computer', 'computer', (2, 0))
 E_SHIELD    = Slot('shield', 'shield', (0, 0))
+
 
 ENEMY_HULL = HullType(
     id='interceptor',
@@ -235,15 +253,16 @@ ENEMY_GUN = ComponentType('enemy_gun', 'Enemy Gun', ('weapon',), mass=1.0,
 
 
 def enemy_loadout():
-    """Twin mains, twin wing guns, generators. Engines/generators reuse the
-    player's component types so the enemy flies exactly like the current
-    AIEnemy; only the silhouette + twin-gun layout is new."""
     return {
         'forward_s': MAIN_ENGINE,
         'forward_p': MAIN_ENGINE,
+        'reverse': NOSE_THRUSTER,
+        'to_left': RCS,
+        'to_right': RCS,
         'gun_s': ENEMY_GUN,
         'gun_p': ENEMY_GUN,
         'reactor': REACTOR_TYPE,
+        'reactor2': REACTOR_TYPE,
         'computer': COMPUTER_TYPE,
-        'shield'  : SHIELD_TYPE,
+        'shield'  : E_SHIELD_TYPE,
     }

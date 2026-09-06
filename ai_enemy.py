@@ -11,10 +11,11 @@ import random
 
 import pygame
 
-
 from .config import (ENEMY_HP, ENEMY_ENGAGE_RANGE, ENEMY_ORBIT_OFFSET,
-                     ENEMY_AVOID_RADIUS, ENEMY_AVOID_WEIGHT, MAX_SPEED,
+                     ENEMY_AVOID_RADIUS, ENEMY_AVOID_WEIGHT,
+                     ENEMY_COURSE_MARGIN, MAX_SPEED,
                      ENEMY_FILL, ENEMY_EDGE, ENEMY_FLAME)
+
 
 from .hulls import ENEMY_HULL, enemy_loadout
 
@@ -94,26 +95,61 @@ class AIEnemy:
                 avoid += d * (urgency * urgency)
                 danger = max(danger, urgency)
 
-        # blend: avoidance takes over as a rock gets close
         desired = seek * (1.0 - 0.8 * danger) + avoid * ENEMY_AVOID_WEIGHT
         if desired.length() < 0.01:
             desired = seek
+        desired.normalize_ip()
         desired_angle = math.atan2(desired.y, desired.x)
 
-        # turn: sign of the wrapped angle error
         diff = (desired_angle - self.ship.angle + math.pi) % (2 * math.pi) - math.pi
         turn = math.copysign(1.0, diff) if abs(diff) > 0.05 else 0.0
 
-        # thrust: burn while chasing, ease off while dodging
-        thrust_fwd = 1.0 if (danger < 0.5 or abs(diff) < 0.6) else 0.0
+        # emergency: on a collision course? Hand the sticks to the
+        # auto-damper (same compute-paid guidance as the player's B)
+        stop = self._on_course(asteroids)
+        if stop:
+            thrust_fwd = thrust_left = thrust_right = 0.0
+        else:
+            # lateral: RCS moves the ship sideways while the nose is
+            # still swinging, so the dodge starts immediately
+            fwd, right = self.ship.axes()
+            lat = desired.dot(right)
+            thrust_left = min(1.0, -lat) if lat < -0.2 else 0.0
+            thrust_right = min(1.0, lat) if lat > 0.2 else 0.0
+            thrust_fwd = 1.0 if (danger < 0.5 or abs(diff) < 0.6) else 0.0
 
-        # fire: aimed at the player and in range (Ship handles the cooldown)
         aim = math.atan2(player.pos.y - self.ship.pos.y,
                          player.pos.x - self.ship.pos.x)
         aim_diff = (aim - self.ship.angle + math.pi) % (2 * math.pi) - math.pi
         fire = abs(aim_diff) < 0.25 and dist < ENEMY_ENGAGE_RANGE
 
-        return ShipInput(turn=turn, thrust_fwd=thrust_fwd, fire=fire)
+        return ShipInput(turn=turn, thrust_fwd=thrust_fwd,
+                         thrust_left=thrust_left, thrust_right=thrust_right,
+                         stop=stop, fire=fire)
+
+    def _on_course(self, asteroids):
+        """True if our current velocity takes us into a rock: closing on
+        it, and the miss distance at closest approach under the combined
+        radii + margin."""
+        vel = self.ship.vel
+        if vel.length() < 1.0:
+            return False
+        r2 = ENEMY_AVOID_RADIUS ** 2
+        for a in asteroids:
+            to_rock = a.pos - self.ship.pos
+            d2 = to_rock.length_squared()
+            if d2 > r2:
+                continue
+            rel = vel - a.vel
+            closing = rel.dot(to_rock)
+            if closing <= 0:
+                continue
+            t_ca = d2 / closing                    # time to closest approach
+            miss = (to_rock - rel * t_ca).length()
+            if miss < a.collision_radius + self.collision_radius + ENEMY_COURSE_MARGIN:
+                return True
+        return False
+
 
     def update(self, dt, player, asteroids):
         """Run one fixed step. Returns the Ship's Shot events (route them

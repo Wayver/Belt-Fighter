@@ -35,7 +35,7 @@ from .config import (WIDTH, HEIGHT, ROT_SPEED, MAX_SPEED,
                      SHIP_COLOR, SHIP_EDGE, FLAME_OUT, FLAME_IN,
                      POWER_HYSTERESIS, AUTO_STOP_COMPUTE, SHIELD_DUMP_DECAY,
                      SHIELD_OVAL_A, SHIELD_OVAL_B, SHIELD_COLOR_DIM,
-                     SHIELD_COLOR_BRIGHT)
+                     SHIELD_COLOR_BRIGHT, SHIELD_OFFLINE_FACTOR, SHIELD_OFFLINE_DRAIN, ARC_GLOW, ARC_CORE)
 
 from .hulls import DEFAULT_HULL, default_loadout, Slot, ComponentType
 
@@ -122,11 +122,14 @@ class Ship:
         self.power_used = 0.0
         self.compute_used = 0.0
         self.brownout = False
+        self.power_factor = 1.0
         self.compute_alloc = 1.0
         self.pos = pygame.Vector2(WIDTH / 2, HEIGHT / 2)
         self.vel = pygame.Vector2(0, 0)
         self.angle = -math.pi / 2
         self.flame_mags = {}   # presentation only — never serialized
+        self.arcs = [] # presentation only: brownout lightning (pts, age, ttl)
+        self.arc_clock = 0.0
         self.dampening = False
         self.prev_pos = self.pos.copy()
         self.prev_angle = self.angle
@@ -221,6 +224,7 @@ class Ship:
         accel = self._resolve_forces()
         shots = self._fire(dt, inp)
         self._integrate(dt, accel)
+        self._update_arcs(dt)
         return shots
 
     def _apply_rotation(self, dt, inp):
@@ -301,10 +305,22 @@ class Ship:
             shield_active = self.shield_comp.power_active + self.shield_dump
         total = idle + sum(need for _, need in active) + shield_active
         self.power_used = total
+        
+
         if not self.brownout and total > self.power_supply * (1.0 + POWER_HYSTERESIS):
             self.brownout = True
         elif self.brownout and total < self.power_supply * (1.0 - POWER_HYSTERESIS):
             self.brownout = False
+
+
+        # How much of the non-idle demand can the reactor actually meet?
+        # 1.0 = fully powered; <1.0 while browned out (whole-ship sag).
+        non_idle = sum(need for _, need in active) + shield_active
+        if self.brownout and non_idle > 0:
+            self.power_factor = min(1.0, (self.power_supply - idle) / non_idle)
+        else:
+            self.power_factor = 1.0
+
         if self.brownout:
             remaining = max(0.0, self.power_supply - idle - shield_active)
             for t, need in sorted(active, key=lambda p: p[0].comp.priority):
@@ -324,6 +340,10 @@ class Ship:
         self.compute_used = comp_demand
         self.compute_alloc = (min(1.0, self.compute_supply / comp_demand)
                               if comp_demand > 0 else 1.0)
+        
+
+        # Brownout sags compute too: auto-stop guidance weakens on a spike.
+        self.compute_alloc *= self.power_factor
 
 
     def _resolve_forces(self):
@@ -371,18 +391,64 @@ class Ship:
         self.pos += self.vel * dt
 
     def _update_shield(self, dt):
-        """Recharge the shield and decay the hit-dump."""
+        """Recharge the shield, decay the hit-dump, sag under brownout."""
         if self.shield_comp is None:
             return
+        # Deep brownout: shield goes offline, charge drains.
+        if self.brownout and self.power_factor < SHIELD_OFFLINE_FACTOR:
+            self.shield_charge = max(0.0,
+                                     self.shield_charge - SHIELD_OFFLINE_DRAIN * dt)
+            self.shield_dump = max(0.0, self.shield_dump - SHIELD_DUMP_DECAY * dt)
+            return
         if self.shield_charge < self.shield_comp.shield_max_charge:
+            rate = self.shield_comp.shield_recharge_rate * self.power_factor
             self.shield_charge = min(self.shield_comp.shield_max_charge,
-                                     self.shield_charge
-                                     + self.shield_comp.shield_recharge_rate * dt)
+                                     self.shield_charge + rate * dt)
         if self.shield_dump > 0:
             self.shield_clock += dt
             self.shield_dump = max(0.0, self.shield_dump - SHIELD_DUMP_DECAY * dt)
         else:
             self.shield_clock = 0.0
+
+    def _update_arcs(self, dt):
+        """Presentation-only: spawn/age lightning arcs during brownout.
+
+        Never serialized. Spawn rate scales with brownout severity
+        (1 - power_factor): a deep sag crackles harder.
+        """
+        for arc in self.arcs:
+            arc[1] += dt
+        self.arcs = [a for a in self.arcs if a[1] < a[2]]
+        if not self.brownout:
+            return
+        severity = 1.0 - self.power_factor
+        self.arc_clock += dt
+        interval = 0.45 - 0.15 * severity   # 0.25s -> 0.10s as it deepens
+        if self.arc_clock >= interval:
+            self.arc_clock = 0.0
+            self.arcs.append(self._make_arc())
+
+    def _make_arc(self):
+        """One jagged arc in LOCAL ship space, from a random hull vertex
+        pointing outward. Local space so it tracks the rendered ship even
+        with network render interpolation."""
+        verts = self.hull.polygon
+        lx, ly = verts[random.randrange(len(verts))]
+        d = pygame.Vector2(lx, ly)
+        if d.length_squared() < 1e-6:
+            d = pygame.Vector2(1, 0)
+        else:
+            d = d.normalize()
+        d.rotate(random.uniform(-50, 50))
+        pts = [(lx, ly)]
+        x, y = lx, ly
+        for _ in range(random.randint(3, 5)):
+            d.rotate(random.uniform(-55, 55))
+            x += d.x * random.uniform(6, 14)
+            y += d.y * random.uniform(6, 14)
+            pts.append((x, y))
+        ttl = random.uniform(0.05, 0.12)
+        return [pts, 0.0, ttl]
 
 
     def register_hit(self):
@@ -456,6 +522,7 @@ class Ship:
                 pygame.draw.circle(screen, edge, cam.to_screen(w(gx, gy)), 2)
 
         self._draw_shield(screen, cam, pos, angle)
+        self._draw_arcs(screen, cam, w)
 
 
     def _flame(self, screen, cam, fwd, right, base_world, dx, dy, mag,
@@ -489,3 +556,13 @@ class Ship:
             pts.append(cam.to_screen(world))
         pygame.draw.polygon(screen, _dim_color(color, 0.5), pts, 5)  # glow
         pygame.draw.polygon(screen, color, pts, 2)                   # core
+
+    def _draw_arcs(self, screen, cam, w):
+        """Draw brownout lightning: blue glow under a white core, fading out."""
+        if not self.arcs:
+            return
+        for pts, age, ttl in self.arcs:
+            fade = 1.0 - age / ttl
+            sp = [cam.to_screen(w(*p)) for p in pts]
+            pygame.draw.lines(screen, _dim_color(ARC_GLOW, fade), False, sp, 3)
+            pygame.draw.lines(screen, _dim_color(ARC_CORE, fade), False, sp, 1)

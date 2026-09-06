@@ -21,8 +21,15 @@ MAX_SPAWNS_PER_TICK = 4     # fill the field gradually, not all at once
 WAVE_INTERVAL = 40          # seconds between difficulty waves
 
 # --- power / compute (Phase 2) ---
-POWER_HYSTERESIS = 0.10   # brownout latch deadband, fraction of supply
+POWER_HYSTERESIS = 0.00   # brownout latch deadband, fraction of supply
 AUTO_STOP_COMPUTE = 10.0  # compute drawn by auto-stop guidance (B)
+
+SHIELD_OFFLINE_FACTOR = 0.5   # brownout factor below which the shield drops offline
+SHIELD_OFFLINE_DRAIN  = 0.5   # shield charge/s lost while offline
+
+ARC_GLOW = (70, 120, 255)     # brownout lightning: outer glow
+ARC_CORE = (235, 245, 255)    # brownout lightning: white core
+
 
 # --- ship feel knobs ---
 SHIP_ACCEL = 320.0
@@ -31,7 +38,7 @@ MAX_SPEED = 520.0
 BULLET_SPEED = 860.0
 BULLET_LIFE = 1.5
 FIRE_COOLDOWN = 0.01
-MAX_BULLETS = 8
+MAX_BULLETS = 12
 STOP_GAIN = 3.0
 MAX_STOP_ACCEL = 600.0
 STOP_DEADBAND = 1.5
@@ -57,8 +64,8 @@ ROCK_SPLIT = {'large': 'medium', 'medium': 'small', 'small': None}
 STARTING_WAVE = 2        # large rocks in wave 1; +1 per wave
 
 # --- enemy ship knobs ---
-ENEMY_ACCEL = 140.0
-ENEMY_MAX_SPEED = 350.0
+ENEMY_ACCEL = 110.0
+ENEMY_MAX_SPEED = 250.0
 ENEMY_ROT_SPEED = 3.4
 ENEMY_RADIUS = 11.0
 ENEMY_HP = 1
@@ -67,10 +74,13 @@ ENEMY_BULLET_SPEED = 720.0
 ENEMY_BULLET_LIFE = 1.5
 ENEMY_FIRE_COOLDOWN = .15
 ENEMY_FIRE_SPREAD = 0.16
-ENEMY_ENGAGE_RANGE = 1400.0  # only chase/fire within this range
+ENEMY_ENGAGE_RANGE = 2400.0  # only chase/fire within this range
 ENEMY_ORBIT_OFFSET = 140.0  # aim offset so it circles instead of ramming
+ENEMY_AVOID_RADIUS = 800.0  # how far ahead the enemy "sees" rocks
+ENEMY_AVOID_WEIGHT = 4.2    # strength of the avoidance steering
 ENEMY_AVOID_RADIUS = 400.0  # how far ahead the enemy "sees" rocks
-ENEMY_AVOID_WEIGHT = 3.2    # strength of the avoidance steering
+ENEMY_AVOID_WEIGHT = 6.2    # strength of the avoidance steering
+ENEMY_COURSE_MARGIN = 30.0  # miss-distance slack before the AI slams the damper
 
 # --- fog of war knobs ---
 FOG_ALPHA = 100          # how dark the fog is (0-255)

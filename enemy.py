@@ -4,12 +4,11 @@ import random
 
 import pygame
 
-from .config import (WIDTH, HEIGHT, ENEMY_ACCEL, ENEMY_MAX_SPEED,
-                     ENEMY_ROT_SPEED, ENEMY_RADIUS, ENEMY_HP,
-                     ENEMY_BULLET_SPEED, ENEMY_FIRE_COOLDOWN,
-                     ENEMY_FIRE_SPREAD, ENEMY_ENGAGE_RANGE,
-                     ENEMY_ORBIT_OFFSET, ENEMY_AVOID_RADIUS,
-                     ENEMY_AVOID_WEIGHT, ENEMY_FILL, ENEMY_EDGE, ENEMY_FLAME)
+from .config import (ENEMY_HP, ENEMY_ENGAGE_RANGE, ENEMY_ORBIT_OFFSET,
+                     ENEMY_AVOID_RADIUS, ENEMY_AVOID_WEIGHT,
+                     ENEMY_COURSE_MARGIN, MAX_SPEED,
+                     ENEMY_FILL, ENEMY_EDGE, ENEMY_FLAME)
+
 from .bullets import EnemyBullet
 
 

@@ -83,7 +83,7 @@ class Game:
         self.cam.pos = self.ship.pos.copy()
         update_field(self.asteroids, [self.ship.pos], self.wave, 0)
         spawn_enemy(self.enemies, self.ship)
-        #spawn_enemy(self.enemies, self.ship)
+        spawn_enemy(self.enemies, self.ship)
 
     def handle_events(self):
         """Returns False when the window should close."""

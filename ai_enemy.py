@@ -14,7 +14,7 @@ import pygame
 from .config import (ENEMY_HP, ENEMY_ENGAGE_RANGE, ENEMY_ORBIT_OFFSET,
                      ENEMY_AVOID_RADIUS, ENEMY_AVOID_WEIGHT,
                      ENEMY_COURSE_MARGIN, MAX_SPEED,
-                     ENEMY_FILL, ENEMY_EDGE, ENEMY_FLAME)
+                     ENEMY_FILL, ENEMY_EDGE, ENEMY_FLAME, TARGETING_MAX_LEAD)
 
 
 from .hulls import ENEMY_HULL, enemy_loadout
@@ -160,3 +160,50 @@ class AIEnemy:
     def draw(self, screen, cam):
         self.ship.draw(screen, cam, fill=ENEMY_FILL, edge=ENEMY_EDGE,
                        flame_out=ENEMY_FLAME, flame_in=ENEMY_FLAME)
+
+    def predict_path(self, horizon, steps):
+        """Presentation-only predicted future positions for the targeting
+        assist. Constant-velocity base + a decaying acceleration term: the
+        AI re-plans every tick, so its instantaneous accel is only
+        trustworthy near-term — the fade keeps the far end from over-curving
+        when the enemy turns."""
+        pos = self.ship.pos.copy()
+        vel = self.ship.vel.copy()
+        acc = self.ship.accel.copy()
+        pts = [pos.copy()]
+        dt = horizon / steps
+        for i in range(steps):
+            w = 1.0 - i / steps          # accel influence fades over the horizon
+            pos += vel * dt + 0.5 * acc * (w * dt * dt)
+            vel += acc * (w * dt)
+            pts.append(pos.copy())
+        return pts
+
+    def lead_point(self, shooter_pos, bullet_speed, use_accel=True):
+        """Intercept solution: the world point the shooter should aim at so a
+        bullet of `bullet_speed` fired from `shooter_pos` meets this enemy.
+
+        Solves |E(T) - shooter| = bullet_speed * T, where E(T) is the enemy's
+        predicted position (constant velocity + optional constant accel).
+        Iterates to convergence — the mapping is a contraction whenever the
+        bullet can actually catch the enemy, so it converges exactly when a
+        hit is possible. Returns None when there's no valid solution (enemy
+        moving away faster than the bullet, or lead time out of range).
+        """
+        e0 = self.ship.pos
+        v = self.ship.vel
+        a = self.ship.accel if use_accel else pygame.Vector2(0, 0)
+        d0 = (e0 - shooter_pos).length()
+        if d0 < 1:
+            return None
+        T = d0 / bullet_speed
+        for _ in range(6):
+            eT = e0 + v * T + 0.5 * a * (T * T)
+            T_new = (eT - shooter_pos).length() / bullet_speed
+            if T_new > TARGETING_MAX_LEAD:
+                return None
+            if abs(T_new - T) < 1e-3:
+                T = T_new
+                break
+            T = T_new
+        return e0 + v * T + 0.5 * a * (T * T)

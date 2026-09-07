@@ -13,10 +13,14 @@ from dataclasses import replace
 import pygame
 
 from .config import (WIDTH, HEIGHT, SPAWN_PROTECT, MAX_BULLETS,
-                    ENEMY_SCORE,
+                    BULLET_SPEED, ENEMY_SCORE,
                     ROCK_SPLIT, ROCK_SIZES, BG, STAR_COLOR,
-                    BULLET_COLOR, ENEMY_BULLET_COLOR, WAVE_INTERVAL)
-from .ship import Ship
+                    BULLET_COLOR, ENEMY_BULLET_COLOR, WAVE_INTERVAL,
+                    TARGETING_ASSIST, TARGETING_COLOR, TARGETING_HORIZON,
+                    TARGETING_STEPS, TARGETING_RANGE,
+                    TARGETING_USE_ACCEL, TARGETING_MAX_LEAD,
+                    TARGETING_COLOR_GREEN, TARGETING_ALIGN_TOL)
+from .ship import Ship, wrapped_delta
 from .intent import ShipInput
 from .asteroid import Asteroid
 from .bullets import Bullet, EnemyBullet
@@ -84,6 +88,7 @@ class Game:
         update_field(self.asteroids, [self.ship.pos], self.wave, 0)
         spawn_enemy(self.enemies, self.ship)
         spawn_enemy(self.enemies, self.ship)
+        spawn_enemy(self.enemies, self.ship)
 
     def handle_events(self):
         """Returns False when the window should close."""
@@ -140,6 +145,52 @@ class Game:
 
         if not self.game_over:
             self._collisions()
+
+    def _draw_targeting(self, screen, e):
+        pts = e.predict_path(TARGETING_HORIZON, TARGETING_STEPS)
+        n = len(pts)
+        for i, p in enumerate(pts):
+            s = self.cam.to_screen(p)          # world -> screen [3]
+            t = i / (n - 1)                    # 0 at enemy, 1 at far end
+            r = max(1, int(3 * (1.0 - t)))     # dots shrink toward the far end
+            c = tuple(int(ch * (1.0 - 0.6 * t)) for ch in TARGETING_COLOR)
+            pygame.draw.circle(screen, c, (int(s.x), int(s.y)), r)
+
+    def _draw_lead(self, screen, e):
+        p = e.lead_point(self.ship.pos, BULLET_SPEED, TARGETING_USE_ACCEL)
+        if p is None or (p - self.ship.pos).length() > TARGETING_RANGE:
+            return
+        if self._lead_aligned(e, p):
+            # flash green: alternate between green and the base light blue
+            c = (TARGETING_COLOR_GREEN if (pygame.time.get_ticks() // 100) % 2
+                 else TARGETING_COLOR)
+        else:
+            c = TARGETING_COLOR
+        s = self.cam.to_screen(p)
+        x, y = int(s.x), int(s.y)
+        R, gap = 8, 3
+        pygame.draw.line(screen, c, (x, y - R), (x, y - gap), 2)
+        pygame.draw.line(screen, c, (x, y + R), (x, y + gap), 2)
+        pygame.draw.line(screen, c, (x - R, y), (x - gap, y), 2)
+        pygame.draw.line(screen, c, (x + R, y), (x + gap, y), 2)
+
+    def _lead_aligned(self, e, p):
+        """True when the player's nose points between the reticle and the
+        enemy: the facing direction lies in the angular span (plus tolerance)
+        between the direction to the reticle and the direction to the enemy."""
+        ship = self.ship
+        to_ret = p - ship.pos
+        to_en = e.pos - ship.pos
+        if to_ret.length() < 1 or to_en.length() < 1:
+            return False
+        ang_r = math.atan2(to_ret.y, to_ret.x)
+        ang_e = math.atan2(to_en.y, to_en.x)
+        d_f = wrapped_delta(ang_r, ship.angle, 2 * math.pi)   # reticle -> facing
+        d_e = wrapped_delta(ang_r, ang_e, 2 * math.pi)        # reticle -> enemy
+        if d_f * d_e < 0:
+            return False   # facing on the far side of the reticle
+        return abs(d_f) <= abs(d_e) + TARGETING_ALIGN_TOL
+
 
     def _handle_ship_hit(self, source_pos):
         """Handle a hit on the ship. Returns True if the ship survives."""
@@ -250,6 +301,8 @@ class Game:
             a.draw(screen, self.cam)
         for e in self.enemies:
             e.draw(screen, self.cam)
+            if TARGETING_ASSIST:
+                self._draw_lead(screen, e)
         for b in self.bullets:
             s = self.cam.to_screen(b.pos)
             pygame.draw.circle(screen, BULLET_COLOR, (int(s.x), int(s.y)), 3)

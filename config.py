@@ -110,3 +110,16 @@ PARTICLE_COLORS = [(200, 210, 225), (150, 160, 175), (255, 150, 50)]
 # --- timing ---
 TICK = 1 / 60        # fixed sim step, seconds
 MAX_FRAME_DT = 0.25  # clamp frame dt so a hiccup can't trigger a catch-up spiral
+
+
+# tartet assist
+TARGETING_ASSIST  = True
+TARGETING_COLOR   = (120, 200, 255)   # cyan, matches the HUD info color
+TARGETING_HORIZON = 0.6               # seconds of prediction
+TARGETING_STEPS   = 14
+TARGETING_COLOR     = (255, 140, 60)   # orange reticle, distinct from enemy cyan
+TARGETING_COLOR_GREEN = (120,255,140)
+TARGETING_ALIGN_TOL = 0.08
+TARGETING_RANGE     = 900.0            # only show the lead within this range
+TARGETING_USE_ACCEL = True             # bend the lead by the enemy's accel
+TARGETING_MAX_LEAD  = 1.5              # cap on lead time (s); no marker beyond

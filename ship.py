@@ -126,6 +126,7 @@ class Ship:
         self.compute_alloc = 1.0
         self.pos = pygame.Vector2(WIDTH / 2, HEIGHT / 2)
         self.vel = pygame.Vector2(0, 0)
+        self.accel = pygame.Vector2(0, 0)
         self.angle = -math.pi / 2
         self.flame_mags = {}   # presentation only — never serialized
         self.arcs = [] # presentation only: brownout lightning (pts, age, ttl)
@@ -222,6 +223,7 @@ class Ship:
         self._set_demands(inp)
         self._allocate(inp)
         accel = self._resolve_forces()
+        self.accel = accel.copy()
         shots = self._fire(dt, inp)
         self._integrate(dt, accel)
         self._update_arcs(dt)

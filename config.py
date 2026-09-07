@@ -123,3 +123,8 @@ TARGETING_ALIGN_TOL = 0.08
 TARGETING_RANGE     = 900.0            # only show the lead within this range
 TARGETING_USE_ACCEL = True             # bend the lead by the enemy's accel
 TARGETING_MAX_LEAD  = 1.5              # cap on lead time (s); no marker beyond
+
+# --- targeting assist (paid system) ---
+TARGETING_POWER = 8.0              # power draw while the reticle is on
+TARGETING_COMPUTE_BASE = 6.0       # compute for the targeting system itself
+TARGETING_COMPUTE_PER_TARGET = 4.0 # extra compute per tracked enemy

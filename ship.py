@@ -35,7 +35,8 @@ from .config import (WIDTH, HEIGHT, ROT_SPEED, MAX_SPEED,
                      SHIP_COLOR, SHIP_EDGE, FLAME_OUT, FLAME_IN,
                      POWER_HYSTERESIS, AUTO_STOP_COMPUTE, SHIELD_DUMP_DECAY,
                      SHIELD_OVAL_A, SHIELD_OVAL_B, SHIELD_COLOR_DIM,
-                     SHIELD_COLOR_BRIGHT, SHIELD_OFFLINE_FACTOR, SHIELD_OFFLINE_DRAIN, ARC_GLOW, ARC_CORE)
+                     SHIELD_COLOR_BRIGHT, SHIELD_OFFLINE_FACTOR, SHIELD_OFFLINE_DRAIN,
+                     ARC_GLOW, ARC_CORE, TARGETING_POWER, TARGETING_COMPUTE_BASE, TARGETING_COMPUTE_PER_TARGET)
 
 from .hulls import DEFAULT_HULL, default_loadout, Slot, ComponentType
 
@@ -115,6 +116,10 @@ class Ship:
                               if self.shield_comp else 0.0)
         self.shield_dump = 0.0
         self.shield_clock = 0.0
+        # targeting assist: player-toggled paid system (T key)
+        self.targeting_on = False
+        self.tracked = 0    # enemies within TARGETING_RANGE; set by Game each tick
+
 
         # Phase 2: power/compute budgets, derived from the fitted parts
         self.power_supply = sum(c.power_supply for c in self.components.values())
@@ -302,12 +307,16 @@ class Ship:
         idle = sum(c.power_idle for c in self.components.values())
         active = [(t, t.comp.power_active * t.demand) for t in self.thrusters]
         active += [(w, w.comp.power_active) for w in self.weapons if inp.fire]
+        
         shield_active = 0.0
         if self.shield_on:
             shield_active = self.shield_comp.power_active + self.shield_dump
-        total = idle + sum(need for _, need in active) + shield_active
+        # Targeting: fixed draw while on, like the shield — a priority
+        # system that can TRIGGER a brownout but isn't shed itself.
+        targeting_active = TARGETING_POWER if self.targeting_on else 0.0
+        total = (idle + sum(need for _, need in active) + shield_active
+                 + targeting_active)
         self.power_used = total
-        
 
         if not self.brownout and total > self.power_supply * (1.0 + POWER_HYSTERESIS):
             self.brownout = True
@@ -317,7 +326,8 @@ class Ship:
 
         # How much of the non-idle demand can the reactor actually meet?
         # 1.0 = fully powered; <1.0 while browned out (whole-ship sag).
-        non_idle = sum(need for _, need in active) + shield_active
+        non_idle = (sum(need for _, need in active) + shield_active
+                    + targeting_active)
         if self.brownout and non_idle > 0:
             self.power_factor = min(1.0, (self.power_supply - idle) / non_idle)
         else:
@@ -339,11 +349,12 @@ class Ship:
         comp_demand = sum(t.comp.compute_demand * t.demand for t in self.thrusters)
         if self.dampening:
             comp_demand += AUTO_STOP_COMPUTE
+        if self.targeting_on:
+            comp_demand += (TARGETING_COMPUTE_BASE
+                            + TARGETING_COMPUTE_PER_TARGET * self.tracked)
         self.compute_used = comp_demand
         self.compute_alloc = (min(1.0, self.compute_supply / comp_demand)
                               if comp_demand > 0 else 1.0)
-        
-
         # Brownout sags compute too: auto-stop guidance weakens on a spike.
         self.compute_alloc *= self.power_factor
 

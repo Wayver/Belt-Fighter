@@ -4,7 +4,7 @@ import pygame
 from .config import WIDTH, HEIGHT, FPS
 from .fog import make_light_texture
 from .game import Game
-
+from .menu import Menu
 
 def main():
     pygame.init()
@@ -18,7 +18,18 @@ def main():
     fog_surf = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
     light_surf = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
 
-    game = Game(screen, font, big_font, light_tex, fog_surf, light_surf)
+
+    menu = Menu(font, big_font)
+    while not menu.done:
+        clock.tick(FPS)
+        if not menu.handle_events():
+            pygame.quit(); return
+        menu.draw(screen)
+        pygame.display.flip()
+
+    game = Game(screen, font, big_font, light_tex, fog_surf, light_surf,
+            hull=menu.hull, loadout=menu.loadout)
+
 
     running = True
     while running:

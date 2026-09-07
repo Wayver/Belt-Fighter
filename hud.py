@@ -1,7 +1,7 @@
 """HUD and game-over screen."""
 import pygame
 
-from .config import WIDTH, HEIGHT, ENEMY_EDGE
+from .config import WIDTH, HEIGHT, ENEMY_EDGE, TARGETING_COLOR
 
 
 HUD_ROW = 26  # vertical spacing between HUD rows
@@ -23,6 +23,10 @@ def draw_hud(screen, font, score, wave, enemies, ship):
     if ship.shield_comp is not None:
         _bar(screen, font, 8, y + 2 * HUD_ROW, "SHD", ship.shield_charge,
              ship.shield_comp.shield_max_charge, warn=not ship.shield_on)
+    if ship.targeting_on:
+        screen.blit(font.render(f"TGT on  {ship.tracked} tracked",
+                                True, TARGETING_COLOR),
+                    (8, y + 3 * HUD_ROW))
 
 
 def _bar(screen, font, x, y, label, used, supply, warn=False):

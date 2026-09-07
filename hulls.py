@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from .config import (SHIP_ACCEL, FIRE_COOLDOWN, BULLET_SPEED,
                      ENEMY_FIRE_COOLDOWN, ENEMY_BULLET_SPEED)
 
+
 @dataclass(frozen=True)
 class Slot:
     """A mount point on a hull.
@@ -191,6 +192,40 @@ def default_loadout():
         'reactor': REACTOR_TYPE,
         'computer': COMPUTER_TYPE,
         'shield'  : SHIELD_TYPE,
+    }
+
+
+# --- Player-selectable catalog ---
+PLAYER_HULLS = (DEFAULT_HULL,)   # future hulls append here
+
+# What the menu offers per slot type.
+COMPONENT_CATALOG = {
+    'thruster': (MAIN_ENGINE, NOSE_THRUSTER, RCS),
+    'weapon':   (GUN_TYPE,),
+    'reactor':  (REACTOR_TYPE,),
+    'computer': (COMPUTER_TYPE,),
+    'shield':   (SHIELD_TYPE,),
+}
+
+def validate_loadout(hull, loadout):
+    """Every slot filled, every part compatible with its slot type."""
+    slots = {s.name: s for s in hull.slots}
+    if set(loadout) != set(slots):
+        return False
+    return all(s.slot_type in loadout[n].slot_types
+               for n, s in slots.items())
+
+def loadout_stats(hull, loadout):
+    """Derived numbers for menu display — pure data, no sim."""
+    parts = list(loadout.values())
+    idle = sum(c.power_idle for c in parts)
+    return {
+        'mass': hull.base_mass + sum(c.mass for c in parts),
+        'power_supply': sum(c.power_supply for c in parts),
+        'power_idle': idle,
+        'power_max': idle + sum(c.power_active for c in parts),
+        'compute_supply': sum(c.compute_supply for c in parts),
+        'shield_charge': max((c.shield_max_charge for c in parts), default=0.0),
     }
 
 

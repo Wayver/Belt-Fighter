@@ -34,7 +34,8 @@ STEP = 1 / 60   # fixed simulation timestep
 
 
 class Game:
-    def __init__(self, screen, font, big_font, light_tex, fog_surf, light_surf):
+    def __init__(self, screen, font, big_font, light_tex, fog_surf, light_surf,
+                hull=None, loadout=None):
         self.screen = screen
         self.font = font
         self.big_font = big_font
@@ -73,6 +74,8 @@ class Game:
         self.ship.prev_pos = self.ship.pos.copy()
         self.ship.prev_angle = self.ship.angle
         self.ship.reset_shield()
+        self.ship.targeting_on = False
+        self.ship.tracked = 0
         self.bullets.clear()
         self.enemy_bullets.clear()
         self.particles.clear()
@@ -98,6 +101,8 @@ class Game:
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     return False
+                elif event.key == pygame.K_t and not self.game_over:
+                    self.ship.targeting_on = not self.ship.targeting_on
                 elif event.key == pygame.K_r and self.game_over:
                     self.reset()
         return True
@@ -112,6 +117,11 @@ class Game:
 
     def _step(self, dt, inp):
         if not self.game_over:
+            # Targeting sensor: count enemies in range before the ship
+            # steps, so _allocate() sees this tick's tracked count.
+            self.ship.tracked = sum(
+                1 for e in self.enemies
+                if e.pos.distance_to(self.ship.pos) <= TARGETING_RANGE)
             if inp.fire and len(self.bullets) >= MAX_BULLETS:
                 inp = replace(inp, fire=False)   # world cap: no room, no shot
             for shot in self.ship.update(dt, inp):
@@ -301,7 +311,7 @@ class Game:
             a.draw(screen, self.cam)
         for e in self.enemies:
             e.draw(screen, self.cam)
-            if TARGETING_ASSIST:
+            if TARGETING_ASSIST and self.ship.targeting_on:
                 self._draw_lead(screen, e)
         for b in self.bullets:
             s = self.cam.to_screen(b.pos)

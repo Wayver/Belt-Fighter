@@ -28,7 +28,7 @@ from dataclasses import dataclass
 
 import pygame
 
-from .bullets import Shot
+from .bullets import Shot, Beam
 
 from .config import (WIDTH, HEIGHT, ROT_SPEED, MAX_SPEED,
                      STOP_GAIN, MAX_STOP_ACCEL, STOP_DEADBAND,
@@ -36,7 +36,8 @@ from .config import (WIDTH, HEIGHT, ROT_SPEED, MAX_SPEED,
                      POWER_HYSTERESIS, AUTO_STOP_COMPUTE, SHIELD_DUMP_DECAY,
                      SHIELD_OVAL_A, SHIELD_OVAL_B, SHIELD_COLOR_DIM,
                      SHIELD_COLOR_BRIGHT, SHIELD_OFFLINE_FACTOR, SHIELD_OFFLINE_DRAIN,
-                     ARC_GLOW, ARC_CORE, TARGETING_POWER, TARGETING_COMPUTE_BASE, TARGETING_COMPUTE_PER_TARGET)
+                     ARC_GLOW, ARC_CORE, TARGETING_POWER, TARGETING_COMPUTE_BASE,
+                     TARGETING_COMPUTE_PER_TARGET, LASER_DUMP_DECAY, LASER_COLOR)
 
 from .hulls import DEFAULT_HULL, default_loadout, Slot, ComponentType
 
@@ -62,6 +63,8 @@ class Thruster:
     allocation: float = 1.0
     force: float = 0.0
 
+
+
 @dataclass
 class Weapon:
     """Runtime state for one fitted weapon (one per weapon slot).
@@ -73,6 +76,8 @@ class Weapon:
     comp: ComponentType
     cooldown: float = 0.0
     allocation: float = 1.0
+    charge: float = 0.0
+
 
 def _lerp_color(c1, c2, t):
     return tuple(int(c1[i] + (c2[i] - c1[i]) * t) for i in range(3))
@@ -119,6 +124,8 @@ class Ship:
         # targeting assist: player-toggled paid system (T key)
         self.targeting_on = False
         self.tracked = 0    # enemies within TARGETING_RANGE; set by Game each tick
+        self.laser_target = None   # enemy candidate; set by Game each tick
+        self.laser_dump = 0.0      # decaying power spike from discharges
 
 
         # Phase 2: power/compute budgets, derived from the fitted parts
@@ -187,6 +194,13 @@ class Ship:
         lx, ly = d.dot(fwd), d.dot(right)
         return (lx / SHIELD_OVAL_A) ** 2 + (ly / SHIELD_OVAL_B) ** 2 <= 1.0
 
+    def reset_lasers(self):
+        self.laser_target = None
+        self.laser_dump = 0.0
+        for w in self.weapons:
+            w.charge = 0.0
+
+
     def axes(self):
         fwd = pygame.Vector2(math.cos(self.angle), math.sin(self.angle))
         right = pygame.Vector2(-fwd.y, fwd.x)
@@ -214,12 +228,10 @@ class Ship:
 
     # --- simulation: per-thruster pipeline ---
 
-    def update(self, dt, inp):
-        """Advance one fixed timestep. dt must be the fixed step size.
 
-        Returns the list of Shot events fired this tick (world pos/vel +
-        owner id); the caller routes them into its bullet lists.
-        """
+    def update(self, dt, inp):
+        """... Returns (shots, beams) fired this tick; the caller routes
+        them into its bullet/beam lists."""
         self.prev_pos = self.pos.copy()
         self.prev_angle = self.angle
         self.dampening = inp.stop
@@ -230,12 +242,13 @@ class Ship:
         accel = self._resolve_forces()
         self.accel = accel.copy()
         shots = self._fire(dt, inp)
+        beams = self._update_lasers(dt, inp)   # after _allocate: sees this tick's brownout
         self._integrate(dt, accel)
         self._update_arcs(dt)
-        return shots
+        return shots, beams
 
     def _apply_rotation(self, dt, inp):
-        self.angle += inp.turn * ROT_SPEED * dt
+        self.angle += inp.turn * ROT_SPEED * self.hull.turn_rate_factor * dt
 
     def _set_demands(self, inp):
         """Map player input (and auto-stop guidance) to per-thruster demand.
@@ -273,8 +286,9 @@ class Ship:
         the current velocity. Limited by what the fitted thrusters can push."""
         fwd, right = self.axes()
         retro = -(self.vel * (STOP_GAIN * self.compute_alloc))
-        if retro.length() > MAX_STOP_ACCEL:
-            retro.scale_to_length(MAX_STOP_ACCEL)
+        cap = MAX_STOP_ACCEL * self.hull.max_speed_factor
+        if retro.length() > cap:
+            retro.scale_to_length(cap)
         r_fwd = retro.dot(fwd)
         r_right = retro.dot(right)
         # Push along each local axis using the thrusters aligned with it.
@@ -311,6 +325,9 @@ class Ship:
         idle = sum(c.power_idle for c in self.components.values())
         active = [(t, t.comp.power_active * t.demand) for t in self.thrusters]
         active += [(w, w.comp.power_active) for w in self.weapons if inp.fire]
+        # lasers draw power while charging (charge is last tick's value)
+        active += [(w, w.comp.power_active) for w in self.weapons
+            if w.comp.laser_range > 0 and 0.0 < w.charge < 1.0]
         
         shield_active = 0.0
         if self.shield_on:
@@ -318,6 +335,7 @@ class Ship:
         # Targeting: fixed draw while on, like the shield — a priority
         # system that can TRIGGER a brownout but isn't shed itself.
         targeting_active = TARGETING_POWER if self.targeting_on else 0.0
+        laser_active = self.laser_dump
         total = (idle + sum(need for _, need in active) + shield_active
                  + targeting_active)
         self.power_used = total
@@ -389,6 +407,8 @@ class Ship:
         """
         shots = []
         for w in self.weapons:
+            if w.comp.laser_range > 0:
+                continue   # laser: no ballistic shots, _update_lasers() owns it
             w.cooldown -= dt
             if inp.fire and w.cooldown <= 0 and w.allocation > 0:
                 fwd, right = self.axes()
@@ -398,14 +418,15 @@ class Ship:
                 w.cooldown = w.comp.fire_cooldown
         return shots
 
-
     def _integrate(self, dt, accel):
         self.vel += accel * dt
-        if self.vel.length() > MAX_SPEED:
-            self.vel.scale_to_length(MAX_SPEED)
+        cap = MAX_SPEED * self.hull.max_speed_factor
+        if self.vel.length() > cap:
+            self.vel.scale_to_length(cap)
         if self.vel.length() < STOP_DEADBAND:
             self.vel = pygame.Vector2(0, 0)
         self.pos += self.vel * dt
+
 
     def _update_shield(self, dt):
         """Recharge the shield, decay the hit-dump, sag under brownout."""
@@ -483,6 +504,53 @@ class Ship:
             self.shield_clock = 0.0
 
 
+    def _laser_in_wedge(self, w, target_pos):
+        """True if target_pos is inside laser w's firing wedge and range.
+
+        The wedge is measured from the nose: 0 deg = straight ahead,
+        positive = starboard. The component stores the arc in degrees
+        (the human-facing stat); the test works in radians via
+        wrapped_delta, same as the rest of the sim.
+        """
+        d = target_pos - self.pos
+        dist = d.length()
+        if dist < 1 or dist > w.comp.laser_range:
+            return False
+        ang_deg = math.degrees(wrapped_delta(self.angle,
+                                         math.atan2(d.y, d.x), 2 * math.pi))
+        return w.comp.laser_arc_start_deg <= ang_deg <= w.comp.laser_arc_end_deg
+
+
+    def _update_lasers(self, dt, inp):
+        """Laser charge/discharge state machine. Returns Beam events.
+
+        IDLE -> CHARGING:   target in wedge, charge < 1
+        CHARGING -> READY:  charge reaches 1
+        -> IDLE (reset):    target leaves wedge, target gone, or brownout
+        READY -> DISCHARGE: inp.laser_fire (R)
+        """
+        # decay the discharge spike (mirrors the shield's hit-dump)
+        if self.laser_dump > 0:
+            self.laser_dump = max(0.0, self.laser_dump - LASER_DUMP_DECAY * dt)
+
+        beams = []
+        for w in self.weapons:
+            if w.comp.laser_range <= 0:
+                continue                      # not a laser
+            t = self.laser_target
+            if t is None or self.brownout or not self._laser_in_wedge(w, t.pos):
+                w.charge = 0.0                # broken: full reset
+                continue
+            if w.charge < 1.0:
+                w.charge = min(1.0, w.charge + dt / w.comp.laser_charge_time)
+                continue
+            if inp.laser_fire:
+                beams.append(Beam(self.to_world(*w.slot.position), t.pos,
+                              self.id, w.comp.laser_damage))
+                self.laser_dump += w.comp.laser_discharge_dump
+                w.charge = 0.0
+        return beams
+
     # --- rendering (reads geometry from self.hull) ---
     def draw(self, screen, cam, pos=None, angle=None, fill=None, edge=None,
              flame_out=None, flame_in=None):
@@ -539,6 +607,7 @@ class Ship:
                 pygame.draw.circle(screen, edge, cam.to_screen(w(gx, gy)), 2)
 
         self._draw_shield(screen, cam, pos, angle)
+        self._draw_laser_charge(screen, cam, w)
         self._draw_arcs(screen, cam, w)
 
 
@@ -583,3 +652,43 @@ class Ship:
             sp = [cam.to_screen(w(*p)) for p in pts]
             pygame.draw.lines(screen, _dim_color(ARC_GLOW, fade), False, sp, 3)
             pygame.draw.lines(screen, _dim_color(ARC_CORE, fade), False, sp, 1)
+
+    def _draw_laser_charge(self, screen, cam, to_world):
+        """Draw a charge effect at each laser's muzzle: rays pulled
+        inward toward the weapon point as charge builds.
+
+        Rays light up in sequence; each one's inner end advances from
+        the outer radius to the muzzle over its slice of charge, so at
+        full charge they've all converged on the point. Only visible
+        while a target is in the wedge (charge resets to 0 otherwise),
+        so it doubles as a lock indicator. Presentation only.
+        """
+        n = 8
+        outer = 26.0
+        rot = pygame.time.get_ticks() * 0.0008   # slow swirl, ~8s per rev
+        for wpn in self.weapons:
+            if wpn.comp.laser_range <= 0:
+                continue                      # not a laser
+            if wpn.charge <= 0:
+                continue
+            m = cam.to_screen(to_world(*wpn.slot.position))
+            for i in range(n):
+                prog = wpn.charge * n - i     # this ray's 0..1 progress
+                if prog <= 0:
+                    continue
+                prog = min(1.0, prog)
+                ang = 2 * math.pi * i / n + rot
+                r_in = outer - prog * (outer - 2.0)
+                x1 = m.x + math.cos(ang) * r_in
+                y1 = m.y + math.sin(ang) * r_in
+                x2 = m.x + math.cos(ang) * outer
+                y2 = m.y + math.sin(ang) * outer
+                bright = 0.35 + 0.65 * prog
+                pygame.draw.line(screen, _dim_color(LASER_COLOR, bright),
+                                 (x1, y1), (x2, y2), 2)
+            if wpn.charge >= 1.0:
+                # converged: pulse a bright point at the muzzle
+                phase = pygame.time.get_ticks() * 0.012
+                r = 3 + int(2 * (0.5 + 0.5 * math.sin(phase)))
+                pygame.draw.circle(screen, LASER_COLOR,
+                                   (int(m.x), int(m.y)), r)

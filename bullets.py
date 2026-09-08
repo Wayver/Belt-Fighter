@@ -15,6 +15,14 @@ class Shot:
     vel: pygame.Vector2
     owner: int
 
+@dataclass(frozen=True)
+class Beam:
+    """A hitscan laser discharge in world space (muzzle -> target)."""
+    start: pygame.Vector2
+    end: pygame.Vector2
+    owner: int
+    damage: int = 1
+
 
 class Bullet:
     def __init__(self, pos, vel, owner=0):

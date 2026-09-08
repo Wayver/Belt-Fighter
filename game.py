@@ -19,7 +19,7 @@ from .config import (WIDTH, HEIGHT, SPAWN_PROTECT, MAX_BULLETS,
                     TARGETING_ASSIST, TARGETING_COLOR, TARGETING_HORIZON,
                     TARGETING_STEPS, TARGETING_RANGE,
                     TARGETING_USE_ACCEL, TARGETING_MAX_LEAD,
-                    TARGETING_COLOR_GREEN, TARGETING_ALIGN_TOL)
+                    TARGETING_COLOR_GREEN, TARGETING_ALIGN_TOL, LASER_COLOR)
 from .ship import Ship, wrapped_delta
 from .intent import ShipInput
 from .asteroid import Asteroid
@@ -54,6 +54,7 @@ class Game:
 
         self.cam = Camera(self.ship.pos)
         self.bullets = []
+        self.beams   = []
         self.enemy_bullets = []
         self.particles = []
         self.asteroids = []
@@ -78,6 +79,8 @@ class Game:
         self.ship.tracked = 0
         self.bullets.clear()
         self.enemy_bullets.clear()
+        self.beams.clear()
+        self.ship.reset_lasers()
         self.particles.clear()
         self.asteroids.clear()
         self.enemies.clear()
@@ -90,8 +93,8 @@ class Game:
         self.cam.pos = self.ship.pos.copy()
         update_field(self.asteroids, [self.ship.pos], self.wave, 0)
         spawn_enemy(self.enemies, self.ship)
-        spawn_enemy(self.enemies, self.ship)
-        spawn_enemy(self.enemies, self.ship)
+        #spawn_enemy(self.enemies, self.ship)
+        #spawn_enemy(self.enemies, self.ship)
 
     def handle_events(self):
         """Returns False when the window should close."""
@@ -122,39 +125,83 @@ class Game:
             self.ship.tracked = sum(
                 1 for e in self.enemies
                 if e.pos.distance_to(self.ship.pos) <= TARGETING_RANGE)
+            
+
+
+            # Laser target: nearest enemy in range, set before the ship
+            # steps so _update_lasers() sees it this tick.
+            self.ship.laser_target = self._pick_laser_target()
             if inp.fire and len(self.bullets) >= MAX_BULLETS:
                 inp = replace(inp, fire=False)   # world cap: no room, no shot
-            for shot in self.ship.update(dt, inp):
+            shots, beams = self.ship.update(dt, inp)
+            
+            for shot in shots:
                 self.bullets.append(Bullet(shot.pos, shot.vel, owner=shot.owner))
+            
+            for beam in beams:
+                self._resolve_beam(beam)
+            
             self.protect_timer -= dt
             self.wave_timer += dt
             if self.wave_timer >= WAVE_INTERVAL:
                 self.wave_timer = 0.0
                 self.wave += 1
             update_field(self.asteroids, [self.ship.pos], self.wave, dt)
-            
-        #
+
         for e in self.enemies:
-            for shot in e.update(dt, self.ship, self.asteroids):
+            shots, _ = e.update(dt, self.ship, self.asteroids)
+            for shot in shots:
                 self.enemy_bullets.append(EnemyBullet(shot.pos, shot.vel, owner=shot.owner))
 
         for b in self.bullets:
             b.update(dt)
-        self.bullets = [b for b in self.bullets if b.life > 0]
-
         for b in self.enemy_bullets:
             b.update(dt)
-        self.enemy_bullets = [b for b in self.enemy_bullets if b.life > 0]
-
         for a in self.asteroids:
             a.update(dt)
-
         for p in self.particles:
             p.update(dt)
+
+        # cull expired projectiles and particles
+        self.bullets = [b for b in self.bullets if b.life > 0]
+        self.enemy_bullets = [b for b in self.enemy_bullets if b.life > 0]
         self.particles = [p for p in self.particles if p.life > 0]
 
-        if not self.game_over:
-            self._collisions()
+        # collisions after movement, so this tick's motion counts
+        self._collisions()
+
+        # age the beam visuals
+        for b in self.beams:
+            b[2] += dt
+        self.beams = [b for b in self.beams if b[2] < b[3]]
+
+    def _pick_laser_target(self):
+        """Nearest enemy within the max laser range; None if no laser fitted."""
+        max_range = max((w.comp.laser_range for w in self.ship.weapons
+                         if w.comp.laser_range > 0), default=0.0)
+        if max_range <= 0:
+            return None
+        best, best_d = None, max_range
+        for e in self.enemies:
+            d = e.pos.distance_to(self.ship.pos)
+            if d <= best_d:
+                best, best_d = e, d
+        return best
+
+    def _resolve_beam(self, beam):
+        """Hitscan: hit the first enemy near the beam's end point."""
+        for i, e in enumerate(self.enemies):
+            if e.pos.distance_to(beam.end) < e.collision_radius + 4:
+                for _ in range(beam.damage):
+                    if not e.register_hit(beam.end):
+                        self.score += ENEMY_SCORE
+                        burst(self.particles, e.pos, 20, big=True)
+                        self.enemies.pop(i)
+                        spawn_enemy(self.enemies, self.ship)
+                        break
+                self.beams.append([beam.start, beam.end, 0.0, 0.15])
+                return
+
 
     def _draw_targeting(self, screen, e):
         pts = e.predict_path(TARGETING_HORIZON, TARGETING_STEPS)
@@ -316,6 +363,11 @@ class Game:
         for b in self.bullets:
             s = self.cam.to_screen(b.pos)
             pygame.draw.circle(screen, BULLET_COLOR, (int(s.x), int(s.y)), 3)
+        for start, end, age, ttl in self.beams:
+            fade = 1.0 - age / ttl
+            c = tuple(int(ch * fade) for ch in LASER_COLOR)
+            pygame.draw.line(screen, c, self.cam.to_screen(start),
+                             self.cam.to_screen(end), 2)
         for b in self.enemy_bullets:
             s = self.cam.to_screen(b.pos)
             pygame.draw.circle(screen, ENEMY_BULLET_COLOR, (int(s.x), int(s.y)), 3)

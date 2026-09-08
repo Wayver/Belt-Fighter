@@ -54,6 +54,10 @@ SHIELD_COLOR_DIM = (50, 100, 170)
 SHIELD_COLOR_BRIGHT = (120, 200, 255)
 SHIELD_SPARK_COLORS = [(120, 200, 255), (180, 230, 255), (255, 255, 255)]
 
+# --- laser (charge weapon) ---
+LASER_DUMP_DECAY = 50.0        # power/s the discharge spike decays (mirrors shield dump)
+LASER_COLOR      = (140, 255, 190)   # beam + charge ring
+
 # --- asteroid knobs ---
 ROCK_SIZES = {
     'large':  {'radius': 50, 'score': 20,  'speed': (20, 60),  'spin': (0.2, 0.8)},
@@ -64,8 +68,10 @@ ROCK_SPLIT = {'large': 'medium', 'medium': 'small', 'small': None}
 STARTING_WAVE = 2        # large rocks in wave 1; +1 per wave
 
 # --- enemy ship knobs ---
-ENEMY_ACCEL = 110.0
-ENEMY_MAX_SPEED = 250.0
+#ENEMY_ACCEL = 110.0
+#ENEMY_MAX_SPEED = 250.0
+ENEMY_ACCEL = 10.0
+ENEMY_MAX_SPEED = 25.0
 ENEMY_ROT_SPEED = 3.4
 ENEMY_RADIUS = 11.0
 ENEMY_HP = 1
@@ -83,7 +89,7 @@ ENEMY_AVOID_WEIGHT = 6.2    # strength of the avoidance steering
 ENEMY_COURSE_MARGIN = 30.0  # miss-distance slack before the AI slams the damper
 
 # --- fog of war knobs ---
-FOG_ALPHA = 100          # how dark the fog is (0-255)
+FOG_ALPHA = 50          # how dark the fog is (0-255)
 FOG_BASE_RADIUS = 160.0  # all-around visibility around the ship
 FOG_FRONT_RADIUS = 430.0 # reach of the forward lobe
 FOG_SIDE_RADIUS = 200.0  # width of the forward lobe

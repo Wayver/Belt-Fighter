@@ -58,6 +58,8 @@ class HullType:
     collision_radius: float = 12.0
     nose: tuple = (18, 0)          # fallback muzzle / ram anchor
     cockpit: tuple = (8, 0)        # small cockpit dot
+    max_speed_factor: float = 1.0  # per-hull top-speed multiplier
+    turn_rate_factor: float = 1.0  # per-hull turn-rate multiplier
 
 
 @dataclass(frozen=True)
@@ -86,7 +88,15 @@ class ComponentType:
     shield_recharge_rate: float = 0.0
     fire_cooldown: float = 0.0   # seconds between shots
     bullet_speed: float = 0.0    # px/s, expressed off config below
-
+    fire_cooldown: float = 0.0
+    bullet_speed: float = 0.0
+    # --- laser (charge weapon) ---
+    laser_arc_start_deg: float = 0.0   # wedge start, deg rel. to nose (+ = starboard)
+    laser_arc_end_deg: float = 0.0     # wedge end
+    laser_range: float = 0.0           # 0 = not a laser; else max firing range
+    laser_charge_time: float = 0.0     # seconds to full charge
+    laser_damage: int = 0
+    laser_discharge_dump: float = 0.0  # power spike added on fire
 
 # --- The current ship, as data ---
 # orientation = force direction on the ship (exhaust is the opposite).
@@ -184,6 +194,15 @@ E_SHIELD_TYPE = ComponentType('shield', 'Shield', ('shield',),
                              shield_recharge_rate=0.5)
 
 
+LASER_TYPE = ComponentType('laser', 'Laser', ('weapon',),
+    mass=3.0, power_idle=2.0, power_active=12.0,   # power_active = charge draw
+    laser_arc_start_deg=-15.0, laser_arc_end_deg=15.0,
+    laser_range=900.0,          # <-- the arbitrary range; turn this
+    laser_charge_time=0.5,
+    laser_damage=3,
+    laser_discharge_dump=30.0,
+    priority=2)
+
 def default_loadout(hull=None):
     """slot_name -> ComponentType, the stock fit for a hull."""
     hull = hull or DEFAULT_HULL
@@ -216,7 +235,7 @@ def default_loadout(hull=None):
 # What the menu offers per slot type.
 COMPONENT_CATALOG = {
     'thruster': (MAIN_ENGINE, NOSE_THRUSTER, RCS, RCS_HEAVY),
-    'weapon':   (GUN_TYPE,),
+    'weapon':   (GUN_TYPE, LASER_TYPE),
     'reactor':  (REACTOR_TYPE,),
     'computer': (COMPUTER_TYPE,),
     'shield':   (SHIELD_TYPE,),

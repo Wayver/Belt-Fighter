@@ -24,6 +24,7 @@ class ShipInput:
     thrust_right: float = 0.0    # D, 0 or 1
     stop: bool = False           # B: auto-stop guidance
     fire: bool = False           # SPACE
+    laser_fire: bool = False      # R
 
     @classmethod
     def from_keys(cls, keys):
@@ -38,4 +39,5 @@ class ShipInput:
                    thrust_left=1.0 if keys[pygame.K_a] else 0.0,
                    thrust_right=1.0 if keys[pygame.K_d] else 0.0,
                    stop=keys[pygame.K_b],
-                   fire=keys[pygame.K_SPACE])
+                   fire=keys[pygame.K_SPACE],
+                   laser_fire=keys[pygame.K_r])

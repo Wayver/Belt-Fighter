@@ -157,6 +157,10 @@ RCS           = ComponentType('rcs', 'RCS', ('thruster',),
                               mass=0.5, thrust=SHIP_ACCEL,
                               power_idle=1.0, power_active=5.0,
                               compute_demand=5.0, priority=1)
+RCS_HEAVY = ComponentType('rcs_heavy', 'Heavy RCS', ('thruster',),
+                          mass=0.75, thrust=SHIP_ACCEL * 1.5,
+                          power_idle=1.0, power_active=8.0,
+                          compute_demand=5.0, priority=1)
 GUN_TYPE      = ComponentType('gun', 'Pulse Gun', ('weapon',), mass=1.0,
                               power_idle=2.0, power_active=5.0,
                               fire_cooldown=FIRE_COOLDOWN,
@@ -180,27 +184,38 @@ E_SHIELD_TYPE = ComponentType('shield', 'Shield', ('shield',),
                              shield_recharge_rate=0.5)
 
 
-def default_loadout():
-    """slot_name -> ComponentType, reproducing the current ship's fittings."""
-    return {
-        'forward_s': MAIN_ENGINE,
-        'forward_p': MAIN_ENGINE,
-        'reverse': NOSE_THRUSTER,
-        'to_left': RCS,
-        'to_right': RCS,
-        'gun': GUN_TYPE,
-        'reactor': REACTOR_TYPE,
-        'computer': COMPUTER_TYPE,
-        'shield'  : SHIELD_TYPE,
-    }
+def default_loadout(hull=None):
+    """slot_name -> ComponentType, the stock fit for a hull."""
+    hull = hull or DEFAULT_HULL
+    is_bb = hull.id == 'blackbird'
+    # Blackbird: strong forward drive, weak reverse (swapped vs the scout).
+    fwd, rev = (NOSE_THRUSTER, MAIN_ENGINE) if is_bb else (MAIN_ENGINE, NOSE_THRUSTER)
+    out = {}
+    for s in hull.slots:
+        if s.slot_type == 'thruster':
+            if s.name in ('forward_s', 'forward_p'):
+                out[s.name] = fwd
+            elif s.name.startswith('reverse'):
+                out[s.name] = rev
+            else:
+                out[s.name] = RCS_HEAVY if hull.id == 'blackbird' else RCS
+        elif s.slot_type == 'weapon':
+            out[s.name] = GUN_TYPE
+        elif s.slot_type == 'reactor':
+            out[s.name] = REACTOR_TYPE
+        elif s.slot_type == 'computer':
+            out[s.name] = COMPUTER_TYPE
+        elif s.slot_type == 'shield':
+            out[s.name] = SHIELD_TYPE
+    return out
 
 
 # --- Player-selectable catalog ---
-PLAYER_HULLS = (DEFAULT_HULL,)   # future hulls append here
+#PLAYER_HULLS = (DEFAULT_HULL, BLACKBIRD_HULL)   # future hulls append here
 
 # What the menu offers per slot type.
 COMPONENT_CATALOG = {
-    'thruster': (MAIN_ENGINE, NOSE_THRUSTER, RCS),
+    'thruster': (MAIN_ENGINE, NOSE_THRUSTER, RCS, RCS_HEAVY),
     'weapon':   (GUN_TYPE,),
     'reactor':  (REACTOR_TYPE,),
     'computer': (COMPUTER_TYPE,),
@@ -228,6 +243,58 @@ def loadout_stats(hull, loadout):
         'shield_charge': max((c.shield_max_charge for c in parts), default=0.0),
     }
 
+
+# --- Blackbird: long slender fuselage, swept delta wings, twin tails ---
+# Twin reverse thrusters flank the nose; RCS pods sit on the wingtips.
+
+BB_FORWARD_S = Slot('forward_s', 'thruster', (-15, 1.5), (1, 0), flame_key='forward')
+BB_FORWARD_P = Slot('forward_p', 'thruster', (-15, -1.5), (1, 0), flame_key='forward')
+# Twin reverse thrusters flanking the nose (shared 'reverse' flame bucket).
+BB_REVERSE_S = Slot('reverse_s', 'thruster', (6, 5.5), (-1, 0), flame_key='reverse')
+BB_REVERSE_P = Slot('reverse_p', 'thruster', (6, -5.5), (-1, 0), flame_key='reverse')
+# RCS pods on the wingtips: force across the ship, flame drawn outward.
+BB_RCS_L     = Slot('to_left', 'thruster', (-8, -13.5), (0, -1),
+                    flame_dir=(0, -1), flame_key='to_left',
+                    flame_scale=0.5, flame_width=2)
+BB_RCS_R     = Slot('to_right', 'thruster', (-8, 13.5), (0, 1),
+                    flame_dir=(0, 1), flame_key='to_right',
+                    flame_scale=0.5, flame_width=2)
+BB_GUN       = Slot('gun', 'weapon', (24, 0), (1, 0))
+BB_REACTOR   = Slot('reactor', 'reactor', (-2, 0))
+BB_COMPUTER  = Slot('computer', 'computer', (4, 0))
+BB_SHIELD    = Slot('shield', 'shield', (0, 0))
+
+BLACKBIRD_HULL = HullType(
+    id='blackbird',
+    polygon=(
+        (26, 0),      # nose tip
+        (14, 1.5),    # nose side (widened for the twin reverse thrusters)
+        (10, 2.5),    # wing root leading edge
+        (-6, 14),     # starboard wingtip, front
+        (-10, 14),    # starboard wingtip, rear (flat tip)
+        (-14, 6),     # wing trailing edge
+        (-16, 5),     # starboard tail fin, front
+        (-18, 5),     # starboard tail fin, rear
+        (-18, 2.5),   # starboard tail fin, inner
+        (-15, 2),     # rear fuselage corner
+        (-15, 0),     # rear center (between exhausts)
+        (-15, -2),
+        (-18, -2.5),
+        (-18, -5),
+        (-16, -5),
+        (-14, -6),
+        (-10, -14),
+        (-6, -14),
+        (10, -2.5),
+        (14, -1.5),
+    ),
+    slots=(BB_FORWARD_S, BB_FORWARD_P, BB_REVERSE_S, BB_REVERSE_P,
+           BB_RCS_L, BB_RCS_R, BB_GUN, BB_REACTOR, BB_COMPUTER, BB_SHIELD),
+    base_mass=1.5,
+    collision_radius=14.0,
+    nose=(26, 0),
+    cockpit=(16, 0),
+)
 
 # --- Enemy hull: slender dart body + forward wing gun pods ---
 # Standard thruster slot names (forward_s/forward_p) so Ship._set_demands
@@ -301,3 +368,6 @@ def enemy_loadout():
         'computer': COMPUTER_TYPE,
         'shield'  : E_SHIELD_TYPE,
     }
+
+
+PLAYER_HULLS = (DEFAULT_HULL, BLACKBIRD_HULL)   # future hulls append here

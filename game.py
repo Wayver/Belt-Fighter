@@ -44,7 +44,7 @@ class Game:
         self.light_surf = light_surf
         self.stars = make_stars()
 
-        self.ship = Ship()
+        self.ship = Ship(hull=hull, loadout=loadout)
         r = self.ship.collision_radius
         self.shield = pygame.Surface((int(r * 2 + 10), int(r * 2 + 10)),
                                      pygame.SRCALPHA)

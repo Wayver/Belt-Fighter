@@ -86,7 +86,7 @@ class Ship:
         self.id = ship_id
         self.hull = hull or DEFAULT_HULL
         # slot_name -> ComponentType (the fitted parts, all types)
-        self.components = dict(loadout or default_loadout())
+        self.components = dict(loadout or default_loadout(self.hull))
         # runtime thruster instances (thruster slots only)
         self.thrusters = []
         self.thrusters_by_name = {}
@@ -249,8 +249,12 @@ class Ship:
         if inp.thrust_fwd:
             self._demand('forward_s', inp.thrust_fwd)
             self._demand('forward_p', inp.thrust_fwd)
+        #if inp.thrust_rev:
+        #    self._demand('reverse', inp.thrust_rev)
         if inp.thrust_rev:
-            self._demand('reverse', inp.thrust_rev)
+            for t in self.thrusters:
+                if t.slot.orientation == (-1, 0):
+                    t.demand = max(t.demand, inp.thrust_rev)
         if inp.thrust_right:
             self._demand('to_right', inp.thrust_right)
         if inp.thrust_left:

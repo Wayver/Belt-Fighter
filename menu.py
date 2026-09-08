@@ -13,7 +13,7 @@ import math
 import pygame
 
 from .config import WIDTH, HEIGHT, BG, SHIP_COLOR, SHIP_EDGE
-from .hulls import PLAYER_HULLS, COMPONENT_CATALOG, loadout_stats
+from .hulls import PLAYER_HULLS, COMPONENT_CATALOG, loadout_stats, default_loadout
 
 DIM = (110, 120, 140)
 BRIGHT = (200, 210, 225)
@@ -29,7 +29,7 @@ class Menu:
         self.state = 'hull'        # 'hull' -> 'loadout' -> done
         self.hull_index = 0
         self.slot_index = 0
-        self.slot_choice = {}      # slot_name -> index into COMPONENT_CATALOG
+        self.slot_choice = self._stock_choices(self._hull()) 
         self.done = False
         self.hull = None
         self.loadout = None
@@ -38,6 +38,16 @@ class Menu:
 
     def _hull(self):
         return PLAYER_HULLS[self.hull_index]
+
+    def _stock_choices(self, hull):
+        """slot_name -> catalog index, matching the hull's stock loadout."""
+        stock = default_loadout(hull)
+        out = {}
+        for s in hull.slots:
+            opts = COMPONENT_CATALOG[s.slot_type]
+            comp = stock.get(s.name)
+            out[s.name] = opts.index(comp) if comp in opts else 0
+        return out
 
     def _current_loadout(self):
         return {s.name: COMPONENT_CATALOG[s.slot_type][
@@ -64,7 +74,7 @@ class Menu:
                         n = len(PLAYER_HULLS)
                         d = 1 if event.key == pygame.K_DOWN else -1
                         self.hull_index = (self.hull_index + d) % n
-                        self.slot_index = 0
+                        self.slot_choice = self._stock_choices(self._hull())
                     elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                         self.state = 'loadout'
                 elif self.state == 'loadout':

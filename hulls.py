@@ -60,7 +60,8 @@ class HullType:
     cockpit: tuple = (8, 0)        # small cockpit dot
     max_speed_factor: float = 1.0  # per-hull top-speed multiplier
     turn_rate_factor: float = 1.0  # per-hull turn-rate multiplier
-
+    fill: tuple = None     # body color; None = config SHIP_COLOR
+    edge: tuple = None     # edge color; None = config SHIP_EDGE
 
 @dataclass(frozen=True)
 class ComponentType:
@@ -190,23 +191,50 @@ E_SHIELD_TYPE = ComponentType('shield', 'Shield', ('shield',),
                              mass=2.0,
                              power_idle=2.0, power_active=10.0,
                              power_hit=45.0,
-                             shield_max_charge=2.0,
+                             shield_max_charge=5.0,
                              shield_recharge_rate=0.5)
 
 
 LASER_TYPE = ComponentType('laser', 'Laser', ('weapon',),
     mass=3.0, power_idle=2.0, power_active=12.0,   # power_active = charge draw
-    laser_arc_start_deg=-15.0, laser_arc_end_deg=15.0,
-    laser_range=900.0,          # <-- the arbitrary range; turn this
+    laser_arc_start_deg=-20.0, laser_arc_end_deg=20.0,
+    laser_range=600.0,          # <-- the arbitrary range; turn this
     laser_charge_time=0.5,
-    laser_damage=3,
+    laser_damage=2,
     laser_discharge_dump=30.0,
     priority=2)
+
+LASER_S = ComponentType('laser_s', 'Laser (Starboard)', ('weapon',),
+    mass=3.0, power_idle=2.0, power_active=12.0,
+    laser_arc_start_deg=0.0,  laser_arc_end_deg=110.0,   # nose to starboard
+    laser_range=900.0,
+    laser_charge_time=1.,
+    laser_damage=2,
+    laser_discharge_dump=30.0,
+    priority=2)
+
+LASER_P = ComponentType('laser_p', 'Laser (Port)', ('weapon',),
+    mass=3.0, power_idle=2.0, power_active=12.0,
+    laser_arc_start_deg=-110.0, laser_arc_end_deg=0.0,   # port to nose
+    laser_range=900.0,
+    laser_charge_time=0.5,
+    laser_damage=2,
+    laser_discharge_dump=30.0,
+    priority=2)
+
+
+
+
+# Silas's teeth: 5 x SHIP_ACCEL/5 = SHIP_ACCEL total (scout-mains parity).
+TOOTH_THRUSTER = ComponentType('tooth_thruster', 'Tooth Thruster', ('thruster',),
+                               mass=0.5, thrust=SHIP_ACCEL / 5,
+                               power_idle=0.5, power_active=8.0, priority=2)
 
 def default_loadout(hull=None):
     """slot_name -> ComponentType, the stock fit for a hull."""
     hull = hull or DEFAULT_HULL
     is_bb = hull.id == 'blackbird'
+    is_silas = hull.id == 'silas'
     # Blackbird: strong forward drive, weak reverse (swapped vs the scout).
     fwd, rev = (NOSE_THRUSTER, MAIN_ENGINE) if is_bb else (MAIN_ENGINE, NOSE_THRUSTER)
     out = {}
@@ -214,12 +242,22 @@ def default_loadout(hull=None):
         if s.slot_type == 'thruster':
             if s.name in ('forward_s', 'forward_p'):
                 out[s.name] = fwd
+            elif s.name.startswith('tooth'):
+                out[s.name] = TOOTH_THRUSTER
             elif s.name.startswith('reverse'):
                 out[s.name] = rev
             else:
                 out[s.name] = RCS_HEAVY if hull.id == 'blackbird' else RCS
+        
         elif s.slot_type == 'weapon':
-            out[s.name] = GUN_TYPE
+            if s.name == 'gun_s':
+                out[s.name] = LASER_S
+            elif s.name == 'gun_p':
+                out[s.name] = LASER_P
+            else:
+                out[s.name] = GUN_TYPE
+
+
         elif s.slot_type == 'reactor':
             out[s.name] = REACTOR_TYPE
         elif s.slot_type == 'computer':
@@ -234,8 +272,8 @@ def default_loadout(hull=None):
 
 # What the menu offers per slot type.
 COMPONENT_CATALOG = {
-    'thruster': (MAIN_ENGINE, NOSE_THRUSTER, RCS, RCS_HEAVY),
-    'weapon':   (GUN_TYPE, LASER_TYPE),
+    'thruster': (MAIN_ENGINE, NOSE_THRUSTER, TOOTH_THRUSTER, RCS, RCS_HEAVY),
+    'weapon':   (GUN_TYPE, LASER_TYPE, LASER_S, LASER_P),
     'reactor':  (REACTOR_TYPE,),
     'computer': (COMPUTER_TYPE,),
     'shield':   (SHIELD_TYPE,),
@@ -315,6 +353,87 @@ BLACKBIRD_HULL = HullType(
     cockpit=(16, 0),
 )
 
+# --- Blackbird WG: Blackbird with wing guns on the leading edges ---
+# Gun slots sit on the wing leading edge, midway between wingtip and
+# wing root: midpoint of (10, 2.5) -> (-6, 14) is (2, 8.25).
+
+BBWG_GUN_S = Slot('gun_s', 'weapon', (2, 8.25), (1, 0))
+BBWG_GUN_P = Slot('gun_p', 'weapon', (2, -8.25), (1, 0))
+
+BLACKBIRD_WG_HULL = HullType(
+    id='blackbird_wg',
+    polygon=BLACKBIRD_HULL.polygon,
+    slots=(BB_FORWARD_S, BB_FORWARD_P, BB_REVERSE_S, BB_REVERSE_P,
+           BB_RCS_L, BB_RCS_R, BB_GUN, BBWG_GUN_S, BBWG_GUN_P,
+           BB_REACTOR, BB_COMPUTER, BB_SHIELD),
+    base_mass=1.5,
+    collision_radius=14.0,
+    nose=(26, 0),
+    cockpit=(16, 0),
+)
+
+
+# --- Silas: cartoon cat head. Orange and white, ears pointing forward,
+# laser eyes, and a row of five tooth-thrusters along the chin.
+# The teeth are the main drive (5 x SHIP_ACCEL/5 = SHIP_ACCEL total).
+
+SILAS_TOOTH_S2 = Slot('tooth_s2', 'thruster', (-11.5, 5), (1, 0), flame_key='forward')
+SILAS_TOOTH_S1 = Slot('tooth_s1', 'thruster', (-13, 2.5), (1, 0), flame_key='forward')
+SILAS_TOOTH_C  = Slot('tooth_c',  'thruster', (-13.5, 0), (1, 0), flame_key='forward')
+SILAS_TOOTH_P1 = Slot('tooth_p1', 'thruster', (-13, -2.5), (1, 0), flame_key='forward')
+SILAS_TOOTH_P2 = Slot('tooth_p2', 'thruster', (-11.5, -5), (1, 0), flame_key='forward')
+# The cat's nose: reverse thruster on the forehead (retro-thrust, flame fwd).
+SILAS_REVERSE  = Slot('reverse', 'thruster', (13, 0), (-1, 0), flame_key='reverse')
+# RCS on the cheeks.
+SILAS_RCS_L = Slot('to_left', 'thruster', (-2, -13.5), (0, -1),
+                   flame_dir=(0, -1), flame_key='to_left',
+                   flame_scale=0.5, flame_width=2)
+SILAS_RCS_R = Slot('to_right', 'thruster', (-2, 13.5), (0, 1),
+                   flame_dir=(0, 1), flame_key='to_right',
+                   flame_scale=0.5, flame_width=2)
+# Laser eyes.
+SILAS_EYE_S = Slot('eye_s', 'weapon', (8, 5.5), (1, 0))
+SILAS_EYE_P = Slot('eye_p', 'weapon', (8, -5.5), (1, 0))
+SILAS_REACTOR  = Slot('reactor', 'reactor', (-6, 0))
+SILAS_COMPUTER = Slot('computer', 'computer', (-2, 0))
+SILAS_SHIELD   = Slot('shield', 'shield', (0, 0))
+
+SILAS_HULL = HullType(
+    id='silas',
+    polygon=(
+        (19, 12),     # starboard ear tip (points forward)
+        (6, 13),      # starboard ear outer base
+        (-1, 15),     # starboard cheek (widest)
+        (-9, 11),     # starboard lower cheek
+        (-13, 6),     # starboard chin corner
+        (-15, 3),     # chin
+        (-15.5, 0),   # chin center (stern)
+        (-15, -3),    # chin
+        (-13, -6),    # port chin corner
+        (-9, -11),    # port lower cheek
+        (-1, -15),    # port cheek
+        (6, -13),     # port ear outer base
+        (19, -12),    # port ear tip (points forward)
+        (10, -5.5),   # port ear inner base
+        (13, 0),      # forehead (dip between the ears)
+        (10, 5.5),    # starboard ear inner base
+    ),
+    slots=(SILAS_TOOTH_S2, SILAS_TOOTH_S1, SILAS_TOOTH_C,
+           SILAS_TOOTH_P1, SILAS_TOOTH_P2, SILAS_REVERSE,
+           SILAS_RCS_L, SILAS_RCS_R, SILAS_EYE_S, SILAS_EYE_P,
+           SILAS_REACTOR, SILAS_COMPUTER, SILAS_SHIELD),
+    base_mass=1.0,
+    collision_radius=15.0,
+    nose=(13, 0),
+    cockpit=(11, 0),      # renders as the cat's nose dot
+    max_speed_factor=1.0,
+    turn_rate_factor=1.15,
+    fill=(240, 150, 60),  # orange
+    edge=(255, 245, 230), # white
+)
+
+
+
 # --- Enemy hull: slender dart body + forward wing gun pods ---
 # Standard thruster slot names (forward_s/forward_p) so Ship._set_demands
 # works unchanged. The wings carry the guns (gun_s/gun_p), not RCS.
@@ -389,4 +508,4 @@ def enemy_loadout():
     }
 
 
-PLAYER_HULLS = (DEFAULT_HULL, BLACKBIRD_HULL)   # future hulls append here
+PLAYER_HULLS = (DEFAULT_HULL, BLACKBIRD_HULL, BLACKBIRD_WG_HULL, SILAS_HULL)   # future hulls append here

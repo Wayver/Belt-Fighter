@@ -22,6 +22,7 @@ class Beam:
     end: pygame.Vector2
     owner: int
     damage: int = 1
+    local_start: tuple = None   # hull-local muzzle coords, for re-anchoring
 
 
 class Bullet:

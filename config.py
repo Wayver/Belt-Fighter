@@ -57,6 +57,7 @@ SHIELD_SPARK_COLORS = [(120, 200, 255), (180, 230, 255), (255, 255, 255)]
 # --- laser (charge weapon) ---
 LASER_DUMP_DECAY = 50.0        # power/s the discharge spike decays (mirrors shield dump)
 LASER_COLOR      = (140, 255, 190)   # beam + charge ring
+BEAM_IMPACT_SPREAD = 0.7 # rad; per-damage-point angular jitter on beam impact
 
 # --- asteroid knobs ---
 ROCK_SIZES = {

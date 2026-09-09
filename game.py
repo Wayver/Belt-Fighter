@@ -19,7 +19,8 @@ from .config import (WIDTH, HEIGHT, SPAWN_PROTECT, MAX_BULLETS,
                     TARGETING_ASSIST, TARGETING_COLOR, TARGETING_HORIZON,
                     TARGETING_STEPS, TARGETING_RANGE,
                     TARGETING_USE_ACCEL, TARGETING_MAX_LEAD,
-                    TARGETING_COLOR_GREEN, TARGETING_ALIGN_TOL, LASER_COLOR)
+                    TARGETING_COLOR_GREEN, TARGETING_ALIGN_TOL, LASER_COLOR,
+                    BEAM_IMPACT_SPREAD)
 from .ship import Ship, wrapped_delta
 from .intent import ShipInput
 from .asteroid import Asteroid
@@ -93,8 +94,8 @@ class Game:
         self.cam.pos = self.ship.pos.copy()
         update_field(self.asteroids, [self.ship.pos], self.wave, 0)
         spawn_enemy(self.enemies, self.ship)
-        #spawn_enemy(self.enemies, self.ship)
-        #spawn_enemy(self.enemies, self.ship)
+        spawn_enemy(self.enemies, self.ship)
+        spawn_enemy(self.enemies, self.ship)
 
     def handle_events(self):
         """Returns False when the window should close."""
@@ -172,8 +173,8 @@ class Game:
 
         # age the beam visuals
         for b in self.beams:
-            b[2] += dt
-        self.beams = [b for b in self.beams if b[2] < b[3]]
+            b[4] += dt
+        self.beams = [b for b in self.beams if b[4] < b[5]]
 
     def _pick_laser_target(self):
         """Nearest enemy within the max laser range; None if no laser fitted."""
@@ -189,17 +190,36 @@ class Game:
         return best
 
     def _resolve_beam(self, beam):
-        """Hitscan: hit the first enemy near the beam's end point."""
+        """Hitscan: hit the first enemy near the beam's end point.
+
+        The beam *line* is drawn to the point on the target's shield/hull
+        facing the muzzle, so beams from different muzzles land at different
+        spots. Each damage point additionally jitters its shield flash.
+        """
         for i, e in enumerate(self.enemies):
             if e.pos.distance_to(beam.end) < e.collision_radius + 4:
+                approach = e.pos - beam.start
+                if approach.length_squared() < 1e-6:
+                    approach = pygame.Vector2(1, 0)
+                base_ang = math.atan2(approach.y, approach.x)
+                # Where the beam line visually lands: on the shield oval (or
+                # hull) facing the muzzle.
+                d = pygame.Vector2(math.cos(base_ang), math.sin(base_ang))
+                vis_end = e.ship.shield_impact_point(e.pos - d * e.collision_radius)
                 for _ in range(beam.damage):
-                    if not e.register_hit(beam.end):
+                    ang = base_ang + random.uniform(-BEAM_IMPACT_SPREAD,
+                                                BEAM_IMPACT_SPREAD)
+                    d2 = pygame.Vector2(math.cos(ang), math.sin(ang))
+                    impact = e.pos - d2 * e.collision_radius
+                    if not e.register_hit(impact):
                         self.score += ENEMY_SCORE
                         burst(self.particles, e.pos, 20, big=True)
                         self.enemies.pop(i)
                         spawn_enemy(self.enemies, self.ship)
                         break
-                self.beams.append([beam.start, beam.end, 0.0, 0.15])
+                    shield_burst(self.particles,
+                             e.ship.shield_impact_point(impact))
+                self.beams.append([beam.local_start, e, d,  vis_end, 0.0, 0.15])
                 return
 
 
@@ -363,11 +383,24 @@ class Game:
         for b in self.bullets:
             s = self.cam.to_screen(b.pos)
             pygame.draw.circle(screen, BULLET_COLOR, (int(s.x), int(s.y)), 3)
-        for start, end, age, ttl in self.beams:
+        
+
+        for local, target, d, vis_end, age, ttl in self.beams:
             fade = 1.0 - age / ttl
             c = tuple(int(ch * fade) for ch in LASER_COLOR)
+            fwd = pygame.Vector2(math.cos(self.ship.rangle),
+                                 math.sin(self.ship.rangle))
+            right = pygame.Vector2(-fwd.y, fwd.x)
+            start = self.ship.rpos + fwd * local[0] + right * local[1]
+            if target in self.enemies:
+                end = target.ship.shield_impact_point(
+                    target.pos - d * target.collision_radius)
+            else:
+                end = vis_end
             pygame.draw.line(screen, c, self.cam.to_screen(start),
                              self.cam.to_screen(end), 2)
+
+
         for b in self.enemy_bullets:
             s = self.cam.to_screen(b.pos)
             pygame.draw.circle(screen, ENEMY_BULLET_COLOR, (int(s.x), int(s.y)), 3)

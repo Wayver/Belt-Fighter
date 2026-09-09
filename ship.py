@@ -260,8 +260,9 @@ class Ship:
         for t in self.thrusters:
             t.demand = 0.0
         if inp.thrust_fwd:
-            self._demand('forward_s', inp.thrust_fwd)
-            self._demand('forward_p', inp.thrust_fwd)
+            for t in self.thrusters:
+                if t.slot.orientation == (1, 0):
+                    t.demand = max(t.demand, inp.thrust_fwd)
         #if inp.thrust_rev:
         #    self._demand('reverse', inp.thrust_rev)
         if inp.thrust_rev:
@@ -546,7 +547,8 @@ class Ship:
                 continue
             if inp.laser_fire:
                 beams.append(Beam(self.to_world(*w.slot.position), t.pos,
-                              self.id, w.comp.laser_damage))
+                              self.id, w.comp.laser_damage,
+                              local_start=w.slot.position))
                 self.laser_dump += w.comp.laser_discharge_dump
                 w.charge = 0.0
         return beams
@@ -555,9 +557,9 @@ class Ship:
     def draw(self, screen, cam, pos=None, angle=None, fill=None, edge=None,
              flame_out=None, flame_in=None):
         if fill is None:
-            fill = SHIP_COLOR
+            fill = self.hull.fill or SHIP_COLOR
         if edge is None:
-            edge = SHIP_EDGE
+            edge = self.hull.edge or SHIP_EDGE
         if flame_out is None:
             flame_out = FLAME_OUT
         if flame_in is None:
@@ -664,7 +666,7 @@ class Ship:
         so it doubles as a lock indicator. Presentation only.
         """
         n = 8
-        outer = 26.0
+        outer = 13.0
         rot = pygame.time.get_ticks() * 0.0008   # slow swirl, ~8s per rev
         for wpn in self.weapons:
             if wpn.comp.laser_range <= 0:

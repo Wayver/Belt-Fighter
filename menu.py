@@ -114,8 +114,8 @@ class Menu:
                     cy + (fy * lx + ry * ly) * scale)
 
         pts = [w(*p) for p in hull.polygon]
-        pygame.draw.polygon(screen, SHIP_COLOR, pts)
-        pygame.draw.polygon(screen, SHIP_EDGE, pts, 2)
+        pygame.draw.polygon(screen, hull.fill or SHIP_COLOR, pts)
+        pygame.draw.polygon(screen, hull.edge or SHIP_EDGE, pts, 2)
         for s in hull.slots:
             x, y = w(*s.position)
             if s.name == highlight:
@@ -186,6 +186,10 @@ class Menu:
             parts.append(f"shld {comp.shield_max_charge:.0f}")
         if comp.fire_cooldown:
             parts.append(f"rof {comp.fire_cooldown:.2f}s")
+        if comp.laser_range:
+            parts.append(f"range {comp.laser_range:.0f}")
+        if comp.laser_arc_start_deg or comp.laser_arc_end_deg:
+            parts.append(f"arc {comp.laser_arc_start_deg:.0f}..{comp.laser_arc_end_deg:.0f}")
         screen.blit(self.font.render("  ".join(parts), True, ACCENT), (x, y + 8))
 
         # stats panel

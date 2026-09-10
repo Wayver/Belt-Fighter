@@ -26,7 +26,7 @@ from .intent import ShipInput
 from .asteroid import Asteroid
 from .bullets import Bullet, EnemyBullet
 from .particles import burst, shield_burst
-from .spawning import spawn_enemy, make_stars, update_field
+from .spawning import spawn_enemy, make_stars, update_field, TestTarget
 from .fog import draw_fog
 from .hud import draw_hud, draw_game_over
 from .camera import Camera
@@ -36,7 +36,7 @@ STEP = 1 / 60   # fixed simulation timestep
 
 class Game:
     def __init__(self, screen, font, big_font, light_tex, fog_surf, light_surf,
-                hull=None, loadout=None):
+                hull=None, loadout=None, test_mode=False):
         self.screen = screen
         self.font = font
         self.big_font = big_font
@@ -66,7 +66,7 @@ class Game:
         self.game_over = False
         self.protect_timer = SPAWN_PROTECT
         self.acc = 0.0
-
+        self.test_mode = test_mode
         self.reset()
 
     def reset(self):
@@ -92,6 +92,9 @@ class Game:
         self.protect_timer = SPAWN_PROTECT
         self.acc = 0.0
         self.cam.pos = self.ship.pos.copy()
+        if self.test_mode:
+            self._setup_test_scene()
+            return
         update_field(self.asteroids, [self.ship.pos], self.wave, 0)
         spawn_enemy(self.enemies, self.ship)
         spawn_enemy(self.enemies, self.ship)
@@ -108,6 +111,8 @@ class Game:
                 elif event.key == pygame.K_t and not self.game_over:
                     self.ship.targeting_on = not self.ship.targeting_on
                 elif event.key == pygame.K_r and self.game_over:
+                    self.reset()
+                elif event.key == pygame.K_f and (self.test_mode or self.game_over):
                     self.reset()
         return True
 
@@ -147,7 +152,8 @@ class Game:
             if self.wave_timer >= WAVE_INTERVAL:
                 self.wave_timer = 0.0
                 self.wave += 1
-            update_field(self.asteroids, [self.ship.pos], self.wave, dt)
+            if not self.test_mode:
+                update_field(self.asteroids, [self.ship.pos], self.wave, dt)
 
         for e in self.enemies:
             shots, _ = e.update(dt, self.ship, self.asteroids)
@@ -196,6 +202,11 @@ class Game:
         facing the muzzle, so beams from different muzzles land at different
         spots. Each damage point additionally jitters its shield flash.
         """
+        rock, hit_pt = self._beam_blocked(beam)
+        if rock is not None:
+            self._beam_hit_asteroid(rock, hit_pt, beam)
+            return
+
         for i, e in enumerate(self.enemies):
             if e.pos.distance_to(beam.end) < e.collision_radius + 4:
                 approach = e.pos - beam.start
@@ -215,13 +226,53 @@ class Game:
                         self.score += ENEMY_SCORE
                         burst(self.particles, e.pos, 20, big=True)
                         self.enemies.pop(i)
-                        spawn_enemy(self.enemies, self.ship)
+                        if self.test_mode:
+                            self._setup_test_scene()   # re-arm: fresh rock + target
+                        else:
+                            spawn_enemy(self.enemies, self.ship)
                         break
                     shield_burst(self.particles,
                              e.ship.shield_impact_point(impact))
                 self.beams.append([beam.local_start, e, d,  vis_end, 0.0, 0.15])
                 return
 
+
+    def _beam_blocked(self, beam):
+        """Nearest asteroid intersecting the beam segment, or (None, None)."""
+        seg = beam.end - beam.start
+        seg_len2 = seg.length_squared()
+        if seg_len2 < 1e-6:
+            return None, None
+        best_t, best_a, best_pt = 1.0, None, None
+        for a in self.asteroids:
+            t = (a.pos - beam.start).dot(seg) / seg_len2
+            t = max(0.0, min(1.0, t))          # clamp: only between muzzle and target
+            closest = beam.start + seg * t
+            if closest.distance_to(a.pos) < a.collision_radius and t < best_t:
+                best_t, best_a, best_pt = t, a, closest
+        return best_a, best_pt
+
+    def _beam_hit_asteroid(self, a, hit_pt, beam):
+        # Same kill/split as a bullet hitting a rock.
+        self.score += a.score
+        burst(self.particles, hit_pt, a.radius)
+        child_size = ROCK_SPLIT[a.size]
+        if child_size:
+            for _ in range(2):
+                ks = random.uniform(*ROCK_SIZES[child_size]['speed'])
+                ka = random.uniform(0, 2 * math.pi)
+                kick = pygame.Vector2(math.cos(ka) * ks, math.sin(ka) * ks)
+                self.asteroids.append(Asteroid(a.pos, child_size,
+                                           vel=a.vel * 0.5 + kick))
+        self.asteroids.remove(a)
+        # Beam visual: fixed endpoint on the rock's surface. target=None makes
+        # draw() use vis_end (the "target already gone" path).
+        d = hit_pt - a.pos
+        if d.length_squared() < 1e-6:
+            d = beam.end - beam.start
+        d = d.normalize()
+        vis_end = a.pos + d * a.collision_radius
+        self.beams.append([beam.local_start, None, d, vis_end, 0.0, 0.15])
 
     def _draw_targeting(self, screen, e):
         pts = e.predict_path(TARGETING_HORIZON, TARGETING_STEPS)
@@ -291,7 +342,10 @@ class Game:
                         self.score += ENEMY_SCORE
                         burst(self.particles, e.pos, 20, big=True)
                         self.enemies.pop(i)
-                        spawn_enemy(self.enemies, self.ship)
+                        if self.test_mode:
+                            self._setup_test_scene()   # re-arm: fresh rock + target
+                        else:
+                            spawn_enemy(self.enemies, self.ship)
                     break
 
         # bullet vs asteroid
@@ -417,3 +471,17 @@ class Game:
         draw_hud(screen, self.font, self.score, self.wave, self.enemies, self.ship)
         if self.game_over:
             draw_game_over(screen, self.big_font, self.font, self.score)
+
+
+            # --- test range: static scene for laser occlusion testing ---
+    TEST_ROCK_POS   = (960, 340)   # 300 px ahead of the ship
+    TEST_TARGET_POS = (960, 40)    # 600 px ahead, behind the rock
+
+    def _setup_test_scene(self):
+        self.asteroids.clear()
+        self.enemies.clear()
+        rock = Asteroid(pygame.Vector2(self.TEST_ROCK_POS), 'large')
+        rock.vel = pygame.Vector2(0, 0)
+        rock.spin = 0.0
+        self.asteroids.append(rock)
+        self.enemies.append(TestTarget(pygame.Vector2(self.TEST_TARGET_POS)))

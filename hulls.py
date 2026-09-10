@@ -199,25 +199,25 @@ LASER_TYPE = ComponentType('laser', 'Laser', ('weapon',),
     mass=3.0, power_idle=2.0, power_active=12.0,   # power_active = charge draw
     laser_arc_start_deg=-20.0, laser_arc_end_deg=20.0,
     laser_range=600.0,          # <-- the arbitrary range; turn this
-    laser_charge_time=0.5,
+    laser_charge_time=1.0,
     laser_damage=2,
     laser_discharge_dump=30.0,
     priority=2)
 
 LASER_S = ComponentType('laser_s', 'Laser (Starboard)', ('weapon',),
     mass=3.0, power_idle=2.0, power_active=12.0,
-    laser_arc_start_deg=0.0,  laser_arc_end_deg=110.0,   # nose to starboard
-    laser_range=900.0,
-    laser_charge_time=1.,
+    laser_arc_start_deg=0.0,  laser_arc_end_deg=90.0,   # nose to starboard
+    laser_range=600.0,
+    laser_charge_time=1.0,
     laser_damage=2,
     laser_discharge_dump=30.0,
     priority=2)
 
 LASER_P = ComponentType('laser_p', 'Laser (Port)', ('weapon',),
     mass=3.0, power_idle=2.0, power_active=12.0,
-    laser_arc_start_deg=-110.0, laser_arc_end_deg=0.0,   # port to nose
-    laser_range=900.0,
-    laser_charge_time=0.5,
+    laser_arc_start_deg=-90.0, laser_arc_end_deg=0.0,   # port to nose
+    laser_range=600.0,
+    laser_charge_time=1.0,
     laser_damage=2,
     laser_discharge_dump=30.0,
     priority=2)

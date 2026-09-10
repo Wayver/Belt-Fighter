@@ -666,7 +666,7 @@ class Ship:
         so it doubles as a lock indicator. Presentation only.
         """
         n = 8
-        outer = 13.0
+        outer = 6.0
         rot = pygame.time.get_ticks() * 0.0008   # slow swirl, ~8s per rev
         for wpn in self.weapons:
             if wpn.comp.laser_range <= 0:

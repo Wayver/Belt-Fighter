@@ -21,7 +21,26 @@ from .config import (WIDTH, HEIGHT, SECTOR_SIZE, ACTIVE_SECTORS,
                      MAX_SPAWNS_PER_TICK)
 from .asteroid import Asteroid
 from .enemy import EnemyShip
+from .intent import ShipInput
 from .ai_enemy import AIEnemy
+
+
+class TestTarget(AIEnemy):
+    """Stationary, non-firing target for the test range. Same collision
+    surface and shield/hp routing as a real enemy; the brain is
+    replaced with 'sit still'."""
+    def __init__(self, pos):
+        super().__init__(pos)
+        self.hp = 50            # ENEMY_HP is 1; survive a test session
+        self.ship.angle = math.pi / 2   # nose toward the player
+        self.ship.vel = pygame.Vector2(0, 0)
+
+    def update(self, dt, player, asteroids):
+        self.ship.vel = pygame.Vector2(0, 0)   # kill any drift
+        return self.ship.update(dt, ShipInput(turn=0, thrust_fwd=0.0,
+                                              thrust_left=0.0,
+                                              thrust_right=0.0,
+                                              stop=False, fire=False))
 
 def _far_pos(ship, min_dist, tries=20):
     """Pick a random position at least min_dist from the ship."""

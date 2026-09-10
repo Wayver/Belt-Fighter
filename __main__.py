@@ -1,4 +1,6 @@
 """Entry point: run with  python -m ship5"""
+import sys                                   # <-- new
+
 import pygame
 
 from .config import WIDTH, HEIGHT, FPS
@@ -18,7 +20,6 @@ def main():
     fog_surf = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
     light_surf = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
 
-
     menu = Menu(font, big_font)
     while not menu.done:
         clock.tick(FPS)
@@ -28,7 +29,8 @@ def main():
         pygame.display.flip()
 
     game = Game(screen, font, big_font, light_tex, fog_surf, light_surf,
-            hull=menu.hull, loadout=menu.loadout)
+                hull=menu.hull, loadout=menu.loadout,
+                test_mode=('--test' in sys.argv))
 
 
     running = True

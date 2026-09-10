@@ -472,16 +472,40 @@ class Game:
         if self.game_over:
             draw_game_over(screen, self.big_font, self.font, self.score)
 
-
-            # --- test range: static scene for laser occlusion testing ---
-    TEST_ROCK_POS   = (960, 340)   # 300 px ahead of the ship
+# --- test range: static scene for laser occlusion testing ---
+    TEST_ROCK_POS   = (960, 340)   # 300 px ahead, dead center (large)
     TEST_TARGET_POS = (960, 40)    # 600 px ahead, behind the rock
 
     def _setup_test_scene(self):
         self.asteroids.clear()
         self.enemies.clear()
+
+        # Dead-center large rock (the primary occluder)
         rock = Asteroid(pygame.Vector2(self.TEST_ROCK_POS), 'large')
         rock.vel = pygame.Vector2(0, 0)
         rock.spin = 0.0
         self.asteroids.append(rock)
+
+        # Medium rock, slightly off-axis and further out.
+        # Tests nearest-t: if both are on the beam line, the closer
+        # (large) rock should win.
+        rock2 = Asteroid(pygame.Vector2(990, 250), 'medium')
+        rock2.vel = pygame.Vector2(0, 0)
+        rock2.spin = 0.0
+        self.asteroids.append(rock2)
+
+        # Small rock, off-axis and closer in. Should NOT be hit by a
+        # center-line beam (verifies the segment test doesn't false-positive).
+        rock3 = Asteroid(pygame.Vector2(920, 480), 'small')
+        rock3.vel = pygame.Vector2(0, 0)
+        rock3.spin = 0.0
+        self.asteroids.append(rock3)
+
+        # Medium rock, well off-axis to the right. Should never be hit
+        # unless you deliberately turn the ship.
+        rock4 = Asteroid(pygame.Vector2(1060, 380), 'medium')
+        rock4.vel = pygame.Vector2(0, 0)
+        rock4.spin = 0.0
+        self.asteroids.append(rock4)
+
         self.enemies.append(TestTarget(pygame.Vector2(self.TEST_TARGET_POS)))

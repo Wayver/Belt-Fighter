@@ -478,7 +478,8 @@ ENEMY_HULL = HullType(
         (10, -6),    # port wing root leading edge
         (12, -3),    # fuselage shoulder (port)
     ),
-    slots=(E_FORWARD_S, E_FORWARD_P, E_GUN_S, E_GUN_P, E_REACTOR, E_COMPUTER, E_SHIELD),
+    slots=(E_FORWARD_S, E_FORWARD_P, E_REVERSE, E_RCS_L, E_RCS_R,
+           E_GUN_S, E_GUN_P, E_REACTOR, E_REACTOR_2, E_COMPUTER, E_SHIELD),
     base_mass=3.0,
     collision_radius=16.0,
     nose=(28, 0),

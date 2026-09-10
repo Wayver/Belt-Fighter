@@ -83,10 +83,11 @@ ENEMY_FIRE_COOLDOWN = .15
 ENEMY_FIRE_SPREAD = 0.16
 ENEMY_ENGAGE_RANGE = 2400.0  # only chase/fire within this range
 ENEMY_ORBIT_OFFSET = 140.0  # aim offset so it circles instead of ramming
+
 ENEMY_AVOID_RADIUS = 800.0  # how far ahead the enemy "sees" rocks
-ENEMY_AVOID_WEIGHT = 4.2    # strength of the avoidance steering
-ENEMY_AVOID_RADIUS = 400.0  # how far ahead the enemy "sees" rocks
-ENEMY_AVOID_WEIGHT = 6.2    # strength of the avoidance steering
+ENEMY_AVOID_WEIGHT = 5.0    # strength of the avoidance steering
+ENEMY_AVOID_BUFFER = 50.0   # extra clearance the AI insists on (see below)
+ENEMY_COURSE_MARGIN = 30.0  # miss-distance slack before the AI slams the damper
 ENEMY_COURSE_MARGIN = 30.0  # miss-distance slack before the AI slams the damper
 
 # --- fog of war knobs ---

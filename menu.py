@@ -190,6 +190,10 @@ class Menu:
             parts.append(f"range {comp.laser_range:.0f}")
         if comp.laser_arc_start_deg or comp.laser_arc_end_deg:
             parts.append(f"arc {comp.laser_arc_start_deg:.0f}..{comp.laser_arc_end_deg:.0f}")
+        if comp.sensor_range:
+            parts.append(f"sns {comp.sensor_range:.0f}")
+        if comp.scan_cooldown:
+            parts.append(f"scan {comp.scan_range:.0f} @ {comp.scan_cooldown:.0f}s")
         screen.blit(self.font.render("  ".join(parts), True, ACCENT), (x, y + 8))
 
         # stats panel

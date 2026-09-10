@@ -39,7 +39,7 @@ from .config import (WIDTH, HEIGHT, ROT_SPEED, MAX_SPEED,
                      ARC_GLOW, ARC_CORE, TARGETING_POWER, TARGETING_COMPUTE_BASE,
                      TARGETING_COMPUTE_PER_TARGET, LASER_DUMP_DECAY, LASER_COLOR,
                      SHIELD_IMPACT_TTL, SHIELD_IMPACT_SPREAD, SHIELD_IMPACT_SPREAD_TIME,
-                     SHIELD_IMPACT_STEPS)
+                     SHIELD_IMPACT_STEPS, SENSOR_COLOR, SENSOR_SCAN_COLOR, SCAN_DUMP_DECAY)
 
 from .hulls import DEFAULT_HULL, default_loadout, Slot, ComponentType
 
@@ -124,11 +124,31 @@ class Ship:
         self.shield_dump = 0.0
         self.shield_clock = 0.0
         self.shield_impacts = []
+        
         # targeting assist: player-toggled paid system (T key)
         self.targeting_on = False
         self.tracked = 0    # enemies within TARGETING_RANGE; set by Game each tick
         self.laser_target = None   # enemy candidate; set by Game each tick
         self.laser_dump = 0.0      # decaying power spike from discharges
+
+        # sensors: passive ear (V) + active ping (G). The fitted part
+        # decides which exist (0 range/cooldown = not fitted).
+        self.sensor_slot = None
+        self.sensor_comp = None
+        for slot in self.hull.slots:
+            if slot.slot_type == 'sensor' and slot.name in self.components:
+                self.sensor_slot = slot
+                self.sensor_comp = self.components[slot.name]
+                break
+        self.sensor_on = False
+        self.contacts = []      # [(pos, dist, strength, confirmed)]; Game sets each tick
+        self.scan_cd = 0.0      # seconds until the next ping
+        self.scan_reveal = 0.0  # seconds of confirmed contacts remaining
+        self.scan_dump = 0.0    # decaying power spike from pings
+        self.scan_pulse = -1.0   # no ping in flight; >0 = age of the ring
+        # Active draw = power_used - idle; the passive sensor listens for
+        # this on enemies.
+        self.power_idle_total = sum(c.power_idle for c in self.components.values())
 
 
         # Phase 2: power/compute budgets, derived from the fitted parts
@@ -174,6 +194,40 @@ class Ship:
     @property
     def shield_on(self):
         return self.shield_comp is not None and self.shield_charge > 0
+
+
+    def reset_sensors(self):
+        self.sensor_on = False
+        self.contacts = []
+        self.scan_cd = 0.0
+        self.scan_reveal = 0.0
+        self.scan_dump = 0.0
+        self.scan_pulse = -1.0
+
+    def fire_scan(self):
+        """Active ping. The power spike rides with the dumps: it can
+        trigger a brownout, and a deep brownout refuses the ping."""
+        c = self.sensor_comp
+        if c is None or c.scan_cooldown <= 0 or self.scan_cd > 0:
+            return False
+        if self.brownout and self.power_factor < SHIELD_OFFLINE_FACTOR:
+            return False
+        self.scan_cd = c.scan_cooldown
+        self.scan_reveal = c.scan_duration
+        self.scan_dump += c.scan_dump
+        self.scan_pulse = 0.0
+        return True
+
+    def _update_sensors(self, dt):
+        if self.scan_cd > 0:
+            self.scan_cd -= dt
+        if self.scan_reveal > 0:
+            self.scan_reveal -= dt
+        if self.scan_dump > 0:
+            self.scan_dump = max(0.0, self.scan_dump - SCAN_DUMP_DECAY * dt)
+        if self.scan_pulse >= 0:
+            self.scan_pulse += dt
+
 
     def shield_impact_point(self, world_pos):
         """Point on the shield oval in the direction of world_pos."""
@@ -239,6 +293,7 @@ class Ship:
         self.prev_angle = self.angle
         self.dampening = inp.stop
         self._update_shield(dt)
+        self._update_sensors(dt)
         self._apply_rotation(dt, inp)
         self._set_demands(inp)
         self._allocate(inp)
@@ -340,8 +395,11 @@ class Ship:
         # system that can TRIGGER a brownout but isn't shed itself.
         targeting_active = TARGETING_POWER if self.targeting_on else 0.0
         laser_active = self.laser_dump
+        sensor_active = (self.sensor_comp.power_active
+                         if self.sensor_on and self.sensor_comp else 0.0)
+        scan_active = self.scan_dump
         total = (idle + sum(need for _, need in active) + shield_active
-                 + targeting_active)
+                 + targeting_active + laser_active + sensor_active + scan_active)
         self.power_used = total
 
         if not self.brownout and total > self.power_supply * (1.0 + POWER_HYSTERESIS):
@@ -353,7 +411,7 @@ class Ship:
         # How much of the non-idle demand can the reactor actually meet?
         # 1.0 = fully powered; <1.0 while browned out (whole-ship sag).
         non_idle = (sum(need for _, need in active) + shield_active
-                    + targeting_active)
+                    + targeting_active + sensor_active + scan_active)
         if self.brownout and non_idle > 0:
             self.power_factor = min(1.0, (self.power_supply - idle) / non_idle)
         else:
@@ -378,6 +436,8 @@ class Ship:
         if self.targeting_on:
             comp_demand += (TARGETING_COMPUTE_BASE
                             + TARGETING_COMPUTE_PER_TARGET * self.tracked)
+        if self.sensor_on and self.sensor_comp:
+            comp_demand += self.sensor_comp.compute_demand
         self.compute_used = comp_demand
         self.compute_alloc = (min(1.0, self.compute_supply / comp_demand)
                               if comp_demand > 0 else 1.0)
@@ -567,6 +627,20 @@ class Ship:
                 w.charge = 0.0
         return beams
 
+    def _draw_scan_pulse(self, screen, cam, pos):
+        """Expanding ring from the ship while a ping is in flight."""
+        c = self.sensor_comp
+        if c is None or c.scan_cooldown <= 0 or self.scan_pulse < 0:
+            return
+        t = self.scan_pulse / max(c.scan_duration, 0.01)
+        if t >= 1.3:
+            return
+        r = min(1.0, t) * c.scan_range
+        fade = max(0.0, 1.0 - t / 1.3)
+        s = cam.to_screen(pos)
+        pygame.draw.circle(screen, _dim_color(SENSOR_SCAN_COLOR, fade),
+                           (int(s.x), int(s.y)), max(2, int(r)), 2)
+
     # --- rendering (reads geometry from self.hull) ---
     def draw(self, screen, cam, pos=None, angle=None, fill=None, edge=None,
              flame_out=None, flame_in=None):
@@ -622,6 +696,7 @@ class Ship:
                 gx, gy = slot.position
                 pygame.draw.circle(screen, edge, cam.to_screen(w(gx, gy)), 2)
 
+        self._draw_scan_pulse(screen, cam, pos)
         self._draw_shield(screen, cam, pos, angle)
         self._draw_shield_impacts(screen,cam,pos,angle)
         self._draw_laser_charge(screen, cam, w)

@@ -98,6 +98,12 @@ class ComponentType:
     laser_charge_time: float = 0.0     # seconds to full charge
     laser_damage: int = 0
     laser_discharge_dump: float = 0.0  # power spike added on fire
+    # --- sensors ---
+    sensor_range: float = 0.0        # passive detection range; 0 = none
+    scan_cooldown: float = 0.0       # seconds between active pings; 0 = none
+    scan_duration: float = 0.0       # seconds a ping's reveal lasts
+    scan_range: float = 0.0          # active ping range
+    scan_dump: float = 0.0           # power spike added on ping (decays)
 
 # --- The current ship, as data ---
 # orientation = force direction on the ship (exhaust is the opposite).
@@ -105,19 +111,25 @@ class ComponentType:
 FORWARD_S = Slot('forward_s', 'thruster', (-13, 8), (1, 0), flame_key='forward')
 FORWARD_P = Slot('forward_p', 'thruster', (-13, -8), (1, 0), flame_key='forward')
 REVERSE   = Slot('reverse', 'thruster', (16, 0), (-1, 0), flame_key='reverse')
+
 # RCS: force is across the ship (port/starboard), but the flame is drawn
 # outward (flame_dir) so it stays visible instead of ending under the hull.
-RCS_LEFT  = Slot('to_left', 'thruster', (-10, -9.5), (0, -1),
-                 flame_dir=(0, -1), flame_key='to_left',
+RCS_LEFT  = Slot('to_left', 'thruster', (-10, 9.5), (0, -1),
+                 flame_key='to_left',
                  flame_scale=0.5, flame_width=2)
-RCS_RIGHT = Slot('to_right', 'thruster', (-10, 9.5), (0, 1),
-                 flame_dir=(0, 1), flame_key='to_right',
+RCS_RIGHT = Slot('to_right', 'thruster', (-10, -9.5), (0, 1),
+                 flame_key='to_right',
                  flame_scale=0.5, flame_width=2)
+
 GUN       = Slot('gun', 'weapon', (18, 0), (1, 0))
 # Generators: plain mount points, no orientation/flame semantics.
 REACTOR   = Slot('reactor', 'reactor', (-4, 0))
 COMPUTER  = Slot('computer', 'computer', (2, 0))
 SHIELD    = Slot('shield', 'shield', (0, 0))
+# Sensor positions
+SENSOR       = Slot('sensor', 'sensor', (6, 4))     # scout
+BB_SENSOR    = Slot('sensor', 'sensor', (6, 8))     # blackbird / blackbird_wg
+SILAS_SENSOR = Slot('sensor', 'sensor', (0, 10))    # silas (starboard cheek)
 
 DEFAULT_HULL = HullType(
     id='scout',
@@ -139,7 +151,7 @@ DEFAULT_HULL = HullType(
         (14, -3.5),
     ),
     slots=(FORWARD_S, FORWARD_P, REVERSE, RCS_LEFT, RCS_RIGHT, GUN,
-           REACTOR, COMPUTER, SHIELD),
+           REACTOR, COMPUTER, SHIELD, SENSOR),
     base_mass=1.0,
     collision_radius=12.0,
     nose=(18, 0),
@@ -222,6 +234,27 @@ LASER_P = ComponentType('laser_p', 'Laser (Port)', ('weapon',),
     laser_discharge_dump=30.0,
     priority=2)
 
+# --- Sensors ---
+# Passive: a cheap ear. While on (V), any enemy in sensor_range burning
+# >= SENSOR_SIGNATURE_THRESHOLD of active power shows as an off-screen
+# arrow. Coasting enemies are invisible.
+PASSIVE_SENSOR = ComponentType('passive_sensor', 'Passive Sensor', ('sensor',),
+    mass=1.0, power_idle=1.0, power_active=4.0, compute_demand=4.0,
+    sensor_range=1800.0, priority=4)
+
+# Active: a ping (G). Confirms every enemy in scan_range for scan_duration;
+# the power spike can brownout the ship.
+ACTIVE_SCANNER = ComponentType('active_scanner', 'Active Scanner', ('sensor',),
+    mass=1.5, power_idle=1.0,
+    scan_cooldown=6.0, scan_duration=1.5, scan_range=2400.0,
+    scan_dump=30.0, priority=4)
+
+# Both, slightly weaker each way.
+SENSOR_ARRAY = ComponentType('sensor_array', 'Sensor Array', ('sensor',),
+    mass=2.0, power_idle=2.0, power_active=6.0, compute_demand=6.0,
+    sensor_range=1500.0,
+    scan_cooldown=8.0, scan_duration=1.2, scan_range=2000.0,
+    scan_dump=35.0, priority=4)
 
 
 
@@ -233,7 +266,7 @@ TOOTH_THRUSTER = ComponentType('tooth_thruster', 'Tooth Thruster', ('thruster',)
 def default_loadout(hull=None):
     """slot_name -> ComponentType, the stock fit for a hull."""
     hull = hull or DEFAULT_HULL
-    is_bb = hull.id == 'blackbird'
+    is_bb = hull.id in ('blackbird, blackbird_wg')
     is_silas = hull.id == 'silas'
     # Blackbird: strong forward drive, weak reverse (swapped vs the scout).
     fwd, rev = (NOSE_THRUSTER, MAIN_ENGINE) if is_bb else (MAIN_ENGINE, NOSE_THRUSTER)
@@ -264,6 +297,8 @@ def default_loadout(hull=None):
             out[s.name] = COMPUTER_TYPE
         elif s.slot_type == 'shield':
             out[s.name] = SHIELD_TYPE
+        elif s.slot_type == 'sensor':
+            out[s.name] = ACTIVE_SCANNER
     return out
 
 
@@ -277,6 +312,7 @@ COMPONENT_CATALOG = {
     'reactor':  (REACTOR_TYPE,),
     'computer': (COMPUTER_TYPE,),
     'shield':   (SHIELD_TYPE,),
+    'sensor':   (PASSIVE_SENSOR, ACTIVE_SCANNER, SENSOR_ARRAY),
 }
 
 def validate_loadout(hull, loadout):
@@ -298,6 +334,8 @@ def loadout_stats(hull, loadout):
         'power_max': idle + sum(c.power_active for c in parts),
         'compute_supply': sum(c.compute_supply for c in parts),
         'shield_charge': max((c.shield_max_charge for c in parts), default=0.0),
+        'sensor_range': max((c.sensor_range for c in parts), default=0.0),
+        'scan_range': max((c.scan_range for c in parts), default=0.0),
     }
 
 
@@ -310,11 +348,11 @@ BB_FORWARD_P = Slot('forward_p', 'thruster', (-15, -1.5), (1, 0), flame_key='for
 BB_REVERSE_S = Slot('reverse_s', 'thruster', (6, 5.5), (-1, 0), flame_key='reverse')
 BB_REVERSE_P = Slot('reverse_p', 'thruster', (6, -5.5), (-1, 0), flame_key='reverse')
 # RCS pods on the wingtips: force across the ship, flame drawn outward.
-BB_RCS_L     = Slot('to_left', 'thruster', (-8, -13.5), (0, -1),
-                    flame_dir=(0, -1), flame_key='to_left',
+BB_RCS_L     = Slot('to_left', 'thruster', (-8, 13.5), (0, -1),
+                    flame_key='to_left',
                     flame_scale=0.5, flame_width=2)
-BB_RCS_R     = Slot('to_right', 'thruster', (-8, 13.5), (0, 1),
-                    flame_dir=(0, 1), flame_key='to_right',
+BB_RCS_R     = Slot('to_right', 'thruster', (-8, -13.5), (0, 1),
+                    flame_key='to_right',
                     flame_scale=0.5, flame_width=2)
 BB_GUN       = Slot('gun', 'weapon', (24, 0), (1, 0))
 BB_REACTOR   = Slot('reactor', 'reactor', (-2, 0))
@@ -346,7 +384,7 @@ BLACKBIRD_HULL = HullType(
         (14, -1.5),
     ),
     slots=(BB_FORWARD_S, BB_FORWARD_P, BB_REVERSE_S, BB_REVERSE_P,
-           BB_RCS_L, BB_RCS_R, BB_GUN, BB_REACTOR, BB_COMPUTER, BB_SHIELD),
+           BB_RCS_L, BB_RCS_R, BB_GUN, BB_REACTOR, BB_COMPUTER, BB_SHIELD, BB_SENSOR),
     base_mass=1.5,
     collision_radius=14.0,
     nose=(26, 0),
@@ -365,7 +403,7 @@ BLACKBIRD_WG_HULL = HullType(
     polygon=BLACKBIRD_HULL.polygon,
     slots=(BB_FORWARD_S, BB_FORWARD_P, BB_REVERSE_S, BB_REVERSE_P,
            BB_RCS_L, BB_RCS_R, BB_GUN, BBWG_GUN_S, BBWG_GUN_P,
-           BB_REACTOR, BB_COMPUTER, BB_SHIELD),
+           BB_REACTOR, BB_COMPUTER, BB_SHIELD, BB_SENSOR),
     base_mass=1.5,
     collision_radius=14.0,
     nose=(26, 0),
@@ -385,11 +423,11 @@ SILAS_TOOTH_P2 = Slot('tooth_p2', 'thruster', (-11.5, -5), (1, 0), flame_key='fo
 # The cat's nose: reverse thruster on the forehead (retro-thrust, flame fwd).
 SILAS_REVERSE  = Slot('reverse', 'thruster', (13, 0), (-1, 0), flame_key='reverse')
 # RCS on the cheeks.
-SILAS_RCS_L = Slot('to_left', 'thruster', (-2, -13.5), (0, -1),
-                   flame_dir=(0, -1), flame_key='to_left',
+SILAS_RCS_L = Slot('to_left', 'thruster', (-2, 13.5), (0, -1),
+                   flame_key='to_left',
                    flame_scale=0.5, flame_width=2)
-SILAS_RCS_R = Slot('to_right', 'thruster', (-2, 13.5), (0, 1),
-                   flame_dir=(0, 1), flame_key='to_right',
+SILAS_RCS_R = Slot('to_right', 'thruster', (-2, -13.5), (0, 1),
+                   flame_key='to_right',
                    flame_scale=0.5, flame_width=2)
 # Laser eyes.
 SILAS_EYE_S = Slot('eye_s', 'weapon', (8, 5.5), (1, 0))
@@ -421,7 +459,7 @@ SILAS_HULL = HullType(
     slots=(SILAS_TOOTH_S2, SILAS_TOOTH_S1, SILAS_TOOTH_C,
            SILAS_TOOTH_P1, SILAS_TOOTH_P2, SILAS_REVERSE,
            SILAS_RCS_L, SILAS_RCS_R, SILAS_EYE_S, SILAS_EYE_P,
-           SILAS_REACTOR, SILAS_COMPUTER, SILAS_SHIELD),
+           SILAS_REACTOR, SILAS_COMPUTER, SILAS_SHIELD, SILAS_SENSOR),
     base_mass=1.0,
     collision_radius=15.0,
     nose=(13, 0),
@@ -443,11 +481,11 @@ E_FORWARD_P = Slot('forward_p', 'thruster', (-14, -2.5), (1, 0), flame_key='forw
 # braking/strafing: same slot names the player uses, so Ship._set_demands
 # and auto-stop work unchanged
 E_REVERSE   = Slot('reverse', 'thruster', (24, 0), (-1, 0), flame_key='reverse')
-E_RCS_L     = Slot('to_left', 'thruster', (-7, -8), (0, -1),
-                   flame_dir=(0, -1), flame_key='to_left',
+E_RCS_L     = Slot('to_left', 'thruster', (-7, 8), (0, -1),
+                   flame_key='to_left',
                    flame_scale=0.5, flame_width=2)
-E_RCS_R     = Slot('to_right', 'thruster', (-7, 8), (0, 1),
-                   flame_dir=(0, 1), flame_key='to_right',
+E_RCS_R     = Slot('to_right', 'thruster', (-7, -8), (0, 1),
+                   flame_key='to_right',
                    flame_scale=0.5, flame_width=2)
 E_GUN_S     = Slot('gun_s', 'weapon', (21, 11), (1, 0))
 E_GUN_P     = Slot('gun_p', 'weapon', (21, -11), (1, 0))

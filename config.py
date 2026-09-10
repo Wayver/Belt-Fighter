@@ -74,6 +74,14 @@ ROCK_SIZES = {
 ROCK_SPLIT = {'large': 'medium', 'medium': 'small', 'small': None}
 STARTING_WAVE = 2        # large rocks in wave 1; +1 per wave
 
+# --- sensors ---
+SENSOR_COLOR      = (120, 255, 140)   # passive contacts (arrows/blips)
+SENSOR_SCAN_COLOR = (255, 220, 120)   # active scan: pulse ring + confirmed contacts
+SENSOR_SIGNATURE_THRESHOLD = 12.0  # enemy active power draw needed to be passively detectable
+SENSOR_SIG_FULL      = 40.0     # draw level that maps to a full-strength arrow
+SENSOR_ARROW_MARGIN  = 24       # px inset of edge arrows from the screen edge
+SCAN_DUMP_DECAY      = 50.0     # power/s the ping spike decays (mirrors shield/laser dumps)
+
 # --- enemy ship knobs ---
 #ENEMY_ACCEL = 110.0
 #ENEMY_MAX_SPEED = 250.0

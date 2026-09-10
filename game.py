@@ -20,8 +20,11 @@ from .config import (WIDTH, HEIGHT, SPAWN_PROTECT, MAX_BULLETS,
                     TARGETING_STEPS, TARGETING_RANGE,
                     TARGETING_USE_ACCEL, TARGETING_MAX_LEAD,
                     TARGETING_COLOR_GREEN, TARGETING_ALIGN_TOL, LASER_COLOR,
-                    BEAM_IMPACT_SPREAD)
-from .ship import Ship, wrapped_delta
+                    BEAM_IMPACT_SPREAD, SENSOR_COLOR, SENSOR_SCAN_COLOR,
+                    SENSOR_SIGNATURE_THRESHOLD, SENSOR_SIG_FULL, SENSOR_ARROW_MARGIN,
+                    SCAN_DUMP_DECAY)
+
+from .ship import Ship, wrapped_delta, _dim_color
 from .intent import ShipInput
 from .asteroid import Asteroid
 from .bullets import Bullet, EnemyBullet
@@ -82,6 +85,7 @@ class Game:
         self.enemy_bullets.clear()
         self.beams.clear()
         self.ship.reset_lasers()
+        self.ship.reset_sensors()
         self.particles.clear()
         self.asteroids.clear()
         self.enemies.clear()
@@ -112,6 +116,10 @@ class Game:
                     self.ship.targeting_on = not self.ship.targeting_on
                 elif event.key == pygame.K_r and self.game_over:
                     self.reset()
+                elif event.key == pygame.K_v and not self.game_over:
+                    self.ship.sensor_on = not self.ship.sensor_on
+                elif event.key == pygame.K_g and not self.game_over:
+                    self.ship.fire_scan()
                 elif event.key == pygame.K_f and (self.test_mode or self.game_over):
                     self.reset()
         return True
@@ -137,6 +145,12 @@ class Game:
             # Laser target: nearest enemy in range, set before the ship
             # steps so _update_lasers() sees it this tick.
             self.ship.laser_target = self._pick_laser_target()
+            
+
+            # Sensor contacts: passive + active reveals, same pattern.
+            self._update_contacts()
+
+
             if inp.fire and len(self.bullets) >= MAX_BULLETS:
                 inp = replace(inp, fire=False)   # world cap: no room, no shot
             shots, beams = self.ship.update(dt, inp)
@@ -181,6 +195,76 @@ class Game:
         for b in self.beams:
             b[4] += dt
         self.beams = [b for b in self.beams if b[4] < b[5]]
+
+    def _update_contacts(self):
+        """Build the ship's contact list from the fitted sensor.
+
+        Passive: enemies in sensor_range whose active power draw
+        (power_used - idle) crosses the signature threshold. Active:
+        while a ping's reveal lasts, everything in scan_range is
+        confirmed. A confirmed contact replaces a passive one.
+        """
+        ship = self.ship
+        c = ship.sensor_comp
+        ship.contacts = []
+        if c is None:
+            return
+        found = {}
+        if ship.sensor_on and c.sensor_range > 0:
+            for e in self.enemies:
+                d = e.pos.distance_to(ship.pos)
+                if d <= c.sensor_range:
+                    sig = e.ship.power_used - e.ship.power_idle_total
+                    if sig >= SENSOR_SIGNATURE_THRESHOLD:
+                        found[e] = [e.pos.copy(), d,
+                                    min(1.0, sig / SENSOR_SIG_FULL), False]
+        if ship.scan_reveal > 0 and c.scan_range > 0:
+            for e in self.enemies:
+                d = e.pos.distance_to(ship.pos)
+                if d <= c.scan_range:
+                    found[e] = [e.pos.copy(), d, 1.0, True]
+        ship.contacts = list(found.values())
+
+    def _draw_sensor_contacts(self):
+        """Contacts above the fog: on-screen blips, off-screen edge
+        arrows. Confirmed (scanned) contacts are brighter + show distance."""
+        screen = self.screen
+        ship = self.ship
+        if not ship.contacts:
+            return
+        sp = self.cam.to_screen(ship.pos)
+        for pos, dist, strength, confirmed in ship.contacts:
+            s = self.cam.to_screen(pos)
+            base = SENSOR_SCAN_COLOR if confirmed else SENSOR_COLOR
+            color = _dim_color(base, 0.35 + 0.65 * strength)
+            if -20 <= s.x <= WIDTH + 20 and -20 <= s.y <= HEIGHT + 20:
+                pygame.draw.circle(screen, color, (int(s.x), int(s.y)), 5, 2)
+                continue
+            d = pygame.Vector2(s.x - sp.x, s.y - sp.y)
+            if d.length_squared() < 1:
+                continue
+            d.normalize_ip()
+            m = SENSOR_ARROW_MARGIN
+            ts = []
+            if d.x > 0:
+                ts.append((WIDTH - m - sp.x) / d.x)
+            elif d.x < 0:
+                ts.append((m - sp.x) / d.x)
+            if d.y > 0:
+                ts.append((HEIGHT - m - sp.y) / d.y)
+            elif d.y < 0:
+                ts.append((m - sp.y) / d.y)
+            if not ts:
+                continue
+            p = sp + d * min(ts)
+            ang = math.atan2(d.y, d.x)
+            for off in (0.5, -0.5):
+                pygame.draw.line(screen, color, (p.x, p.y),
+                                  (p.x - math.cos(ang + off) * 9,
+                                   p.y - math.sin(ang + off) * 9), 2)
+            if confirmed:
+                txt = self.font.render(f"{dist:.0f}", True, color)
+                screen.blit(txt, (p.x - txt.get_width() / 2, p.y + 10))
 
     def _pick_laser_target(self):
         """Nearest enemy within the max laser range; None if no laser fitted."""
@@ -468,6 +552,7 @@ class Game:
                 screen.blit(self.shield, (ssx - self.shield.get_width() // 2,
                                       ssy - self.shield.get_height() // 2))
         draw_fog(screen, self.ship, self.cam, self.light_tex, self.fog_surf, self.light_surf)
+        self._draw_sensor_contacts()
         draw_hud(screen, self.font, self.score, self.wave, self.enemies, self.ship)
         if self.game_over:
             draw_game_over(screen, self.big_font, self.font, self.score)

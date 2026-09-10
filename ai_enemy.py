@@ -52,7 +52,7 @@ class AIEnemy:
 
     def register_hit(self, source_pos):
         """Route a hit through the shield first, then hp. True if alive."""
-        if self.ship.register_hit():
+        if self.ship.register_hit(source_pos):
             return True          # shield absorbed it
         self.hp -= 1
         return self.hp > 0

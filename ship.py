@@ -37,7 +37,9 @@ from .config import (WIDTH, HEIGHT, ROT_SPEED, MAX_SPEED,
                      SHIELD_OVAL_A, SHIELD_OVAL_B, SHIELD_COLOR_DIM,
                      SHIELD_COLOR_BRIGHT, SHIELD_OFFLINE_FACTOR, SHIELD_OFFLINE_DRAIN,
                      ARC_GLOW, ARC_CORE, TARGETING_POWER, TARGETING_COMPUTE_BASE,
-                     TARGETING_COMPUTE_PER_TARGET, LASER_DUMP_DECAY, LASER_COLOR)
+                     TARGETING_COMPUTE_PER_TARGET, LASER_DUMP_DECAY, LASER_COLOR,
+                     SHIELD_IMPACT_TTL, SHIELD_IMPACT_SPREAD, SHIELD_IMPACT_SPREAD_TIME,
+                     SHIELD_IMPACT_STEPS)
 
 from .hulls import DEFAULT_HULL, default_loadout, Slot, ComponentType
 
@@ -121,6 +123,7 @@ class Ship:
                               if self.shield_comp else 0.0)
         self.shield_dump = 0.0
         self.shield_clock = 0.0
+        self.shield_impacts = []
         # targeting assist: player-toggled paid system (T key)
         self.targeting_on = False
         self.tracked = 0    # enemies within TARGETING_RANGE; set by Game each tick
@@ -433,6 +436,11 @@ class Ship:
         """Recharge the shield, decay the hit-dump, sag under brownout."""
         if self.shield_comp is None:
             return
+        # Presentation-only impact arcs: age + cull every step, even in
+        # brownout, so they never freeze mid-fade.
+        for imp in self.shield_impacts:
+            imp[1] += dt
+        self.shield_impacts = [imp for imp in self.shield_impacts if imp[1] < imp[2]]
         # Deep brownout: shield goes offline, charge drains.
         if self.brownout and self.power_factor < SHIELD_OFFLINE_FACTOR:
             self.shield_charge = max(0.0,
@@ -489,14 +497,20 @@ class Ship:
         ttl = random.uniform(0.05, 0.12)
         return [pts, 0.0, ttl]
 
-
-    def register_hit(self):
-        """Register a hit on the shield. Returns True if it absorbed the hit."""
+    def register_hit(self, world_pos=None):
         if not self.shield_on:
             return False
         self.shield_charge -= 1.0
         self.shield_dump += self.shield_comp.power_hit
+        if world_pos is not None:
+            d = world_pos - self.pos
+            fwd, right = self.axes()
+            lx, ly = d.dot(fwd), d.dot(right)
+            if lx * lx + ly * ly > 1e-6:
+                theta = math.atan2(ly / SHIELD_OVAL_B, lx / SHIELD_OVAL_A)
+                self.shield_impacts.append([theta, 0.0, SHIELD_IMPACT_TTL])
         return True
+
 
     def reset_shield(self):
         if self.shield_comp is not None:
@@ -609,6 +623,7 @@ class Ship:
                 pygame.draw.circle(screen, edge, cam.to_screen(w(gx, gy)), 2)
 
         self._draw_shield(screen, cam, pos, angle)
+        self._draw_shield_impacts(screen,cam,pos,angle)
         self._draw_laser_charge(screen, cam, w)
         self._draw_arcs(screen, cam, w)
 
@@ -644,6 +659,29 @@ class Ship:
             pts.append(cam.to_screen(world))
         pygame.draw.polygon(screen, _dim_color(color, 0.5), pts, 5)  # glow
         pygame.draw.polygon(screen, color, pts, 2)                   # core
+
+    def _draw_shield_impacts(self, screen, cam, pos, angle):
+        """Laser-colored arcs wrapping the shield at recent impacts: a hot
+        spot that spreads along the oval and fades — energy bleeding in."""
+        if not self.shield_impacts:
+            return
+        fwd = pygame.Vector2(math.cos(angle), math.sin(angle))
+        right = pygame.Vector2(-fwd.y, fwd.x)
+        for theta, age, ttl in self.shield_impacts:
+            fade = 1.0 - age / ttl
+            if fade <= 0.02:
+                continue
+            span = SHIELD_IMPACT_SPREAD * min(1.0, age / SHIELD_IMPACT_SPREAD_TIME)
+            pts = []
+            for i in range(SHIELD_IMPACT_STEPS + 1):
+                th = theta - span + 2.0 * span * i / SHIELD_IMPACT_STEPS
+                world = pos + fwd * (SHIELD_OVAL_A * math.cos(th)) \
+                             + right * (SHIELD_OVAL_B * math.sin(th))
+                pts.append(cam.to_screen(world))
+            pygame.draw.lines(screen, _dim_color(LASER_COLOR, fade * 0.5),
+                              False, pts, 5)   # glow
+            pygame.draw.lines(screen, _dim_color(LASER_COLOR, fade),
+                              False, pts, 2)   # core
 
     def _draw_arcs(self, screen, cam, w):
         """Draw brownout lightning: blue glow under a white core, fading out."""

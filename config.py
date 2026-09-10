@@ -54,6 +54,12 @@ SHIELD_COLOR_DIM = (50, 100, 170)
 SHIELD_COLOR_BRIGHT = (120, 200, 255)
 SHIELD_SPARK_COLORS = [(120, 200, 255), (180, 230, 255), (255, 255, 255)]
 
+SHIELD_IMPACT_TTL        = 0.4    # seconds the arc lives
+SHIELD_IMPACT_SPREAD     = 0.6    # arc half-width (rad) at full spread
+SHIELD_IMPACT_SPREAD_TIME = 0.15  # seconds to reach full width
+SHIELD_IMPACT_STEPS      = 20     # oval samples per arc
+
+
 # --- laser (charge weapon) ---
 LASER_DUMP_DECAY = 50.0        # power/s the discharge spike decays (mirrors shield dump)
 LASER_COLOR      = (140, 255, 190)   # beam + charge ring

@@ -12,7 +12,7 @@ class Asteroid:
         cfg = ROCK_SIZES[size]
         self.size = size
         self.radius = cfg['radius']
-        self.collision_radius = cfg['radius'] * 0.8
+        self.collision_radius = cfg['radius'] * 1.0
         self.score = cfg['score']
         self.pos = pygame.Vector2(pos)
         if vel is None:

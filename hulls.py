@@ -62,6 +62,8 @@ class HullType:
     turn_rate_factor: float = 1.0  # per-hull turn-rate multiplier
     fill: tuple = None     # body color; None = config SHIP_COLOR
     edge: tuple = None     # edge color; None = config SHIP_EDGE
+    panels: tuple = ()     # detail polygons: ((polygon, fill), ...) in local coords
+    shield_oval: tuple = None  # (a, b, cx, cy) local coords; None = config default
 
 @dataclass(frozen=True)
 class ComponentType:
@@ -130,6 +132,20 @@ SHIELD    = Slot('shield', 'shield', (0, 0))
 SENSOR       = Slot('sensor', 'sensor', (6, 4))     # scout
 BB_SENSOR    = Slot('sensor', 'sensor', (6, 8))     # blackbird / blackbird_wg
 SILAS_SENSOR = Slot('sensor', 'sensor', (0, 10))    # silas (starboard cheek)
+
+def shield_oval_from_polygon(polygon, margin=8.0):
+    """Shield oval (a, b, cx, cy) from the hull bbox + margin.
+
+    Centered on the bbox center, not the hull origin — the dreadnought's
+    hull runs x -54..78, so an origin-centered oval can't cover both ends.
+    """
+    xs = [p[0] for p in polygon]
+    ys = [p[1] for p in polygon]
+    cx = (min(xs) + max(xs)) / 2.0
+    cy = (min(ys) + max(ys)) / 2.0
+    a = (max(xs) - min(xs)) / 2.0 + margin
+    b = (max(ys) - min(ys)) / 2.0 + margin
+    return (a, b, cx, cy)
 
 DEFAULT_HULL = HullType(
     id='scout',
@@ -268,6 +284,7 @@ def default_loadout(hull=None):
     hull = hull or DEFAULT_HULL
     is_bb = hull.id in ('blackbird, blackbird_wg')
     is_silas = hull.id == 'silas'
+    is_dn = hull.id == 'dreadnought'
     # Blackbird: strong forward drive, weak reverse (swapped vs the scout).
     fwd, rev = (NOSE_THRUSTER, MAIN_ENGINE) if is_bb else (MAIN_ENGINE, NOSE_THRUSTER)
     out = {}
@@ -280,7 +297,7 @@ def default_loadout(hull=None):
             elif s.name.startswith('reverse'):
                 out[s.name] = rev
             else:
-                out[s.name] = RCS_HEAVY if hull.id == 'blackbird' else RCS
+                out[s.name] = (RCS_HEAVY if hull.id in ('blackbird', 'dreadnought') else RCS)
         
         elif s.slot_type == 'weapon':
             if s.name == 'gun_s':
@@ -547,4 +564,141 @@ def enemy_loadout():
     }
 
 
-PLAYER_HULLS = (DEFAULT_HULL, BLACKBIRD_HULL, BLACKBIRD_WG_HULL, SILAS_HULL)   # future hulls append here
+# --- Dreadnought: hefty slow cruiser, 3x the Blackbird's length ---
+# 132 long (nose +78, stern -54) but only 22 beam: long slender spine
+# with canard, mid wing, and tail fin. Heavily fitted: 4 mains, 2
+# reverses, 4 RCS, 3 guns, 3 reactors, 2 computers.
+
+DN_FWD_S1 = Slot('forward_s1', 'thruster', (-44, 2.5), (1, 0), flame_key='forward')
+DN_FWD_P1 = Slot('forward_p1', 'thruster', (-44, -2.5), (1, 0), flame_key='forward')
+DN_FWD_S2 = Slot('forward_s2', 'thruster', (-50, 2.5), (1, 0), flame_key='forward')
+DN_FWD_P2 = Slot('forward_p2', 'thruster', (-50, -2.5), (1, 0), flame_key='forward')
+DN_REV_S  = Slot('reverse_s', 'thruster', (60, 1.6), (-1, 0), flame_key='reverse')
+DN_REV_P  = Slot('reverse_p', 'thruster', (60, -1.6), (-1, 0), flame_key='reverse')
+# Four RCS (canard tip + wingtip per side). Starboard pods push (0,-1),
+# port pods push (0,1); ship.py drives them by orientation (see below).
+DN_RCS_CS = Slot('rcs_canard_s', 'thruster', (34, 6), (0, -1),
+                 flame_key='to_left', flame_scale=0.5, flame_width=2)
+DN_RCS_CP = Slot('rcs_canard_p', 'thruster', (34, -6), (0, 1),
+                 flame_key='to_right', flame_scale=0.5, flame_width=2)
+DN_RCS_WS = Slot('rcs_wing_s', 'thruster', (-18, 11), (0, -1),
+                 flame_key='to_left', flame_scale=0.5, flame_width=2)
+DN_RCS_WP = Slot('rcs_wing_p', 'thruster', (-18, -11), (0, 1),
+                 flame_key='to_right', flame_scale=0.5, flame_width=2)
+DN_GUN     = Slot('gun', 'weapon', (76, 0), (1, 0))
+DN_GUN_S   = Slot('gun_s', 'weapon', (3, 7.25), (1, 0))   # wing leading edge midpoint
+DN_GUN_P   = Slot('gun_p', 'weapon', (3, -7.25), (1, 0))
+DN_REACTOR    = Slot('reactor', 'reactor', (20, 0))
+DN_REACTOR_2  = Slot('reactor2', 'reactor', (-10, 0))
+DN_REACTOR_3  = Slot('reactor3', 'reactor', (-30, 0))
+DN_COMPUTER   = Slot('computer', 'computer', (40, 0))
+DN_COMPUTER_2 = Slot('computer2', 'computer', (0, 0))
+DN_SHIELD = Slot('shield', 'shield', (10, 0))
+DN_SENSOR = Slot('sensor', 'sensor', (52, 2.2))
+
+
+def _dreadnought_panels():
+    """Detail panels in local coords. `mirror` copies each piece to the
+    port side. Nubs are drawn PAST the hull outline on purpose: panels
+    render over the fill and under the edge stroke, so anything that
+    sticks out reads as a real protrusion in the silhouette."""
+    DARK, MID, LIGHT, ACCENT = (95, 105, 120), (120, 130, 148), (165, 175, 192), (70, 130, 170)
+    panels = []
+
+    def poly(pts, fill, mirror=True):
+        panels.append((tuple(pts), fill))
+        if mirror:
+            panels.append((tuple((x, -y) for x, y in pts), fill))
+
+    def rect(x1, x2, y1, y2, fill, mirror=True):
+        poly([(x1, y1), (x2, y1), (x2, y2), (x1, y2)], fill, mirror)
+
+    # Centerline: spine ridge + cockpit canopy (no mirror).
+    rect(30, -48, -0.6, 0.6, LIGHT, mirror=False)
+    rect(42, 47, -1.2, 1.2, LIGHT, mirror=False)
+
+    # Side armor plates, alternating shades.
+    rect(44, 36, 1.0, 2.0, DARK)
+    rect(34, 26, 1.0, 2.0, MID)
+    rect(24, 16, 1.0, 2.0, DARK)
+    rect(12, 4, 1.0, 2.0, MID)
+    rect(0, -8, 1.0, 2.0, DARK)
+    rect(-12, -20, 1.0, 2.4, MID)
+    rect(-24, -32, 1.0, 2.4, DARK)
+    rect(-36, -44, 1.0, 2.4, MID)
+
+    # Protrusions (each straddles the local hull edge, poking out):
+    rect(66, 68, 0.6, 2.0, DARK)        # nose antenna
+    poly([(50.8, 2.4), (52, 3.4), (53.2, 2.4),
+          (53.2, 1.6), (52, 0.8), (50.8, 1.6)], ACCENT)   # sensor dome
+    rect(37, 39, 6.0, 7.2, MID)         # canard tip nubs
+    rect(29, 31, 6.0, 7.2, MID)
+    rect(-7, -5, 11.0, 12.6, DARK)      # wingtip pods
+    rect(-25, -23, 11.0, 12.6, DARK)
+    rect(19, 21, 2.8, 3.9, MID)         # mid-hull vents
+    rect(14, 16, 2.8, 3.9, MID)
+    rect(-51, -49, 5.0, 6.2, MID)       # tail-fin docking clamps
+
+    # Engine cowlings + stern exhaust port (deck detail, inside the hull).
+    rect(-47, -41, 1.7, 3.3, MID)
+    rect(-53, -47, 1.7, 3.3, MID)
+    rect(-53.5, -51.5, -1.5, 1.5, DARK, mirror=False)
+    return tuple(panels)
+
+
+DREADNOUGHT_POLYGON = (
+        (78, 0),      # nose tip
+        (64, 1.2),    # nose spike
+        (56, 2.2),    # fore fuselage
+        (48, 2.6),    # canard root leading edge
+        (38, 6),      # canard tip front
+        (30, 6),      # canard tip rear (flat)
+        (26, 3),      # canard trailing edge
+        (14, 3.5),    # main wing root leading edge
+        (-8, 11),     # wingtip front
+        (-26, 11),    # wingtip rear (flat)
+        (-34, 4.5),   # wing trailing edge 
+        (-40, 5),     # tail fin front
+        (-52, 5),     # tail fin rear
+        (-54, 2.5),   # fin inner
+        (-54, 0),     # stern center 
+        (-54, -2.5),
+        (-52, -5),
+        (-40, -5),
+        (-34, -4.5),
+        (-26, -11),
+        (-8, -11),
+        (14, -3.5),
+        (26, -3),
+        (30, -6),
+        (38, -6),
+        (48, -2.6),
+        (56, -2.2),
+        (64, -1.2),
+    )
+
+DREADNOUGHT_HULL = HullType(
+    id='dreadnought',
+    polygon=DREADNOUGHT_POLYGON,
+    slots=(DN_FWD_S1, DN_FWD_P1, DN_FWD_S2, DN_FWD_P2,
+           DN_REV_S, DN_REV_P,
+           DN_RCS_CS, DN_RCS_CP, DN_RCS_WS, DN_RCS_WP,
+           DN_GUN, DN_GUN_S, DN_GUN_P,
+           DN_REACTOR, DN_REACTOR_2, DN_REACTOR_3,
+           DN_COMPUTER, DN_COMPUTER_2,
+           DN_SHIELD, DN_SENSOR),
+    base_mass=16.0,
+    collision_radius=23.0,
+    nose=(78, 0),
+    cockpit=(44, 0),
+    max_speed_factor=0.55,
+    turn_rate_factor=0.2,
+    fill=(110, 120, 138),
+    edge=(90, 150, 190),
+    panels=_dreadnought_panels(),
+    shield_oval=shield_oval_from_polygon(DREADNOUGHT_POLYGON),
+)
+
+
+
+PLAYER_HULLS = (DEFAULT_HULL, BLACKBIRD_HULL, BLACKBIRD_WG_HULL, SILAS_HULL, DREADNOUGHT_HULL)   # future hulls append here

@@ -28,22 +28,25 @@ class Beam:
 class Bullet:
     def __init__(self, pos, vel, owner=0):
         self.pos = pos
+        self.prev_pos = pos.copy()      # NEW
         self.vel = vel
         self.life = BULLET_LIFE
-        self.owner = owner  # index into Game.ships; this is the future sync field
+        self.owner = owner
 
     def update(self, dt):
+        self.prev_pos = self.pos.copy()  # NEW
         self.pos += self.vel * dt
         self.life -= dt
-
 
 class EnemyBullet:
     def __init__(self, pos, vel, owner=0):
         self.pos = pos
+        self.prev_pos = pos.copy()      # NEW
         self.vel = vel
         self.life = ENEMY_BULLET_LIFE
         self.owner = owner
 
     def update(self, dt):
+        self.prev_pos = self.pos.copy()  # NEW
         self.pos += self.vel * dt
         self.life -= dt

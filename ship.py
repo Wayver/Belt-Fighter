@@ -30,6 +30,8 @@ import pygame
 
 from .bullets import Shot, Beam
 
+from .collision import HullCollision, convex_hull
+
 from .config import (WIDTH, HEIGHT, ROT_SPEED, MAX_SPEED,
                      STOP_GAIN, MAX_STOP_ACCEL, STOP_DEADBAND,
                      SHIP_COLOR, SHIP_EDGE, FLAME_OUT, FLAME_IN,
@@ -39,7 +41,8 @@ from .config import (WIDTH, HEIGHT, ROT_SPEED, MAX_SPEED,
                      ARC_GLOW, ARC_CORE, TARGETING_POWER, TARGETING_COMPUTE_BASE,
                      TARGETING_COMPUTE_PER_TARGET, LASER_DUMP_DECAY, LASER_COLOR,
                      SHIELD_IMPACT_TTL, SHIELD_IMPACT_SPREAD, SHIELD_IMPACT_SPREAD_TIME,
-                     SHIELD_IMPACT_STEPS, SENSOR_COLOR, SENSOR_SCAN_COLOR, SCAN_DUMP_DECAY)
+                     SHIELD_IMPACT_STEPS, SENSOR_COLOR, SENSOR_SCAN_COLOR, SCAN_DUMP_DECAY,
+                     HULL_COLLISION_INSET)
 
 from .hulls import DEFAULT_HULL, default_loadout, Slot, ComponentType
 
@@ -92,6 +95,8 @@ class Ship:
     def __init__(self, ship_id=0, hull=None, loadout=None):
         self.id = ship_id
         self.hull = hull or DEFAULT_HULL
+        # per-hull shield oval (a, b, cx, cy) in local coords; None = config default
+        self.shield_oval = self.hull.shield_oval or (SHIELD_OVAL_A, SHIELD_OVAL_B, 0.0, 0.0)
         # slot_name -> ComponentType (the fitted parts, all types)
         self.components = dict(loadout or default_loadout(self.hull))
         # runtime thruster instances (thruster slots only)
@@ -169,6 +174,13 @@ class Ship:
         self.dampening = False
         self.prev_pos = self.pos.copy()
         self.prev_angle = self.angle
+        # exact collision shape: convex hull of the hull polygon, precomputed
+        # once. Pure float math -> lockstep-safe. See collision.py.
+        self.collision = HullCollision(convex_hull(self.hull.polygon),
+                                       inset=HULL_COLLISION_INSET)
+
+
+
 
     # --- geometry helpers (read from the hull) ---
 
@@ -190,6 +202,44 @@ class Ship:
     def collision_radius(self):
         """Collision radius from the hull (per-hull, not a global)."""
         return self.hull.collision_radius
+
+    # --- exact hull collision (see collision.py) ---
+
+    def collision_contains(self, world_pos):
+        """True if world_pos (Vector2) is inside the hull's collision polygon."""
+        return self.collision.contains_point(world_pos.x, world_pos.y,
+                                             self.pos, self.angle)
+
+    def collision_segment(self, p0, p1):
+        """Sweep segment p0->p1 (world Vector2s) against the collision polygon.
+        Returns (hit, world_hit_point). Fixes bullet tunneling at high speed."""
+        return self.collision.segment_hits(p0, p1, self.pos, self.angle)
+
+    def collision_overlaps_ship(self, other):
+        """SAT: True if this hull's collision polygon overlaps other's."""
+        return self.collision.overlaps_ship(other.collision, self.pos, self.angle,
+                                            other.pos, other.angle)
+
+    def collision_overlaps_circle(self, center, r):
+        """True if circle (center Vector2, radius r) overlaps the collision polygon."""
+        return self.collision.overlaps_circle(center.x, center.y, r,
+                                              self.pos, self.angle)
+
+    def collision_swept_overlaps_circle(self, center, r):
+        """True if the hull's swept path (prev pose -> current pose) overlaps
+        circle (center Vector2, radius r). Speed-independent: catches fast
+        rams a point-in-time test would skip. Lockstep-safe."""
+        return self.collision.swept_overlaps_circle(
+            tuple(self.prev_pos), self.prev_angle,
+            tuple(self.pos), self.angle,
+            center.x, center.y, r)
+
+    def draw_collision(self, screen, cam):
+        """Debug: draw the collision polygon (presentation-only)."""
+        pts = [cam.to_screen(self.to_world(lx, ly))
+               for (lx, ly) in self.collision.local_poly]
+        pygame.draw.polygon(screen, (255, 0, 255), pts, 1)
+
 
     @property
     def shield_on(self):
@@ -233,23 +283,24 @@ class Ship:
         """Point on the shield oval in the direction of world_pos."""
         if self.shield_comp is None:
             return world_pos
+        a, b, cx, cy = self.shield_oval
         d = world_pos - self.pos
         if d.length_squared() < 1e-6:
             return self.pos
-        d = d.normalize()
         fwd, right = self.axes()
-        dx, dy = d.dot(fwd), d.dot(right)
-        t = 1.0 / math.sqrt((dx / SHIELD_OVAL_A) ** 2 + (dy / SHIELD_OVAL_B) ** 2)
-        return self.pos + fwd * (t * dx) + right * (t * dy)
+        dx, dy = d.dot(fwd) - cx, d.dot(right) - cy
+        t = 1.0 / math.sqrt((dx / a) ** 2 + (dy / b) ** 2)
+        return self.pos + fwd * (cx + t * dx) + right * (cy + t * dy)
 
     def shield_contains(self, world_pos):
         """True if world_pos is inside the shield oval."""
         if self.shield_comp is None:
             return False
+        a, b, cx, cy = self.shield_oval
         d = world_pos - self.pos
         fwd, right = self.axes()
-        lx, ly = d.dot(fwd), d.dot(right)
-        return (lx / SHIELD_OVAL_A) ** 2 + (ly / SHIELD_OVAL_B) ** 2 <= 1.0
+        lx, ly = d.dot(fwd) - cx, d.dot(right) - cy
+        return (lx / a) ** 2 + (ly / b) ** 2 <= 1.0
 
     def reset_lasers(self):
         self.laser_target = None
@@ -327,10 +378,16 @@ class Ship:
             for t in self.thrusters:
                 if t.slot.orientation == (-1, 0):
                     t.demand = max(t.demand, inp.thrust_rev)
-        if inp.thrust_right:
-            self._demand('to_right', inp.thrust_right)
+        
         if inp.thrust_left:
-            self._demand('to_left', inp.thrust_left)
+            for t in self.thrusters:
+                if t.slot.orientation == (0, -1):
+                    t.demand = max(t.demand, inp.thrust_left)
+        if inp.thrust_right:
+            for t in self.thrusters:
+                if t.slot.orientation == (0, 1):
+                    t.demand = max(t.demand, inp.thrust_right)
+
         if inp.stop:
             self._stop_demands()
 
@@ -563,11 +620,12 @@ class Ship:
         self.shield_charge -= 1.0
         self.shield_dump += self.shield_comp.power_hit
         if world_pos is not None:
+            a, b, cx, cy = self.shield_oval
             d = world_pos - self.pos
             fwd, right = self.axes()
-            lx, ly = d.dot(fwd), d.dot(right)
+            lx, ly = d.dot(fwd) - cx, d.dot(right) - cy
             if lx * lx + ly * ly > 1e-6:
-                theta = math.atan2(ly / SHIELD_OVAL_B, lx / SHIELD_OVAL_A)
+                theta = math.atan2(ly / b, lx / a)
                 self.shield_impacts.append([theta, 0.0, SHIELD_IMPACT_TTL])
         return True
 
@@ -680,10 +738,18 @@ class Ship:
                         scale=slot.flame_scale, width=slot.flame_width,
                         flame_out=flame_out, flame_in=flame_in)
 
+        
+
         # Hull.
         pts = [cam.to_screen(w(*p)) for p in self.hull.polygon]
         pygame.draw.polygon(screen, fill, pts)
+        # Detail panels: (polygon, color) in local coords, drawn over the
+        # hull fill and under the edge stroke so the outline stays crisp.
+        for panel_poly, panel_fill in self.hull.panels:
+            ppts = [cam.to_screen(w(*p)) for p in panel_poly]
+            pygame.draw.polygon(screen, panel_fill, ppts)
         pygame.draw.polygon(screen, edge, pts, 2)
+
 
         # Cockpit + engine nozzles + gun muzzles.
         cx, cy = self.hull.cockpit
@@ -726,11 +792,12 @@ class Ship:
         if alpha <= 0.02:
             return
         color = _lerp_color(SHIELD_COLOR_DIM, SHIELD_COLOR_BRIGHT, alpha)
+        a, b, cx, cy = self.shield_oval
         pts = []
         for i in range(32):
             th = 2 * math.pi * i / 32
-            world = pos + fwd * (SHIELD_OVAL_A * math.cos(th)) \
-                         + right * (SHIELD_OVAL_B * math.sin(th))
+            world = pos + fwd * (cx + a * math.cos(th)) \
+                         + right * (cy + b * math.sin(th))
             pts.append(cam.to_screen(world))
         pygame.draw.polygon(screen, _dim_color(color, 0.5), pts, 5)  # glow
         pygame.draw.polygon(screen, color, pts, 2)                   # core
@@ -747,11 +814,12 @@ class Ship:
             if fade <= 0.02:
                 continue
             span = SHIELD_IMPACT_SPREAD * min(1.0, age / SHIELD_IMPACT_SPREAD_TIME)
+            a, b, cx, cy = self.shield_oval
             pts = []
             for i in range(SHIELD_IMPACT_STEPS + 1):
                 th = theta - span + 2.0 * span * i / SHIELD_IMPACT_STEPS
-                world = pos + fwd * (SHIELD_OVAL_A * math.cos(th)) \
-                             + right * (SHIELD_OVAL_B * math.sin(th))
+                world = pos + fwd * (cx + a * math.cos(th)) \
+                             + right * (cy + b * math.sin(th))
                 pts.append(cam.to_screen(world))
             pygame.draw.lines(screen, _dim_color(LASER_COLOR, fade * 0.5),
                               False, pts, 5)   # glow

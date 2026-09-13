@@ -113,9 +113,14 @@ class Menu:
             return (cx + (fx * lx + rx * ly) * scale,
                     cy + (fy * lx + ry * ly) * scale)
 
+
         pts = [w(*p) for p in hull.polygon]
         pygame.draw.polygon(screen, hull.fill or SHIP_COLOR, pts)
+        for panel_poly, panel_fill in hull.panels:
+            pygame.draw.polygon(screen, panel_fill, [w(*p) for p in panel_poly])
         pygame.draw.polygon(screen, hull.edge or SHIP_EDGE, pts, 2)
+
+        
         for s in hull.slots:
             x, y = w(*s.position)
             if s.name == highlight:

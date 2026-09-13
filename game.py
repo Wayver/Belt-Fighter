@@ -22,7 +22,7 @@ from .config import (WIDTH, HEIGHT, SPAWN_PROTECT, MAX_BULLETS,
                     TARGETING_COLOR_GREEN, TARGETING_ALIGN_TOL, LASER_COLOR,
                     BEAM_IMPACT_SPREAD, SENSOR_COLOR, SENSOR_SCAN_COLOR,
                     SENSOR_SIGNATURE_THRESHOLD, SENSOR_SIG_FULL, SENSOR_ARROW_MARGIN,
-                    SCAN_DUMP_DECAY)
+                    SCAN_DUMP_DECAY, DEBUG_COLLISION)
 
 from .ship import Ship, wrapped_delta, _dim_color
 from .intent import ShipInput
@@ -415,13 +415,15 @@ class Game:
         return False
 
     def _collisions(self):
-        # player bullet vs enemy
+        # player bullet vs enemy (swept segment vs hull polygon)
         for b in self.bullets[:]:
             for i, e in enumerate(self.enemies):
-                if b.pos.distance_to(e.pos) < e.collision_radius + 4:
+                hit, hit_pt = e.ship.collision_segment(b.prev_pos, b.pos)
+                if hit:
                     self.bullets.remove(b)
-                    if e.register_hit(b.pos):
-                        burst(self.particles, b.pos, 6)
+                    impact = pygame.Vector2(hit_pt)
+                    if e.register_hit(impact):
+                        burst(self.particles, impact, 6)
                     else:
                         self.score += ENEMY_SCORE
                         burst(self.particles, e.pos, 20, big=True)
@@ -451,7 +453,9 @@ class Game:
                     break
 
         # enemy bullet vs asteroid
-        for b in self.enemy_bullets[:]:
+        for b in self.enemy_bullets:
+            if b.life <= 0:
+                continue
             for i, a in enumerate(self.asteroids):
                 if b.pos.distance_to(a.pos) < a.collision_radius:
                     burst(self.particles, a.pos, a.radius)
@@ -464,36 +468,41 @@ class Game:
                             self.asteroids.append(Asteroid(a.pos, child_size,
                                                            vel=a.vel * 0.5 + kick))
                     self.asteroids.pop(i)
-                    self.enemy_bullets.remove(b)
+                    b.life = 0.0          # was: self.enemy_bullets.remove(b)
                     break
 
-        # enemy bullet vs ship (shield surface if up, else hull)
+        # enemy bullet vs ship (shield surface if up, else swept hull)
         if self.protect_timer <= 0:
-            for b in self.enemy_bullets[:]:
+            for b in self.enemy_bullets:
+                if b.life <= 0:
+                    continue
                 if self.ship.shield_on:
                     if self.ship.shield_contains(b.pos):
-                        self.enemy_bullets.remove(b)
+                        b.life = 0.0      # was: self.enemy_bullets.remove(b)
                         if not self._handle_ship_hit(b.pos):
                             break
-                elif b.pos.distance_to(self.ship.pos) < self.ship.collision_radius + 4:
-                    self.enemy_bullets.remove(b)
-                    if not self._handle_ship_hit(b.pos):
-                        break
+                else:
+                    hit, hit_pt = self.ship.collision_segment(b.prev_pos, b.pos)
+                    if hit:
+                        b.life = 0.0      # was: self.enemy_bullets.remove(b)
+                        if not self._handle_ship_hit(pygame.Vector2(hit_pt)):
+                            break
 
-        # ship vs enemy (ram)
+
+        # ship vs enemy (ram) — SAT on both hull polygons
         if self.protect_timer <= 0 and not self.game_over:
             for e in self.enemies:
-                if self.ship.pos.distance_to(e.pos) < e.collision_radius + self.ship.collision_radius:
+                if self.ship.collision_overlaps_ship(e.ship):
                     if not self._handle_ship_hit(e.pos):
                         break
 
-        # ship vs asteroid
+        # ship vs asteroid — swept hull polygon vs circle (speed-independent)
         if self.protect_timer <= 0 and not self.game_over:
             for a in self.asteroids:
-                if self.ship.pos.distance_to(a.pos) < a.collision_radius + self.ship.collision_radius:
+                if self.ship.collision_swept_overlaps_circle(a.pos, a.collision_radius):
                     if not self._handle_ship_hit(a.pos):
                         break
-
+        
         # enemy vs asteroid (rocks are hazards for everyone)
         for i, e in enumerate(self.enemies[:]):
             for a in self.asteroids:
@@ -556,6 +565,11 @@ class Game:
         draw_hud(screen, self.font, self.score, self.wave, self.enemies, self.ship)
         if self.game_over:
             draw_game_over(screen, self.big_font, self.font, self.score)
+
+        if DEBUG_COLLISION:
+            self.ship.draw_collision(screen, self.cam)
+            for e in self.enemies:
+                e.ship.draw_collision(screen, self.cam)
 
 # --- test range: static scene for laser occlusion testing ---
     TEST_ROCK_POS   = (960, 340)   # 300 px ahead, dead center (large)

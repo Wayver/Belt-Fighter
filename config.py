@@ -105,11 +105,15 @@ ENEMY_COURSE_MARGIN = 30.0  # miss-distance slack before the AI slams the damper
 ENEMY_COURSE_MARGIN = 30.0  # miss-distance slack before the AI slams the damper
 
 # --- fog of war knobs ---
-FOG_ALPHA = 50          # how dark the fog is (0-255)
+FOG_ALPHA = 75          # how dark the fog is (0-255)
 FOG_BASE_RADIUS = 160.0  # all-around visibility around the ship
 FOG_FRONT_RADIUS = 430.0 # reach of the forward lobe
 FOG_SIDE_RADIUS = 200.0  # width of the forward lobe
 FOG_FRONT_OFFSET = 120.0 # how far ahead of the ship the lobe is centered
+
+# collision
+HULL_COLLISION_INSET = 1.0   # scale collision poly toward centroid (1.0 = exact hull)
+DEBUG_COLLISION = True      # draw the collision polygons (presentation-only)
 
 # --- colors ---
 BG = (10, 12, 18)

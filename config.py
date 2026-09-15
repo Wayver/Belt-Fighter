@@ -113,7 +113,7 @@ FOG_FRONT_OFFSET = 120.0 # how far ahead of the ship the lobe is centered
 
 # collision
 HULL_COLLISION_INSET = 1.0   # scale collision poly toward centroid (1.0 = exact hull)
-DEBUG_COLLISION = True      # draw the collision polygons (presentation-only)
+DEBUG_COLLISION = False      # draw the collision polygons (presentation-only)
 
 # --- colors ---
 BG = (10, 12, 18)

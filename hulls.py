@@ -282,7 +282,7 @@ TOOTH_THRUSTER = ComponentType('tooth_thruster', 'Tooth Thruster', ('thruster',)
 def default_loadout(hull=None):
     """slot_name -> ComponentType, the stock fit for a hull."""
     hull = hull or DEFAULT_HULL
-    is_bb = hull.id in ('blackbird, blackbird_wg')
+    is_bb = hull.id in ('blackbird', 'blackbird_wg')
     is_silas = hull.id == 'silas'
     is_dn = hull.id == 'dreadnought'
     # Blackbird: strong forward drive, weak reverse (swapped vs the scout).
@@ -290,7 +290,7 @@ def default_loadout(hull=None):
     out = {}
     for s in hull.slots:
         if s.slot_type == 'thruster':
-            if s.name in ('forward_s', 'forward_p'):
+            if s.name.startswith('forward'):
                 out[s.name] = fwd
             elif s.name.startswith('tooth'):
                 out[s.name] = TOOTH_THRUSTER

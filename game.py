@@ -30,7 +30,9 @@ from .asteroid import Asteroid
 from .bullets import Bullet, EnemyBullet
 from .particles import burst, shield_burst
 from .spawning import spawn_enemy, make_stars, update_field, TestTarget
-from .fog import draw_fog
+
+from .fog import draw_fog, LightSource
+
 from .hud import draw_hud, draw_game_over
 from .camera import Camera
 
@@ -195,6 +197,44 @@ class Game:
         for b in self.beams:
             b[4] += dt
         self.beams = [b for b in self.beams if b[4] < b[5]]
+
+    
+    def _build_lights(self):
+        """Whitelist of things that shine through the fog of war.
+        Returns a list of LightSource in world coords, built fresh each frame."""
+        lights = []
+        ship = self.ship
+
+
+        # --- Targeting reticle: a small light at each predicted lead point.
+        # Mirrors the guard in _draw_lead so the light and the reticle
+        # appear/disappear together.
+        if TARGETING_ASSIST and ship.targeting_on:
+            for e in self.enemies:
+                p = e.lead_point(ship.pos, BULLET_SPEED, TARGETING_USE_ACCEL)
+                if p is not None and (p - ship.pos).length() <= TARGETING_RANGE:
+                    lights.append(LightSource(p, 50, 0.6))
+
+        # --- Weapon fire: bullets glow as they fly through the dark.
+        for b in self.bullets:
+            lights.append(LightSource(b.pos, 30, 0.5))
+        for b in self.enemy_bullets:
+            lights.append(LightSource(b.pos, 24, 0.4))
+
+        # --- Shield impacts: a fading flash at the hit point on the oval.
+        # shield_impacts stores [theta, age, ttl] in local hull space, so
+        # convert to world the same way _draw_shield_impacts does.
+        if ship.shield_impacts:
+            a, b, cx, cy = ship.shield_oval
+            fwd, right = ship.axes()
+            for theta, age, ttl in ship.shield_impacts:
+                fade = 1.0 - age / ttl
+                world = (ship.pos + fwd * (cx + a * math.cos(theta))
+                                 + right * (cy + b * math.sin(theta)))
+                lights.append(LightSource(world, 40, 0.5 * fade))
+
+        return lights
+
 
     def _update_contacts(self):
         """Build the ship's contact list from the fitted sensor.
@@ -560,7 +600,10 @@ class Game:
                 ssx, ssy = self.cam.to_screen(self.ship.rpos)
                 screen.blit(self.shield, (ssx - self.shield.get_width() // 2,
                                       ssy - self.shield.get_height() // 2))
-        draw_fog(screen, self.ship, self.cam, self.light_tex, self.fog_surf, self.light_surf)
+        draw_fog(screen, self.ship, self.cam, self.light_tex, self.fog_surf, self.light_surf, self._build_lights())
+        # Scan pulse above the fog: a bright ring sweeping through the dark
+        if not self.game_over:
+            self.ship._draw_scan_pulse(screen, self.cam, self.ship.rpos)
         self._draw_sensor_contacts()
         draw_hud(screen, self.font, self.score, self.wave, self.enemies, self.ship)
         if self.game_over:

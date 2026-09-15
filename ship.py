@@ -762,7 +762,7 @@ class Ship:
                 gx, gy = slot.position
                 pygame.draw.circle(screen, edge, cam.to_screen(w(gx, gy)), 2)
 
-        self._draw_scan_pulse(screen, cam, pos)
+        #self._draw_scan_pulse(screen, cam, pos)
         self._draw_shield(screen, cam, pos, angle)
         self._draw_shield_impacts(screen,cam,pos,angle)
         self._draw_laser_charge(screen, cam, w)

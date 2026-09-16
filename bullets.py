@@ -83,7 +83,8 @@ class Missile:
             # straight-line boost, ramp to cruise speed
             self.boost -= dt
             self.vel += self.vel.normalize() * MISSILE_ACCEL * dt
-            self.vel = self.vel.limit(MISSILE_SPEED)
+            if self.vel.length() > MISSILE_SPEED:
+                self.vel.scale_to_length(MISSILE_SPEED)
         elif self.target is not None and self.target.hp > 0:
             # seek: steer toward the live intercept point, turn-rate limited
             aim = self.target.lead_point(self.pos, self.vel.length())

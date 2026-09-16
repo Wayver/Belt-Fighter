@@ -351,7 +351,7 @@ def default_loadout(hull=None):
 # What the menu offers per slot type.
 COMPONENT_CATALOG = {
     'thruster': (MAIN_ENGINE, NOSE_THRUSTER, TOOTH_THRUSTER, RCS, RCS_HEAVY),
-    'weapon':   (GUN_TYPE, LASER_TYPE, LASER_S, LASER_P),
+    'weapon':   (GUN_TYPE, LASER_TYPE, LASER_S, LASER_P, MISSILE_TYPE),
     'reactor':  (REACTOR_TYPE,),
     'computer': (COMPUTER_TYPE,),
     'shield':   (SHIELD_TYPE,),

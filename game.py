@@ -22,7 +22,10 @@ from .config import (WIDTH, HEIGHT, SPAWN_PROTECT, MAX_BULLETS,
                     TARGETING_COLOR_GREEN, TARGETING_ALIGN_TOL, LASER_COLOR,
                     BEAM_IMPACT_SPREAD, SENSOR_COLOR, SENSOR_SCAN_COLOR,
                     SENSOR_SIGNATURE_THRESHOLD, SENSOR_SIG_FULL, SENSOR_ARROW_MARGIN,
-                    SCAN_DUMP_DECAY, DEBUG_COLLISION)
+                    SCAN_DUMP_DECAY, DEBUG_COLLISION,
+                    MISSILE_COLOR, MAX_MISSILES)
+
+from .bullets import Bullet, EnemyBullet, Missile, MissileShot
 
 from .ship import Ship, wrapped_delta, _dim_color
 from .intent import ShipInput
@@ -60,6 +63,7 @@ class Game:
 
         self.cam = Camera(self.ship.pos)
         self.bullets = []
+        self.missiles = []
         self.beams   = []
         self.enemy_bullets = []
         self.particles = []
@@ -86,6 +90,8 @@ class Game:
         self.bullets.clear()
         self.enemy_bullets.clear()
         self.beams.clear()
+        self.missiles.clear()
+        self.ship.reset_missiles()
         self.ship.reset_lasers()
         self.ship.reset_sensors()
         self.particles.clear()
@@ -148,6 +154,8 @@ class Game:
             # steps so _update_lasers() sees it this tick.
             self.ship.laser_target = self._pick_laser_target()
             
+            # Missile target: same pattern, for the lock state machine.
+            self.ship.missile_target = self._pick_missile_target()
 
             # Sensor contacts: passive + active reveals, same pattern.
             self._update_contacts()
@@ -155,11 +163,21 @@ class Game:
 
             if inp.fire and len(self.bullets) >= MAX_BULLETS:
                 inp = replace(inp, fire=False)   # world cap: no room, no shot
-            shots, beams = self.ship.update(dt, inp)
+            #shots, beams, missiles = self.ship.update(dt, inp)
             
+            if inp.missile_fire and len(self.missiles) >= MAX_MISSILES:
+                inp = replace(inp, missile_fire=False)
+            shots, beams, missiles = self.ship.update(dt, inp)
+
             for shot in shots:
                 self.bullets.append(Bullet(shot.pos, shot.vel, owner=shot.owner))
             
+
+            for m in missiles:
+                self.missiles.append(Missile(m.pos, m.vel, owner=m.owner,
+                                             target=m.target))
+            
+
             for beam in beams:
                 self._resolve_beam(beam)
             
@@ -172,7 +190,7 @@ class Game:
                 update_field(self.asteroids, [self.ship.pos], self.wave, dt)
 
         for e in self.enemies:
-            shots, _ = e.update(dt, self.ship, self.asteroids)
+            shots = e.update(dt, self.ship, self.asteroids)
             for shot in shots:
                 self.enemy_bullets.append(EnemyBullet(shot.pos, shot.vel, owner=shot.owner))
 
@@ -180,6 +198,8 @@ class Game:
             b.update(dt)
         for b in self.enemy_bullets:
             b.update(dt)
+        for m in self.missiles:
+            m.update(dt)
         for a in self.asteroids:
             a.update(dt)
         for p in self.particles:
@@ -188,6 +208,7 @@ class Game:
         # cull expired projectiles and particles
         self.bullets = [b for b in self.bullets if b.life > 0]
         self.enemy_bullets = [b for b in self.enemy_bullets if b.life > 0]
+        self.missiles = [m for m in self.missiles if m.life > 0]
         self.particles = [p for p in self.particles if p.life > 0]
 
         # collisions after movement, so this tick's motion counts
@@ -318,6 +339,22 @@ class Game:
             if d <= best_d:
                 best, best_d = e, d
         return best
+
+
+    def _pick_missile_target(self):
+        """Nearest enemy within the max missile lock range; None if no
+        missile fitted."""
+        max_range = max((w.comp.missile_lock_range for w in self.ship.weapons
+                         if w.comp.missile_speed > 0), default=0.0)
+        if max_range <= 0:
+            return None
+        best, best_d = None, max_range
+        for e in self.enemies:
+            d = e.pos.distance_to(self.ship.pos)
+            if d <= best_d:
+                best, best_d = e, d
+        return best
+
 
     def _resolve_beam(self, beam):
         """Hitscan: hit the first enemy near the beam's end point.
@@ -492,6 +529,46 @@ class Game:
                     self.bullets.remove(b)
                     break
 
+        # missile vs enemy (swept segment vs hull polygon)
+        for m in self.missiles[:]:
+            for i, e in enumerate(self.enemies):
+                hit, hit_pt = e.ship.collision_segment(m.prev_pos, m.pos)
+                if hit:
+                    self.missiles.remove(m)
+                    impact = pygame.Vector2(hit_pt)
+                    alive = True
+                    for _ in range(m.dmg):
+                        alive = e.register_hit(impact)
+                    if alive:
+                        burst(self.particles, impact, 6)
+                    else:
+                        self.score += ENEMY_SCORE
+                        burst(self.particles, e.pos, 20, big=True)
+                        self.enemies.pop(i)
+                        if self.test_mode:
+                            self._setup_test_scene()   # re-arm: fresh rock + target
+                        else:
+                            spawn_enemy(self.enemies, self.ship)
+                    break
+
+        # missile vs asteroid (detonate, same as a bullet)
+        for m in self.missiles[:]:
+            for i, a in enumerate(self.asteroids):
+                if m.pos.distance_to(a.pos) < a.collision_radius:
+                    self.score += a.score
+                    burst(self.particles, a.pos, a.radius)
+                    child_size = ROCK_SPLIT[a.size]
+                    if child_size:
+                        for _ in range(2):
+                            ks = random.uniform(*ROCK_SIZES[child_size]['speed'])
+                            ka = random.uniform(0, 2 * math.pi)
+                            kick = pygame.Vector2(math.cos(ka) * ks, math.sin(ka) * ks)
+                            self.asteroids.append(Asteroid(a.pos, child_size,
+                                                           vel=a.vel * 0.5 + kick))
+                    self.asteroids.pop(i)
+                    self.missiles.remove(m)
+                    break
+
         # enemy bullet vs asteroid
         for b in self.enemy_bullets:
             if b.life <= 0:
@@ -571,6 +648,12 @@ class Game:
             s = self.cam.to_screen(b.pos)
             pygame.draw.circle(screen, BULLET_COLOR, (int(s.x), int(s.y)), 3)
         
+        for m in self.missiles:
+            s = self.cam.to_screen(m.pos)
+            tail = self.cam.to_screen(m.pos - m.vel.normalize() * 8)
+            pygame.draw.line(screen, _dim_color(MISSILE_COLOR, 0.6), tail, s, 2)
+            pygame.draw.circle(screen, MISSILE_COLOR, (int(s.x), int(s.y)), 3)
+
 
         for local, target, d, vis_end, age, ttl in self.beams:
             fade = 1.0 - age / ttl

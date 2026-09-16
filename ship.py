@@ -28,7 +28,7 @@ from dataclasses import dataclass
 
 import pygame
 
-from .bullets import Shot, Beam
+from .bullets import Shot, Beam, MissileShot
 
 from .collision import HullCollision, convex_hull
 
@@ -42,7 +42,7 @@ from .config import (WIDTH, HEIGHT, ROT_SPEED, MAX_SPEED,
                      TARGETING_COMPUTE_PER_TARGET, LASER_DUMP_DECAY, LASER_COLOR,
                      SHIELD_IMPACT_TTL, SHIELD_IMPACT_SPREAD, SHIELD_IMPACT_SPREAD_TIME,
                      SHIELD_IMPACT_STEPS, SENSOR_COLOR, SENSOR_SCAN_COLOR, SCAN_DUMP_DECAY,
-                     HULL_COLLISION_INSET)
+                     HULL_COLLISION_INSET, MISSILE_COLOR)
 
 from .hulls import DEFAULT_HULL, default_loadout, Slot, ComponentType
 
@@ -82,6 +82,7 @@ class Weapon:
     cooldown: float = 0.0
     allocation: float = 1.0
     charge: float = 0.0
+    lock_progress: float = 0.0
 
 
 def _lerp_color(c1, c2, t):
@@ -135,6 +136,9 @@ class Ship:
         self.tracked = 0    # enemies within TARGETING_RANGE; set by Game each tick
         self.laser_target = None   # enemy candidate; set by Game each tick
         self.laser_dump = 0.0      # decaying power spike from discharges
+
+        self.missile_target = None   # enemy candidate; set by Game each tick
+        self.missile_dump = 0.0      # decaying power spike from launches
 
         # sensors: passive ear (V) + active ping (G). The fitted part
         # decides which exist (0 range/cooldown = not fitted).
@@ -308,6 +312,13 @@ class Ship:
         for w in self.weapons:
             w.charge = 0.0
 
+    
+    def reset_missiles(self):
+        self.missile_target = None
+        self.missile_dump = 0.0
+        for w in self.weapons:
+            w.lock_progress = 0.0
+
 
     def axes(self):
         fwd = pygame.Vector2(math.cos(self.angle), math.sin(self.angle))
@@ -338,7 +349,7 @@ class Ship:
 
 
     def update(self, dt, inp):
-        """... Returns (shots, beams) fired this tick; the caller routes
+        """... Returns (shots, beams, missiles) fired this tick; the caller routes
         them into its bullet/beam lists."""
         self.prev_pos = self.pos.copy()
         self.prev_angle = self.angle
@@ -352,9 +363,10 @@ class Ship:
         self.accel = accel.copy()
         shots = self._fire(dt, inp)
         beams = self._update_lasers(dt, inp)   # after _allocate: sees this tick's brownout
+        missiles = self._update_missiles(dt, inp)
         self._integrate(dt, accel)
         self._update_arcs(dt)
-        return shots, beams
+        return shots, beams, missiles
 
     def _apply_rotation(self, dt, inp):
         self.angle += inp.turn * ROT_SPEED * self.hull.turn_rate_factor * dt
@@ -444,7 +456,9 @@ class Ship:
         # lasers draw power while charging (charge is last tick's value)
         active += [(w, w.comp.power_active) for w in self.weapons
             if w.comp.laser_range > 0 and 0.0 < w.charge < 1.0]
-        
+        active += [(w, w.comp.power_active) for w in self.weapons
+            if w.comp.missile_speed > 0 and w.lock_progress > 0.0]
+
         shield_active = 0.0
         if self.shield_on:
             shield_active = self.shield_comp.power_active + self.shield_dump
@@ -452,11 +466,13 @@ class Ship:
         # system that can TRIGGER a brownout but isn't shed itself.
         targeting_active = TARGETING_POWER if self.targeting_on else 0.0
         laser_active = self.laser_dump
+        missile_active = self.missile_dump
+
         sensor_active = (self.sensor_comp.power_active
                          if self.sensor_on and self.sensor_comp else 0.0)
         scan_active = self.scan_dump
         total = (idle + sum(need for _, need in active) + shield_active
-                 + targeting_active + laser_active + sensor_active + scan_active)
+                 + targeting_active + laser_active + missile_active + sensor_active + scan_active)
         self.power_used = total
 
         if not self.brownout and total > self.power_supply * (1.0 + POWER_HYSTERESIS):
@@ -530,6 +546,8 @@ class Ship:
         for w in self.weapons:
             if w.comp.laser_range > 0:
                 continue   # laser: no ballistic shots, _update_lasers() owns it
+            if w.comp.missile_speed > 0:
+                continue   # missile: no ballistic shots, _update_missiles() owns it
             w.cooldown -= dt
             if inp.fire and w.cooldown <= 0 and w.allocation > 0:
                 fwd, right = self.axes()
@@ -637,22 +655,21 @@ class Ship:
             self.shield_clock = 0.0
 
 
-    def _laser_in_wedge(self, w, target_pos):
-        """True if target_pos is inside laser w's firing wedge and range.
-
-        The wedge is measured from the nose: 0 deg = straight ahead,
-        positive = starboard. The component stores the arc in degrees
-        (the human-facing stat); the test works in radians via
-        wrapped_delta, same as the rest of the sim.
-        """
+    def _in_wedge(self, target_pos, max_range, arc_start_deg, arc_end_deg):
+        """True if target_pos is within max_range and inside the firing arc
+        (degrees from the nose: 0 = ahead, + = starboard)."""
         d = target_pos - self.pos
         dist = d.length()
-        if dist < 1 or dist > w.comp.laser_range:
+        if dist < 1 or dist > max_range:
             return False
         ang_deg = math.degrees(wrapped_delta(self.angle,
                                          math.atan2(d.y, d.x), 2 * math.pi))
-        return w.comp.laser_arc_start_deg <= ang_deg <= w.comp.laser_arc_end_deg
+        return arc_start_deg <= ang_deg <= arc_end_deg
 
+    def _laser_in_wedge(self, w, target_pos):
+        return self._in_wedge(target_pos, w.comp.laser_range,
+                              w.comp.laser_arc_start_deg,
+                              w.comp.laser_arc_end_deg)
 
     def _update_lasers(self, dt, inp):
         """Laser charge/discharge state machine. Returns Beam events.
@@ -684,6 +701,44 @@ class Ship:
                 self.laser_dump += w.comp.laser_discharge_dump
                 w.charge = 0.0
         return beams
+
+    def _update_missiles(self, dt, inp):
+        """Missile lock/launch state machine. Returns MissileShot events.
+
+        IDLE -> LOCKING:   target in arc + range, lock < 1
+        LOCKING -> READY:  lock reaches 1
+        -> IDLE (reset):   target leaves arc/range, target gone, or brownout
+        READY -> LAUNCH:   inp.missile_fire (F)
+        """
+        # decay the launch spike (mirrors the laser's discharge-dump)
+        if self.missile_dump > 0:
+            self.missile_dump = max(0.0, self.missile_dump - LASER_DUMP_DECAY * dt)
+
+        missiles = []
+        for w in self.weapons:
+            if w.comp.missile_speed <= 0:
+                continue                      # not a missile
+            t = self.missile_target
+            if (t is None or self.brownout
+                    or not self._in_wedge(t.pos, w.comp.missile_lock_range,
+                                          w.comp.missile_arc_start_deg,
+                                          w.comp.missile_arc_end_deg)):
+                w.lock_progress = 0.0         # broken: full reset
+                continue
+            if w.lock_progress < 1.0:
+                w.lock_progress = min(1.0,
+                    w.lock_progress + dt / w.comp.missile_lock_time)
+                continue
+            if inp.missile_fire:
+                fwd, right = self.axes()
+                ox, oy = w.slot.orientation
+                vel = (fwd * ox + right * oy) * w.comp.missile_speed
+                missiles.append(MissileShot(self.to_world(*w.slot.position),
+                                            vel, self.id, t))
+                self.missile_dump += w.comp.missile_launch_dump
+                w.lock_progress = 0.0         # lock rebuild is the rate limit
+        return missiles
+
 
     def _draw_scan_pulse(self, screen, cam, pos):
         """Expanding ring from the ship while a ping is in flight."""
@@ -766,6 +821,7 @@ class Ship:
         self._draw_shield(screen, cam, pos, angle)
         self._draw_shield_impacts(screen,cam,pos,angle)
         self._draw_laser_charge(screen, cam, w)
+        self._draw_missile_lock(screen, cam, w)
         self._draw_arcs(screen, cam, w)
 
 
@@ -874,4 +930,25 @@ class Ship:
                 phase = pygame.time.get_ticks() * 0.012
                 r = 3 + int(2 * (0.5 + 0.5 * math.sin(phase)))
                 pygame.draw.circle(screen, LASER_COLOR,
+                                   (int(m.x), int(m.y)), r)
+
+    def _draw_missile_lock(self, screen, cam, to_world):
+        """Lock indicator at each missile's muzzle: an arc that closes as
+        the lock builds, then a pulsing dot when locked. Presentation only."""
+        for wpn in self.weapons:
+            if wpn.comp.missile_speed <= 0 or wpn.lock_progress <= 0:
+                continue
+            m = cam.to_screen(to_world(*wpn.slot.position))
+            if wpn.lock_progress < 1.0:
+                r = 7.0
+                end = 2 * math.pi * wpn.lock_progress
+                pts = [(m.x + math.cos(i * end / 12) * r,
+                        m.y + math.sin(i * end / 12) * r)
+                       for i in range(13)]
+                pygame.draw.lines(screen, _dim_color(MISSILE_COLOR, 0.8),
+                                  False, pts, 2)
+            else:
+                phase = pygame.time.get_ticks() * 0.012
+                r = 3 + int(2 * (0.5 + 0.5 * math.sin(phase)))
+                pygame.draw.circle(screen, MISSILE_COLOR,
                                    (int(m.x), int(m.y)), r)

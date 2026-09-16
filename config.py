@@ -154,3 +154,15 @@ TARGETING_MAX_LEAD  = 1.5              # cap on lead time (s); no marker beyond
 TARGETING_POWER = 8.0              # power draw while the reticle is on
 TARGETING_COMPUTE_BASE = 6.0       # compute for the targeting system itself
 TARGETING_COMPUTE_PER_TARGET = 4.0 # extra compute per tracked enemy
+
+# --- homing missile ---
+MISSILE_SPEED = 460.0      # cruise: below bullet (860), way above enemy (25)
+MISSILE_ACCEL = 900.0      # boost ramp
+MISSILE_BOOST_TIME = 0.35  # s of straight flight before seeking starts
+MISSILE_TURN_RATE = 3.0    # rad/s — THE evasion knob
+MISSILE_LIFE = 3.0         # range limit
+MISSILE_DAMAGE = 2
+MISSILE_COOLDOWN = 1.2
+MAX_MISSILES = 3
+MISSILE_LOCK_RANGE = 900.0 # matches TARGETING_RANGE
+MISSILE_COLOR = (255, 140, 60)

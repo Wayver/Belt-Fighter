@@ -37,10 +37,12 @@ class TestTarget(AIEnemy):
 
     def update(self, dt, player, asteroids):
         self.ship.vel = pygame.Vector2(0, 0)   # kill any drift
-        return self.ship.update(dt, ShipInput(turn=0, thrust_fwd=0.0,
-                                              thrust_left=0.0,
-                                              thrust_right=0.0,
-                                              stop=False, fire=False))
+        shots, _, _ = self.ship.update(dt, ShipInput(turn=0, thrust_fwd=0.0,
+                                                 thrust_left=0.0,
+                                                 thrust_right=0.0,
+                                                 stop=False, fire=False))
+        return shots
+
 
 def _far_pos(ship, min_dist, tries=20):
     """Pick a random position at least min_dist from the ship."""

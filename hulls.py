@@ -18,7 +18,8 @@ the tuning surface.
 from dataclasses import dataclass
 
 from .config import (SHIP_ACCEL, FIRE_COOLDOWN, BULLET_SPEED,
-                     ENEMY_FIRE_COOLDOWN, ENEMY_BULLET_SPEED)
+                     ENEMY_FIRE_COOLDOWN, ENEMY_BULLET_SPEED, MISSILE_SPEED,
+                     MISSILE_LOCK_RANGE, MISSILE_DAMAGE)
 
 
 @dataclass(frozen=True)
@@ -100,6 +101,17 @@ class ComponentType:
     laser_charge_time: float = 0.0     # seconds to full charge
     laser_damage: int = 0
     laser_discharge_dump: float = 0.0  # power spike added on fire
+    
+
+    # --- homing missile (lock + launch) ---
+    missile_speed: float = 0.0        # 0 = not a missile; else cruise px/s
+    missile_arc_start_deg: float = -45.0
+    missile_arc_end_deg: float = 45.0
+    missile_lock_range: float = 0.0   # max range to acquire/hold a lock
+    missile_lock_time: float = 0.0    # seconds to full lock
+    missile_damage: int = 0
+    missile_launch_dump: float = 0.0  # power spike added on launch
+
     # --- sensors ---
     sensor_range: float = 0.0        # passive detection range; 0 = none
     scan_cooldown: float = 0.0       # seconds between active pings; 0 = none
@@ -124,6 +136,7 @@ RCS_RIGHT = Slot('to_right', 'thruster', (-10, -9.5), (0, 1),
                  flame_scale=0.5, flame_width=2)
 
 GUN       = Slot('gun', 'weapon', (18, 0), (1, 0))
+MISSILE     = Slot('missile', 'weapon', (10, 6), (1, 0))
 # Generators: plain mount points, no orientation/flame semantics.
 REACTOR   = Slot('reactor', 'reactor', (-4, 0))
 COMPUTER  = Slot('computer', 'computer', (2, 0))
@@ -250,6 +263,17 @@ LASER_P = ComponentType('laser_p', 'Laser (Port)', ('weapon',),
     laser_discharge_dump=30.0,
     priority=2)
 
+MISSILE_TYPE = ComponentType('missile', 'Homing Missile', ('weapon',),
+    mass=2.0, power_idle=2.0, power_active=8.0,
+    missile_speed=MISSILE_SPEED,
+    missile_arc_start_deg=-45.0, missile_arc_end_deg=45.0,
+    missile_lock_range=MISSILE_LOCK_RANGE,
+    missile_lock_time=0.8,
+    missile_damage=MISSILE_DAMAGE,
+    missile_launch_dump=20.0,
+    priority=2)
+
+
 # --- Sensors ---
 # Passive: a cheap ear. While on (V), any enemy in sensor_range burning
 # >= SENSOR_SIGNATURE_THRESHOLD of active power shows as an off-screen
@@ -304,6 +328,8 @@ def default_loadout(hull=None):
                 out[s.name] = LASER_S
             elif s.name == 'gun_p':
                 out[s.name] = LASER_P
+            elif s.name == 'missile':
+                out[s.name] = MISSILE_TYPE
             else:
                 out[s.name] = GUN_TYPE
 

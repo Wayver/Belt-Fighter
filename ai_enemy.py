@@ -211,7 +211,7 @@ class AIEnemy:
 
     def update(self, dt, player, asteroids):
         inp = self._steer(player, asteroids)
-        shots = self.ship.update(dt, inp)
+        shots, _,_ = self.ship.update(dt, inp)
         k = 1.0 - math.exp(-dt / 0.15)
         self._acc_smooth += (self.ship.accel - self._acc_smooth) * k
         return shots

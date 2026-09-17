@@ -8,7 +8,8 @@ from .config import WIDTH, HEIGHT, ROCK_SIZES, ROCK_FILL, ROCK_EDGE
 
 
 class Asteroid:
-    def __init__(self, pos, size, vel=None):
+    def __init__(self, pos, size, vel=None, rng=None):
+        rng = rng or random
         cfg = ROCK_SIZES[size]
         self.size = size
         self.radius = cfg['radius']
@@ -16,21 +17,22 @@ class Asteroid:
         self.score = cfg['score']
         self.pos = pygame.Vector2(pos)
         if vel is None:
-            speed = random.uniform(*cfg['speed'])
-            a = random.uniform(0, 2 * math.pi)
+            speed = rng.uniform(*cfg['speed'])
+            a = rng.uniform(0, 2 * math.pi)
             self.vel = pygame.Vector2(math.cos(a) * speed, math.sin(a) * speed)
         else:
             self.vel = pygame.Vector2(vel)
-        self.spin = random.uniform(*cfg['spin']) * random.choice((-1, 1))
-        self.angle = random.uniform(0, 2 * math.pi)
-        self.verts = self._make_rock(self.radius)
+        self.spin = rng.uniform(*cfg['spin']) * rng.choice((-1, 1))
+        self.angle = rng.uniform(0, 2 * math.pi)
+        self.verts = self._make_rock(self.radius, rng=rng)
 
     @staticmethod
-    def _make_rock(radius, n=10):
+    def _make_rock(radius, n=10, rng=None):
+        rng = rng or random
         verts = []
         for i in range(n):
             a = 2 * math.pi * i / n
-            r = radius * random.uniform(0.72, 1.25)
+            r = radius * rng.uniform(0.72, 1.25)
             verts.append(pygame.Vector2(math.cos(a) * r, math.sin(a) * r))
         return verts
 

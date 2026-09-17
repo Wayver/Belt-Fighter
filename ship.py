@@ -798,13 +798,19 @@ class Ship:
         # Hull.
         pts = [cam.to_screen(w(*p)) for p in self.hull.polygon]
         pygame.draw.polygon(screen, fill, pts)
-        # Detail panels: (polygon, color) in local coords, drawn over the
+        
         # hull fill and under the edge stroke so the outline stays crisp.
-        for panel_poly, panel_fill in self.hull.panels:
-            ppts = [cam.to_screen(w(*p)) for p in panel_poly]
-            pygame.draw.polygon(screen, panel_fill, ppts)
+        # Panel shapes: a tuple of points (polygon) or ('circle', cx, cy, r).
+        for shape, panel_fill in self.hull.panels:
+            if isinstance(shape[0], str):            # circle pod
+                cx, cy, r = shape[1], shape[2], shape[3]
+                c = cam.to_screen(w(cx, cy))
+                pygame.draw.circle(screen, panel_fill, (int(c.x), int(c.y)),
+                                   max(1, int(r)))
+            else:
+                ppts = [cam.to_screen(w(*p)) for p in shape]
+                pygame.draw.polygon(screen, panel_fill, ppts)
         pygame.draw.polygon(screen, edge, pts, 2)
-
 
         # Cockpit + engine nozzles + gun muzzles.
         cx, cy = self.hull.cockpit

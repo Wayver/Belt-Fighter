@@ -17,8 +17,7 @@ from .config import (ENEMY_HP, ENEMY_ENGAGE_RANGE, ENEMY_ORBIT_OFFSET,
                      ENEMY_FILL, ENEMY_EDGE, ENEMY_FLAME, TARGETING_MAX_LEAD,
                      ENEMY_AVOID_BUFFER, ENEMY_BULLET_SPEED)
 
-
-from .hulls import ENEMY_HULL, enemy_loadout
+from .hulls import ENEMY_HULL, enemy_loadout, MOTE_HULL, mote_loadout
 
 from .ship import Ship
 
@@ -31,14 +30,17 @@ class AIEnemy:
 
     _next_id = 1   # player is ship_id 0; enemies get 1, 2, 3, ...
 
-    def __init__(self, pos):
-        self.ship = Ship(ship_id=self._next_id, hull=ENEMY_HULL,
-                         loadout=enemy_loadout())
+    
+    def __init__(self, pos, hull=None, loadout=None, rng=None):
+        self._rng = rng or random
+        self.hull = hull or ENEMY_HULL
+        self.ship = Ship(ship_id=self._next_id, hull=self.hull,
+                         loadout=loadout or enemy_loadout())
         AIEnemy._next_id += 1
         self.ship.pos = pygame.Vector2(pos)
-        self.ship.angle = random.uniform(0, 2 * math.pi)
+        self.ship.angle = self._rng.uniform(0, 2 * math.pi)
         self.hp = ENEMY_HP
-        self._acc_smooth = pygame.Vector2(0,0)
+        self._acc_smooth = pygame.Vector2(0, 0)
 
     # --- collision surface (mirrors how Game hits the player) ---
 
@@ -174,8 +176,8 @@ class AIEnemy:
                 d = self.ship.pos - rock
                 dist_a = d.length()
                 if dist_a < 1:
-                    d = pygame.Vector2(random.uniform(-1, 1),
-                                       random.uniform(-1, 1))
+                    d = pygame.Vector2(self._rng.uniform(-1, 1),
+                                       self._rng.uniform(-1, 1))
                     dist_a = d.length()
                 d.normalize_ip()
                 urgency = 1.0 - (dist_a - hit_dist) / max(ENEMY_AVOID_RADIUS - hit_dist, 1.0)
@@ -216,9 +218,13 @@ class AIEnemy:
         self._acc_smooth += (self.ship.accel - self._acc_smooth) * k
         return shots
 
+
     def draw(self, screen, cam):
-        self.ship.draw(screen, cam, fill=ENEMY_FILL, edge=ENEMY_EDGE,
+        self.ship.draw(screen, cam,
+                       fill=self.hull.fill or ENEMY_FILL,
+                       edge=self.hull.edge or ENEMY_EDGE,
                        flame_out=ENEMY_FLAME, flame_in=ENEMY_FLAME)
+
 
     def predict_path(self, horizon, steps):
         """Presentation-only predicted future positions for the targeting
@@ -266,3 +272,8 @@ class AIEnemy:
                 break
             T = T_new
         return e0 + v * T + 0.5 * a * (T * T)
+
+class MoteEnemy(AIEnemy):
+    """Pod-cluster variant: same brain, faster and twitchier ship."""
+    def __init__(self, pos, rng=None):
+        super().__init__(pos, hull=MOTE_HULL, loadout=mote_loadout(), rng=rng)

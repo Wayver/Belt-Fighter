@@ -11,7 +11,7 @@ from .menu import Menu
 def main():
     pygame.init()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
-    pygame.display.set_caption("Asteroids — 4-thruster ship")
+    pygame.display.set_caption("Belt Fighter")
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("consolas,menlo,monospace", 18)
     big_font = pygame.font.SysFont("consolas,menlo,monospace", 40)
@@ -28,9 +28,13 @@ def main():
         menu.draw(screen)
         pygame.display.flip()
 
+    seed = None
+    if '--seed' in sys.argv:
+        seed = int(sys.argv[sys.argv.index('--seed') + 1])
+
     game = Game(screen, font, big_font, light_tex, fog_surf, light_surf,
                 hull=menu.hull, loadout=menu.loadout,
-                test_mode=('--test' in sys.argv))
+                test_mode=('--test' in sys.argv), seed=seed)
 
 
     running = True

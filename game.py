@@ -44,14 +44,17 @@ STEP = 1 / 60   # fixed simulation timestep
 
 class Game:
     def __init__(self, screen, font, big_font, light_tex, fog_surf, light_surf,
-                hull=None, loadout=None, test_mode=False):
+                hull=None, loadout=None, test_mode=False, seed=None):
         self.screen = screen
         self.font = font
         self.big_font = big_font
         self.light_tex = light_tex
         self.fog_surf = fog_surf
         self.light_surf = light_surf
-        self.stars = make_stars()
+        # One rng for the whole sim: same seed -> same run. None -> random
+        # each launch (the pre-seed behavior).
+        self.rng = random.Random(seed)
+        self.stars = make_stars(rng=self.rng)
 
         self.ship = Ship(hull=hull, loadout=loadout)
         r = self.ship.collision_radius
@@ -107,10 +110,10 @@ class Game:
         if self.test_mode:
             self._setup_test_scene()
             return
-        update_field(self.asteroids, [self.ship.pos], self.wave, 0)
-        spawn_enemy(self.enemies, self.ship)
-        spawn_enemy(self.enemies, self.ship)
-        spawn_enemy(self.enemies, self.ship)
+        update_field(self.asteroids, [self.ship.pos], self.wave, 0, rng=self.rng)
+        spawn_enemy(self.enemies, self.ship, rng=self.rng)
+        spawn_enemy(self.enemies, self.ship, rng=self.rng)
+        spawn_enemy(self.enemies, self.ship, rng=self.rng)
 
     def handle_events(self):
         """Returns False when the window should close."""
@@ -187,7 +190,8 @@ class Game:
                 self.wave_timer = 0.0
                 self.wave += 1
             if not self.test_mode:
-                update_field(self.asteroids, [self.ship.pos], self.wave, dt)
+                update_field(self.asteroids, [self.ship.pos], self.wave, dt,
+                             rng=self.rng)
 
         for e in self.enemies:
             shots = e.update(dt, self.ship, self.asteroids)
@@ -241,6 +245,9 @@ class Game:
             lights.append(LightSource(b.pos, 30, 0.5))
         for b in self.enemy_bullets:
             lights.append(LightSource(b.pos, 24, 0.4))
+
+        for m in self.missiles:
+            lights.append(LightSource(m.pos, 30, 0.5))
 
         # --- Shield impacts: a fading flash at the hit point on the oval.
         # shield_impacts stores [theta, age, ttl] in local hull space, so
@@ -379,21 +386,22 @@ class Game:
                 d = pygame.Vector2(math.cos(base_ang), math.sin(base_ang))
                 vis_end = e.ship.shield_impact_point(e.pos - d * e.collision_radius)
                 for _ in range(beam.damage):
-                    ang = base_ang + random.uniform(-BEAM_IMPACT_SPREAD,
+                    ang = base_ang + self.rng.uniform(-BEAM_IMPACT_SPREAD,
                                                 BEAM_IMPACT_SPREAD)
                     d2 = pygame.Vector2(math.cos(ang), math.sin(ang))
                     impact = e.pos - d2 * e.collision_radius
                     if not e.register_hit(impact):
                         self.score += ENEMY_SCORE
-                        burst(self.particles, e.pos, 20, big=True)
+                        burst(self.particles, e.pos, 20, big=True, rng=self.rng)
                         self.enemies.pop(i)
                         if self.test_mode:
                             self._setup_test_scene()   # re-arm: fresh rock + target
                         else:
-                            spawn_enemy(self.enemies, self.ship)
+                            spawn_enemy(self.enemies, self.ship, rng=self.rng)
                         break
                     shield_burst(self.particles,
-                             e.ship.shield_impact_point(impact))
+                             e.ship.shield_impact_point(impact),
+                              rng=self.rng)
                 self.beams.append([beam.local_start, e, d,  vis_end, 0.0, 0.15])
                 return
 
@@ -416,15 +424,16 @@ class Game:
     def _beam_hit_asteroid(self, a, hit_pt, beam):
         # Same kill/split as a bullet hitting a rock.
         self.score += a.score
-        burst(self.particles, hit_pt, a.radius)
+        burst(self.particles, hit_pt, a.radius, rng=self.rng)
         child_size = ROCK_SPLIT[a.size]
         if child_size:
             for _ in range(2):
-                ks = random.uniform(*ROCK_SIZES[child_size]['speed'])
-                ka = random.uniform(0, 2 * math.pi)
+                ks = self.rng.uniform(*ROCK_SIZES[child_size]['speed'])
+                ka = self.rng.uniform(0, 2 * math.pi)
                 kick = pygame.Vector2(math.cos(ka) * ks, math.sin(ka) * ks)
                 self.asteroids.append(Asteroid(a.pos, child_size,
-                                           vel=a.vel * 0.5 + kick))
+                                           vel=a.vel * 0.5 + kick,
+                                           rng=self.rng))
         self.asteroids.remove(a)
         # Beam visual: fixed endpoint on the rock's surface. target=None makes
         # draw() use vis_end (the "target already gone" path).
@@ -485,10 +494,10 @@ class Game:
         """Handle a hit on the ship. Returns True if the ship survives."""
         if self.ship.register_hit():
             impact = self.ship.shield_impact_point(source_pos)
-            shield_burst(self.particles, impact)
+            shield_burst(self.particles, impact, rng=self.rng)
             return True
         self.game_over = True
-        burst(self.particles, self.ship.pos, 30, big=True)
+        burst(self.particles, self.ship.pos, 30, big=True, rng=self.rng)
         return False
 
     def _collisions(self):
@@ -500,15 +509,15 @@ class Game:
                     self.bullets.remove(b)
                     impact = pygame.Vector2(hit_pt)
                     if e.register_hit(impact):
-                        burst(self.particles, impact, 6)
+                        burst(self.particles, impact, 6, rng=self.rng)
                     else:
                         self.score += ENEMY_SCORE
-                        burst(self.particles, e.pos, 20, big=True)
+                        burst(self.particles, e.pos, 20, big=True, rng=self.rng)
                         self.enemies.pop(i)
                         if self.test_mode:
                             self._setup_test_scene()   # re-arm: fresh rock + target
                         else:
-                            spawn_enemy(self.enemies, self.ship)
+                            spawn_enemy(self.enemies, self.ship, rng=self.rng)
                     break
 
         # bullet vs asteroid
@@ -516,15 +525,16 @@ class Game:
             for i, a in enumerate(self.asteroids):
                 if b.pos.distance_to(a.pos) < a.collision_radius:
                     self.score += a.score
-                    burst(self.particles, a.pos, a.radius)
+                    burst(self.particles, a.pos, a.radius, rng=self.rng)
                     child_size = ROCK_SPLIT[a.size]
                     if child_size:
                         for _ in range(2):
-                            ks = random.uniform(*ROCK_SIZES[child_size]['speed'])
-                            ka = random.uniform(0, 2 * math.pi)
+                            ks = self.rng.uniform(*ROCK_SIZES[child_size]['speed'])
+                            ka = self.rng.uniform(0, 2 * math.pi)
                             kick = pygame.Vector2(math.cos(ka) * ks, math.sin(ka) * ks)
                             self.asteroids.append(Asteroid(a.pos, child_size,
-                                                           vel=a.vel * 0.5 + kick))
+                                                           vel=a.vel * 0.5 + kick,
+                                                           rng=self.rng))
                     self.asteroids.pop(i)
                     self.bullets.remove(b)
                     break
@@ -540,15 +550,15 @@ class Game:
                     for _ in range(m.dmg):
                         alive = e.register_hit(impact)
                     if alive:
-                        burst(self.particles, impact, 6)
+                        burst(self.particles, impact, 6, rng=self.rng)
                     else:
                         self.score += ENEMY_SCORE
-                        burst(self.particles, e.pos, 20, big=True)
+                        burst(self.particles, e.pos, 20, big=True, rng=self.rng)
                         self.enemies.pop(i)
                         if self.test_mode:
                             self._setup_test_scene()   # re-arm: fresh rock + target
                         else:
-                            spawn_enemy(self.enemies, self.ship)
+                            spawn_enemy(self.enemies, self.ship, rng=self.rng)
                     break
 
         # missile vs asteroid (detonate, same as a bullet)
@@ -556,15 +566,16 @@ class Game:
             for i, a in enumerate(self.asteroids):
                 if m.pos.distance_to(a.pos) < a.collision_radius:
                     self.score += a.score
-                    burst(self.particles, a.pos, a.radius)
+                    burst(self.particles, a.pos, a.radius, rng=self.rng)
                     child_size = ROCK_SPLIT[a.size]
                     if child_size:
                         for _ in range(2):
-                            ks = random.uniform(*ROCK_SIZES[child_size]['speed'])
-                            ka = random.uniform(0, 2 * math.pi)
+                            ks = self.rng.uniform(*ROCK_SIZES[child_size]['speed'])
+                            ka = self.rng.uniform(0, 2 * math.pi)
                             kick = pygame.Vector2(math.cos(ka) * ks, math.sin(ka) * ks)
                             self.asteroids.append(Asteroid(a.pos, child_size,
-                                                           vel=a.vel * 0.5 + kick))
+                                                           vel=a.vel * 0.5 + kick,
+                                                           rng=self.rng))
                     self.asteroids.pop(i)
                     self.missiles.remove(m)
                     break
@@ -575,15 +586,16 @@ class Game:
                 continue
             for i, a in enumerate(self.asteroids):
                 if b.pos.distance_to(a.pos) < a.collision_radius:
-                    burst(self.particles, a.pos, a.radius)
+                    burst(self.particles, a.pos, a.radius, rng=self.rng)
                     child_size = ROCK_SPLIT[a.size]
                     if child_size:
                         for _ in range(2):
-                            ks = random.uniform(*ROCK_SIZES[child_size]['speed'])
-                            ka = random.uniform(0, 2 * math.pi)
+                            ks = self.rng.uniform(*ROCK_SIZES[child_size]['speed'])
+                            ka = self.rng.uniform(0, 2 * math.pi)
                             kick = pygame.Vector2(math.cos(ka) * ks, math.sin(ka) * ks)
                             self.asteroids.append(Asteroid(a.pos, child_size,
-                                                           vel=a.vel * 0.5 + kick))
+                                                           vel=a.vel * 0.5 + kick,
+                                                           rng=self.rng))
                     self.asteroids.pop(i)
                     b.life = 0.0          # was: self.enemy_bullets.remove(b)
                     break
@@ -624,10 +636,10 @@ class Game:
         for i, e in enumerate(self.enemies[:]):
             for a in self.asteroids:
                 if e.pos.distance_to(a.pos) < a.collision_radius + e.collision_radius:
-                    burst(self.particles, e.pos, 20, big=True)
+                    burst(self.particles, e.pos, 20, big=True, rng=self.rng)
                     self.score += ENEMY_SCORE
                     self.enemies.pop(i)
-                    spawn_enemy(self.enemies, self.ship)   # instant respawn
+                    spawn_enemy(self.enemies, self.ship, rng=self.rng)   # instant respawn
                     break
 
     def draw(self, dt):
@@ -648,11 +660,21 @@ class Game:
             s = self.cam.to_screen(b.pos)
             pygame.draw.circle(screen, BULLET_COLOR, (int(s.x), int(s.y)), 3)
         
+
         for m in self.missiles:
+
             s = self.cam.to_screen(m.pos)
-            tail = self.cam.to_screen(m.pos - m.vel.normalize() * 8)
-            pygame.draw.line(screen, _dim_color(MISSILE_COLOR, 0.6), tail, s, 2)
+            fwd = m.vel.normalize()
+            tail = self.cam.to_screen(m.pos - fwd * 14)
+            # body: longer, thicker than a bullet
+            pygame.draw.line(screen, _dim_color(MISSILE_COLOR, 0.7), tail, s, 3)
+            # nose: bright tip
             pygame.draw.circle(screen, MISSILE_COLOR, (int(s.x), int(s.y)), 3)
+            # exhaust: only during the boost ramp, flickering length
+            if m.boost > 0:
+                flick = 6 * (0.5 + 0.5 * math.sin(m.life * 40))
+                flame = self.cam.to_screen(m.pos - fwd * (14 + flick))
+                pygame.draw.line(screen, (255, 220, 120), tail, flame, 2)
 
 
         for local, target, d, vis_end, age, ttl in self.beams:

@@ -26,20 +26,22 @@ class Particle:
         s2 = cam.to_screen(tail)
         pygame.draw.line(screen, self.color, (s1.x, s1.y), (s2.x, s2.y), max(1, int(2 * a)))
 
-def burst(particles, pos, radius, big=False):
+def burst(particles, pos, radius, big=False, rng=None):
+    rng = rng or random
     n = 30 if big else 14
     for _ in range(n):
-        a = random.uniform(0, 2 * math.pi)
-        speed = random.uniform(40, 160) * (1.5 if big else 1.0)
+        a = rng.uniform(0, 2 * math.pi)
+        speed = rng.uniform(40, 160) * (1.5 if big else 1.0)
         vel = pygame.Vector2(math.cos(a) * speed, math.sin(a) * speed)
-        particles.append(Particle(pos, vel, random.choice(PARTICLE_COLORS),
-                                  random.uniform(0.4, 0.9)))
+        particles.append(Particle(pos, vel, rng.choice(PARTICLE_COLORS),
+                                  rng.uniform(0.4, 0.9)))
 
-def shield_burst(particles, pos, n=16):
+def shield_burst(particles, pos, n=16, rng=None):
     """Blue spark burst where a projectile hits the shield."""
+    rng = rng or random
     for _ in range(n):
-        a = random.uniform(0, 2 * math.pi)
-        speed = random.uniform(60, 200)
+        a = rng.uniform(0, 2 * math.pi)
+        speed = rng.uniform(60, 200)
         vel = pygame.Vector2(math.cos(a) * speed, math.sin(a) * speed)
-        particles.append(Particle(pos, vel, random.choice(SHIELD_SPARK_COLORS),
-                                  random.uniform(0.3, 0.6)))
+        particles.append(Particle(pos, vel, rng.choice(SHIELD_SPARK_COLORS),
+                                  rng.uniform(0.3, 0.6)))

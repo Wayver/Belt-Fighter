@@ -228,6 +228,15 @@ SHIELD_TYPE = ComponentType('shield', 'Shield', ('shield',),
                             shield_max_charge=3.0,
                             shield_recharge_rate=0.5)
 
+
+DN_SHIELD_TYPE = ComponentType('heavy shield', 'DN Shield', ('shield',),
+                            mass=2.0,
+                            power_idle=2.0, power_active=10.0,
+                            power_hit=25.0,
+                            shield_max_charge=7.0,
+                            shield_recharge_rate=0.5)
+
+
 E_SHIELD_TYPE = ComponentType('shield', 'Shield', ('shield',),
                              mass=2.0,
                              power_idle=2.0, power_active=10.0,
@@ -354,7 +363,7 @@ COMPONENT_CATALOG = {
     'weapon':   (GUN_TYPE, LASER_TYPE, LASER_S, LASER_P, MISSILE_TYPE),
     'reactor':  (REACTOR_TYPE,),
     'computer': (COMPUTER_TYPE,),
-    'shield':   (SHIELD_TYPE,),
+    'shield':   (SHIELD_TYPE, DN_SHIELD_TYPE),
     'sensor':   (PASSIVE_SENSOR, ACTIVE_SCANNER, SENSOR_ARRAY),
 }
 
@@ -590,6 +599,122 @@ def enemy_loadout():
     }
 
 
+# --- Mote: a cluster of small pod circles + rectangular weapon blocks ---
+# The silhouette is a convex decagon; the pod circles poke PAST the outline
+# so they read as bulges (same trick as the dreadnought's nubs). Collision
+# stays the clean convex hull, so the bulges are presentation-only.
+
+M_FWD_S   = Slot('forward_s', 'thruster', (-12, 4), (1, 0), flame_key='forward')
+M_FWD_P   = Slot('forward_p', 'thruster', (-12, -4), (1, 0), flame_key='forward')
+M_REVERSE = Slot('reverse', 'thruster', (16, 0), (-1, 0), flame_key='reverse')
+M_RCS_L   = Slot('to_left', 'thruster', (-2, 10), (0, -1),
+                 flame_key='to_left', flame_scale=0.5, flame_width=2)
+M_RCS_R   = Slot('to_right', 'thruster', (-2, -10), (0, 1),
+                 flame_key='to_right', flame_scale=0.5, flame_width=2)
+M_GUN_S   = Slot('gun_s', 'weapon', (11, 5), (1, 0))
+M_GUN_P   = Slot('gun_p', 'weapon', (11, -5), (1, 0))
+M_REACTOR   = Slot('reactor', 'reactor', (0, 0))
+M_REACTOR_2 = Slot('reactor2', 'reactor', (-6, 0))
+M_COMPUTER  = Slot('computer', 'computer', (4, 0))
+M_SHIELD    = Slot('shield', 'shield', (0, 0))
+
+
+def _mote_panels():
+    """Pod circles + rectangular emplacements in local coords.
+
+    Circle panels are ('circle', cx, cy, r) shapes — the renderer draws
+    them with pygame.draw.circle (see ship.py / menu.py). `mirror`
+    copies each piece to the port side.
+    """
+    DARK, MID, LIGHT, ACCENT = (45, 66, 70), (80, 110, 112), (120, 155, 150), (90, 190, 170)
+    panels = []
+
+    def poly(pts, fill, mirror=True):
+        panels.append((tuple(pts), fill))
+        if mirror:
+            panels.append((tuple((x, -y) for x, y in pts), fill))
+
+    def rect(x1, x2, y1, y2, fill, mirror=True):
+        poly([(x1, y1), (x2, y1), (x2, y2), (x1, y2)], fill, mirror)
+
+    def circle(cx, cy, r, fill, mirror=True):
+        panels.append((('circle', cx, cy, r), fill))
+        if mirror:
+            panels.append((('circle', cx, -cy, r), fill))
+
+    # --- the pod cluster (big to small, core on top) ---
+    circle(-5, 8, 6.0, MID)              # side pods
+    circle(-12, 4, 5.0, MID)             # rear pods
+    circle(11, 5, 5.5, LIGHT)            # forward gun pods
+    circle(16, 0, 4.0, LIGHT, mirror=False)   # nose pod
+    circle(0, 0, 8.0, LIGHT)             # core
+
+    # --- rectangular weapon emplacements ---
+    rect(8.5, 13.5, 3.0, 7.0, DARK)      # gun mount base on the forward pod
+    rect(13.5, 18.0, 4.2, 5.8, DARK)     # barrel, pokes past the pod
+    rect(2, 6, 3.2, 6.8, MID)            # core side armor plate
+
+    # --- engine + stern detail (in the rear pods) ---
+    rect(-15, -11, 2.5, 5.5, MID)        # engine block
+    rect(-16.5, -14.5, 3.0, 5.0, DARK)   # exhaust port
+
+    # --- centerline vents (no mirror) ---
+    rect(-3, 1, -0.8, 0.8, DARK, mirror=False)
+    rect(4, 8, -0.8, 0.8, DARK, mirror=False)
+
+    # sensor stripe on the nose pod
+    rect(14.5, 17.5, -1.2, 1.2, ACCENT, mirror=False)
+    return tuple(panels)
+
+
+MOTE_POLYGON = (
+    (18, 0),      # nose
+    (13, 8),
+    (4, 12),
+    (-7, 11),
+    (-15, 5),
+    (-16, 0),     # stern
+    (-15, -5),
+    (-7, -11),
+    (4, -12),
+    (13, -8),
+)
+
+MOTE_HULL = HullType(
+    id='mote',
+    polygon=MOTE_POLYGON,
+    slots=(M_FWD_S, M_FWD_P, M_REVERSE, M_RCS_L, M_RCS_R,
+           M_GUN_S, M_GUN_P, M_REACTOR, M_REACTOR_2, M_COMPUTER, M_SHIELD),
+    base_mass=2.5,
+    collision_radius=14.0,
+    nose=(18, 0),
+    cockpit=(16, 0),
+    max_speed_factor=1.1,
+    turn_rate_factor=1.2,
+    fill=(60, 84, 88),        # dark teal body
+    edge=(140, 200, 190),
+    panels=_mote_panels(),
+    shield_oval=shield_oval_from_polygon(MOTE_POLYGON),
+)
+
+# The mote fires faster than the interceptor, same damage — twitchy swarm feel.
+MOTE_GUN = ComponentType('mote_gun', 'Mote Gun', ('weapon',), mass=0.75,
+                         power_idle=2.0, power_active=5.0,
+                         fire_cooldown=ENEMY_FIRE_COOLDOWN * 0.7,
+                         bullet_speed=ENEMY_BULLET_SPEED, priority=2)
+
+
+def mote_loadout():
+    out = enemy_loadout()
+    out['gun_s'] = MOTE_GUN
+    out['gun_p'] = MOTE_GUN
+    return out
+
+
+
+
+
+
 # --- Dreadnought: hefty slow cruiser, 3x the Blackbird's length ---
 # 132 long (nose +78, stern -54) but only 22 beam: long slender spine
 # with canard, mid wing, and tail fin. Heavily fitted: 4 mains, 2
@@ -718,7 +843,7 @@ DREADNOUGHT_HULL = HullType(
     nose=(78, 0),
     cockpit=(44, 0),
     max_speed_factor=0.55,
-    turn_rate_factor=0.2,
+    turn_rate_factor=0.4,
     fill=(110, 120, 138),
     edge=(90, 150, 190),
     panels=_dreadnought_panels(),

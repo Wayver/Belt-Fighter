@@ -25,7 +25,7 @@ class ShipInput:
     stop: bool = False           # B: auto-stop guidance
     fire: bool = False           # SPACE
     laser_fire: bool = False      # R
-    missile_fire: bool = False    # X
+    missile_fire: bool = False    # 2
 
     @classmethod
     def from_keys(cls, keys):
@@ -42,4 +42,4 @@ class ShipInput:
                    stop=keys[pygame.K_b],
                    fire=keys[pygame.K_SPACE],
                    laser_fire=keys[pygame.K_r],
-                   missile_fire=keys[pygame.K_x])
+                   missile_fire=keys[pygame.K_2])

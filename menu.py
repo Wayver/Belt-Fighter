@@ -116,9 +116,16 @@ class Menu:
 
         pts = [w(*p) for p in hull.polygon]
         pygame.draw.polygon(screen, hull.fill or SHIP_COLOR, pts)
-        for panel_poly, panel_fill in hull.panels:
-            pygame.draw.polygon(screen, panel_fill, [w(*p) for p in panel_poly])
-        pygame.draw.polygon(screen, hull.edge or SHIP_EDGE, pts, 2)
+        
+        #
+        for shape, panel_fill in hull.panels:
+            if isinstance(shape[0], str):
+                c = w(shape[1], shape[2])
+                pygame.draw.circle(screen, panel_fill,
+                                   (int(c[0]), int(c[1])),
+                                   max(1, int(shape[3] * scale)))
+            else:
+                pygame.draw.polygon(screen, panel_fill, [w(*p) for p in shape])
 
         
         for s in hull.slots:

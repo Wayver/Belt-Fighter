@@ -23,7 +23,9 @@ from .config import (WIDTH, HEIGHT, SPAWN_PROTECT, MAX_BULLETS,
                     BEAM_IMPACT_SPREAD, SENSOR_COLOR, SENSOR_SCAN_COLOR,
                     SENSOR_SIGNATURE_THRESHOLD, SENSOR_SIG_FULL, SENSOR_ARROW_MARGIN,
                     SCAN_DUMP_DECAY, DEBUG_COLLISION,
-                    MISSILE_COLOR, MAX_MISSILES)
+                    MISSILE_COLOR, MAX_MISSILES,
+                    SFX_LASER_MIN_INTERVAL, SFX_ENEMY_LASER_MIN_INTERVAL,
+                    SFX_SHIELD_HIT_MIN_INTERVAL)
 
 from .bullets import Bullet, EnemyBullet, Missile, MissileShot
 
@@ -44,7 +46,7 @@ STEP = 1 / 60   # fixed simulation timestep
 
 class Game:
     def __init__(self, screen, font, big_font, light_tex, fog_surf, light_surf,
-                hull=None, loadout=None, test_mode=False, seed=None):
+                hull=None, loadout=None, test_mode=False, seed=None, sound=None):
         self.screen = screen
         self.font = font
         self.big_font = big_font
@@ -79,7 +81,24 @@ class Game:
         self.protect_timer = SPAWN_PROTECT
         self.acc = 0.0
         self.test_mode = test_mode
+        self.sound = sound      # SoundBank or None (silent, e.g. headless)
         self.reset()
+
+    def _sfx(self, name):
+        """Play a sound if a SoundBank is attached. Pure side effect:
+        the sim never reads sound state, so determinism is untouched."""
+        if self.sound:
+            self.sound.play(name)
+
+    def _sfx_throttled(self, name, min_interval):
+        """Throttled variant for rapid-fire weapons (see SoundBank)."""
+        if self.sound:
+            self.sound.play_throttled(name, min_interval)
+
+    def _sfx_thruster(self, on):
+        """Engine loop on/off (see SoundBank.set_thruster)."""
+        if self.sound:
+            self.sound.set_thruster(on)
 
     def reset(self):
         self.ship.pos = pygame.Vector2(WIDTH / 2, HEIGHT / 2)
@@ -107,6 +126,7 @@ class Game:
         self.protect_timer = SPAWN_PROTECT
         self.acc = 0.0
         self.cam.pos = self.ship.pos.copy()
+        self._sfx_thruster(False)   # never carry the engine loop across a reset
         if self.test_mode:
             self._setup_test_scene()
             return
@@ -174,11 +194,18 @@ class Game:
 
             for shot in shots:
                 self.bullets.append(Bullet(shot.pos, shot.vel, owner=shot.owner))
+
+            # S3: fire sounds. The gun fires ~100 shots/s (FIRE_COOLDOWN
+            # 0.01), so the laser blip is throttled to a human rate.
+            if shots:
+                self._sfx_throttled("laser", SFX_LASER_MIN_INTERVAL)
             
 
             for m in missiles:
                 self.missiles.append(Missile(m.pos, m.vel, owner=m.owner,
                                              target=m.target))
+            if missiles:
+                self._sfx("missile_launch")
             
 
             for beam in beams:
@@ -193,10 +220,22 @@ class Game:
                 update_field(self.asteroids, [self.ship.pos], self.wave, dt,
                              rng=self.rng)
 
+        # Engine loop: on while the ship is alive and any fitted thruster
+        # has resolved force (demand * allocation > 0). Death or a power
+        # brownout cuts the sound; set_thruster(False) is a cheap no-op
+        # when the loop is already off.
+        self._sfx_thruster(not self.game_over
+                           and any(t.force > 0.0 for t in self.ship.thrusters))
+
+        enemy_fired = False
         for e in self.enemies:
             shots = e.update(dt, self.ship, self.asteroids)
             for shot in shots:
                 self.enemy_bullets.append(EnemyBullet(shot.pos, shot.vel, owner=shot.owner))
+            if shots:
+                enemy_fired = True
+        if enemy_fired:
+            self._sfx_throttled("enemy_laser", SFX_ENEMY_LASER_MIN_INTERVAL)
 
         for b in self.bullets:
             b.update(dt)
@@ -393,6 +432,7 @@ class Game:
                     if not e.register_hit(impact):
                         self.score += ENEMY_SCORE
                         burst(self.particles, e.pos, 20, big=True, rng=self.rng)
+                        self._sfx("explosion")
                         self.enemies.pop(i)
                         if self.test_mode:
                             self._setup_test_scene()   # re-arm: fresh rock + target
@@ -425,6 +465,7 @@ class Game:
         # Same kill/split as a bullet hitting a rock.
         self.score += a.score
         burst(self.particles, hit_pt, a.radius, rng=self.rng)
+        self._sfx("small_explosion")
         child_size = ROCK_SPLIT[a.size]
         if child_size:
             for _ in range(2):
@@ -495,9 +536,13 @@ class Game:
         if self.ship.register_hit():
             impact = self.ship.shield_impact_point(source_pos)
             shield_burst(self.particles, impact, rng=self.rng)
+            # Throttled: 3 enemies can hit ~20/s; the ping is 0.3 s long.
+            self._sfx_throttled("shield_hit", SFX_SHIELD_HIT_MIN_INTERVAL)
             return True
         self.game_over = True
         burst(self.particles, self.ship.pos, 30, big=True, rng=self.rng)
+        self._sfx("explosion")
+        self._sfx("game_over")
         return False
 
     def _collisions(self):
@@ -513,6 +558,7 @@ class Game:
                     else:
                         self.score += ENEMY_SCORE
                         burst(self.particles, e.pos, 20, big=True, rng=self.rng)
+                        self._sfx("explosion")
                         self.enemies.pop(i)
                         if self.test_mode:
                             self._setup_test_scene()   # re-arm: fresh rock + target
@@ -526,6 +572,7 @@ class Game:
                 if b.pos.distance_to(a.pos) < a.collision_radius:
                     self.score += a.score
                     burst(self.particles, a.pos, a.radius, rng=self.rng)
+                    self._sfx("small_explosion")
                     child_size = ROCK_SPLIT[a.size]
                     if child_size:
                         for _ in range(2):
@@ -554,6 +601,7 @@ class Game:
                     else:
                         self.score += ENEMY_SCORE
                         burst(self.particles, e.pos, 20, big=True, rng=self.rng)
+                        self._sfx("explosion")
                         self.enemies.pop(i)
                         if self.test_mode:
                             self._setup_test_scene()   # re-arm: fresh rock + target
@@ -567,6 +615,7 @@ class Game:
                 if m.pos.distance_to(a.pos) < a.collision_radius:
                     self.score += a.score
                     burst(self.particles, a.pos, a.radius, rng=self.rng)
+                    self._sfx("small_explosion")
                     child_size = ROCK_SPLIT[a.size]
                     if child_size:
                         for _ in range(2):
@@ -587,6 +636,7 @@ class Game:
             for i, a in enumerate(self.asteroids):
                 if b.pos.distance_to(a.pos) < a.collision_radius:
                     burst(self.particles, a.pos, a.radius, rng=self.rng)
+                    self._sfx("small_explosion")
                     child_size = ROCK_SPLIT[a.size]
                     if child_size:
                         for _ in range(2):
@@ -637,6 +687,7 @@ class Game:
             for a in self.asteroids:
                 if e.pos.distance_to(a.pos) < a.collision_radius + e.collision_radius:
                     burst(self.particles, e.pos, 20, big=True, rng=self.rng)
+                    self._sfx("explosion")
                     self.score += ENEMY_SCORE
                     self.enemies.pop(i)
                     spawn_enemy(self.enemies, self.ship, rng=self.rng)   # instant respawn

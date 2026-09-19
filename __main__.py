@@ -7,6 +7,7 @@ from .config import WIDTH, HEIGHT, FPS
 from .fog import make_light_texture
 from .game import Game
 from .menu import Menu
+from .sound import SoundBank
 
 def main():
     pygame.init()
@@ -32,9 +33,12 @@ def main():
     if '--seed' in sys.argv:
         seed = int(sys.argv[sys.argv.index('--seed') + 1])
 
+    sfx = SoundBank()
+    sfx.init()
+
     game = Game(screen, font, big_font, light_tex, fog_surf, light_surf,
                 hull=menu.hull, loadout=menu.loadout,
-                test_mode=('--test' in sys.argv), seed=seed)
+                test_mode=('--test' in sys.argv), seed=seed, sound=sfx)
 
 
     running = True

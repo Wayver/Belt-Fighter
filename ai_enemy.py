@@ -59,6 +59,27 @@ class AIEnemy:
         self.hp -= 1
         return self.hp > 0
 
+    # --- networking ---
+    #
+    # SYNCED: the whole ship (see Ship.snapshot), hp, id, and _acc_smooth.
+    # _acc_smooth LOOKS presentation-only but is gameplay state: it feeds
+    # lead_point(), which missile guidance (bullets.py) and the player's
+    # laser targeting (game.py) use to pick their aim point. If it differed
+    # between peers, missiles would steer to different points and the sims
+    # would diverge. (Plan note 2026-07-20: corrected from the original
+    # "presentation-only" classification.)
+    # NOT synced: hull/loadout (identical on both peers by construction).
+
+    def snapshot(self):
+        return (self.ship.snapshot(), self.hp, self.ship.id,
+                self._acc_smooth.x, self._acc_smooth.y)
+
+    def apply_snapshot(self, s):
+        ship_s, hp, _eid, ax, ay = s
+        self.ship.apply_snapshot(ship_s)
+        self.hp = hp
+        self._acc_smooth = pygame.Vector2(ax, ay)
+
     # --- the brain: steering -> ShipInput (no physics here) ---
     def _steer(self, player, asteroids):
         to_player = player.pos - self.ship.pos

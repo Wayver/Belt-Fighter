@@ -18,7 +18,6 @@ ROCKS_PER_SECTOR = 3        # target rocks per active sector
 DESPAWN_RADIUS = 2600       # rocks farther than this from the group are culled
 SPAWN_CLEAR_RADIUS = 500    # never spawn closer than this to a player
 MAX_SPAWNS_PER_TICK = 4     # fill the field gradually, not all at once
-WAVE_INTERVAL = 40          # seconds between difficulty waves
 
 # --- power / compute (Phase 2) ---
 POWER_HYSTERESIS = 0.00   # brownout latch deadband, fraction of supply
@@ -67,12 +66,11 @@ BEAM_IMPACT_SPREAD = 0.7 # rad; per-damage-point angular jitter on beam impact
 
 # --- asteroid knobs ---
 ROCK_SIZES = {
-    'large':  {'radius': 50, 'score': 20,  'speed': (20, 60),  'spin': (0.2, 0.8)},
-    'medium': {'radius': 28, 'score': 50,  'speed': (40, 90),  'spin': (0.4, 1.2)},
-    'small':  {'radius': 15, 'score': 100, 'speed': (70, 130), 'spin': (0.8, 2.0)},
+    'large':  {'radius': 50, 'speed': (20, 60),  'spin': (0.2, 0.8)},
+    'medium': {'radius': 28, 'speed': (40, 90),  'spin': (0.4, 1.2)},
+    'small':  {'radius': 15, 'speed': (70, 130), 'spin': (0.8, 2.0)},
 }
 ROCK_SPLIT = {'large': 'medium', 'medium': 'small', 'small': None}
-STARTING_WAVE = 2        # large rocks in wave 1; +1 per wave
 
 # --- sensors ---
 SENSOR_COLOR      = (120, 255, 140)   # passive contacts (arrows/blips)
@@ -90,7 +88,6 @@ ENEMY_MAX_SPEED = 25.0
 ENEMY_ROT_SPEED = 3.4
 ENEMY_RADIUS = 11.0
 ENEMY_HP = 1
-ENEMY_SCORE = 250
 ENEMY_BULLET_SPEED = 720.0
 ENEMY_BULLET_LIFE = 1.5
 ENEMY_FIRE_COOLDOWN = .15

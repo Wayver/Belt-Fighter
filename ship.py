@@ -19,8 +19,9 @@ the exhaust/flame is rendered in the opposite direction.
 Networked-ready (unchanged):
 - update() takes a ShipInput (flat, serializable intent).
 - update() expects a fixed timestep for deterministic simulation.
-- snapshot()/apply_snapshot() expose the only synced state: (pos, vel, angle).
-- flame_mags is presentation-only.
+- snapshot()/apply_snapshot() expose the full synced state (see the
+  SYNCED vs PRESENTATION-ONLY classification above the methods).
+- flame_mags (and the other presentation-only state) is never serialized.
 """
 import math
 import random
@@ -329,11 +330,62 @@ class Ship:
         fwd, right = self.axes()
         return self.pos + fwd * lx + right * ly
 
-    # --- networking (unchanged) ---
+    # --- networking ---
+    #
+    # SYNCED (serialized, must be identical on both peers):
+    #   pos, vel, angle            kinematics (angle is the RAW unbounded
+    #                              value — the sim accumulates it forever and
+    #                              the determinism oracle compares it raw;
+    #                              wrapping would make the round-trip lossy)
+    #   shield_charge, shield_dump, shield_clock
+    #                              shield energy + hit-dump + dump-age
+    #                              (clock drives the render flicker and is
+    #                              derived from the dump)
+    #   targeting_on               player toggle (T)
+    #   laser_dump, missile_dump   decaying power spikes (affect _allocate)
+    #   sensor_on                  player toggle (V)
+    #   scan_cd, scan_reveal, scan_dump, scan_pulse
+    #                              ping cooldown / reveal / spike / ring age
+    #   brownout, power_factor     latched brownout + sag (power_factor is
+    #                              recomputed next tick, but snapshotting it
+    #                              keeps a restored ship render-consistent
+    #                              before its first step)
+    #   weapons: per weapon (cooldown, charge, lock_progress)
+    #   id                         owner tag for shots (enemy id = None/0)
+    #
+    # PRESENTATION-ONLY (never serialized):
+    #   flame_mags, arcs, arc_clock, shield_impacts
+    #   prev_pos, prev_angle, rpos, rangle, accel, dampening
+    #   tracked, laser_target, missile_target, contacts
+    #                              (Game re-derives these every tick)
+    #   power_used, compute_used, compute_alloc
+    #                              (recomputed by _allocate every tick)
+    #   hull, components, thrusters, weapons (slot/comp refs), shield_oval,
+    #   shield_comp, sensor_comp, power_idle_total, power_supply,
+    #   compute_supply, collision
+    #                              (loadout config — identical on both peers)
 
     def snapshot(self):
-        a = math.atan2(math.sin(self.angle), math.cos(self.angle))
-        return (self.pos.x, self.pos.y, self.vel.x, self.vel.y, a)
+        # Store the RAW angle (unbounded), not a wrapped value. The sim's
+        # angle accumulates forever (self.angle += turn*ROT_SPEED*dt) and the
+        # determinism oracle compares the raw angle — wrapping to [-pi, pi]
+        # would drop the number of full rotations and make the round-trip
+        # lossy (restored raw angle would differ from the original by a
+        # multiple of 2*pi). Raw is bit-identical through a round-trip, and
+        # every consumer (axes, sync_render, AI steering) is periodic or
+        # wraps its own delta, so raw is safe.
+        return (
+            self.pos.x, self.pos.y, self.vel.x, self.vel.y, self.angle,
+            self.shield_charge, self.shield_dump, self.shield_clock,
+            self.targeting_on,
+            self.laser_dump, self.missile_dump,
+            self.sensor_on,
+            self.scan_cd, self.scan_reveal, self.scan_dump, self.scan_pulse,
+            self.brownout, self.power_factor,
+            tuple((w.cooldown, w.charge, w.lock_progress)
+                  for w in self.weapons),
+            self.id,
+        )
 
     def sync_render(self, alpha):
         self.rpos = self.prev_pos.lerp(self.pos, alpha)
@@ -341,9 +393,35 @@ class Ship:
         self.rangle = self.prev_angle + da * alpha
 
     def apply_snapshot(self, s):
-        self.pos = pygame.Vector2(s[0], s[1])
-        self.vel = pygame.Vector2(s[2], s[3])
-        self.angle = s[4]
+        (px, py, vx, vy, a,
+         shield_charge, shield_dump, shield_clock,
+         targeting_on,
+         laser_dump, missile_dump,
+         sensor_on,
+         scan_cd, scan_reveal, scan_dump, scan_pulse,
+         brownout, power_factor,
+         weapons, ship_id) = s
+        self.pos = pygame.Vector2(px, py)
+        self.vel = pygame.Vector2(vx, vy)
+        self.angle = a
+        self.shield_charge = shield_charge
+        self.shield_dump = shield_dump
+        self.shield_clock = shield_clock
+        self.targeting_on = targeting_on
+        self.laser_dump = laser_dump
+        self.missile_dump = missile_dump
+        self.sensor_on = sensor_on
+        self.scan_cd = scan_cd
+        self.scan_reveal = scan_reveal
+        self.scan_dump = scan_dump
+        self.scan_pulse = scan_pulse
+        self.brownout = brownout
+        self.power_factor = power_factor
+        for w, (cooldown, charge, lock_progress) in zip(self.weapons, weapons):
+            w.cooldown = cooldown
+            w.charge = charge
+            w.lock_progress = lock_progress
+        self.id = ship_id
 
     # --- simulation: per-thruster pipeline ---
 

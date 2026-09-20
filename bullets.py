@@ -48,6 +48,18 @@ class Bullet:
         self.life = BULLET_LIFE
         self.owner = owner
 
+    def snapshot(self):
+        return (self.pos.x, self.pos.y, self.vel.x, self.vel.y,
+                self.owner, self.life)
+
+    def apply_snapshot(self, s):
+        (px, py, vx, vy, owner, life) = s
+        self.pos = pygame.Vector2(px, py)
+        self.prev_pos = self.pos.copy()   # no interpolation artifact on restore
+        self.vel = pygame.Vector2(vx, vy)
+        self.owner = owner
+        self.life = life
+
     def update(self, dt):
         self.prev_pos = self.pos.copy()  # NEW
         self.pos += self.vel * dt
@@ -60,6 +72,18 @@ class EnemyBullet:
         self.vel = vel
         self.life = ENEMY_BULLET_LIFE
         self.owner = owner
+
+    def snapshot(self):
+        return (self.pos.x, self.pos.y, self.vel.x, self.vel.y,
+                self.owner, self.life)
+
+    def apply_snapshot(self, s):
+        (px, py, vx, vy, owner, life) = s
+        self.pos = pygame.Vector2(px, py)
+        self.prev_pos = self.pos.copy()   # no interpolation artifact on restore
+        self.vel = pygame.Vector2(vx, vy)
+        self.owner = owner
+        self.life = life
 
     def update(self, dt):
         self.prev_pos = self.pos.copy()  # NEW
@@ -76,6 +100,24 @@ class Missile:
         self.life = MISSILE_LIFE
         self.boost = MISSILE_BOOST_TIME
         self.dmg = MISSILE_DAMAGE
+
+    def snapshot(self):
+        # target is stored as the enemy's ship id (or None); Game
+        # apply_snapshot() re-wires it to the live AIEnemy object.
+        return (self.pos.x, self.pos.y, self.vel.x, self.vel.y,
+                self.owner, self.life, self.boost,
+                self.target.ship.id if self.target is not None else None)
+
+    def apply_snapshot(self, s):
+        (px, py, vx, vy, owner, life, boost, target_id) = s
+        self.pos = pygame.Vector2(px, py)
+        self.prev_pos = self.pos.copy()   # no interpolation artifact on restore
+        self.vel = pygame.Vector2(vx, vy)
+        self.owner = owner
+        self.life = life
+        self.boost = boost
+        self.target = None                # Game wires the real ref
+        self._target_id = target_id
 
     def update(self, dt):
         self.prev_pos = self.pos.copy()

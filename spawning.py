@@ -99,22 +99,19 @@ def _spawn_pos(sector, players, tries=8, rng=None):
     return None
 
 
-def _spawn_size(wave, rng=None):
-    """The field gets meaner as waves rise: more small/medium rocks."""
+def _spawn_size(rng=None):
+    """Random rock size: mostly large, some medium/small."""
     rng = rng or random
-    if wave <= 1:
-        return 'large'
     return rng.choices(('large', 'medium', 'small'),
                        weights=(0.5, 0.3, 0.2))[0]
 
 
-def update_field(asteroids, players, wave, dt, rng=None):
+def update_field(asteroids, players, dt, rng=None):
     """Top up under-populated sectors and cull rocks that drifted away.
 
     Call once per fixed step.
     asteroids: the game's rock list (mutated in place)
     players:   list of Vector2 positions — one entry today, one per ship later
-    wave:      current difficulty wave (shifts the spawn size mix)
     dt:        fixed step size (kept for API symmetry / future use)
     rng:       optional random.Random for reproducible fields (default global)
     """
@@ -142,7 +139,7 @@ def update_field(asteroids, players, wave, dt, rng=None):
             for _ in range(need):
                 pos = _spawn_pos((sx, sy), players, rng=rng)
                 if pos is not None:
-                    asteroids.append(Asteroid(pos, _spawn_size(wave, rng=rng),
+                    asteroids.append(Asteroid(pos, _spawn_size(rng=rng),
                                               rng=rng))
                     counts[(sx, sy)] = counts.get((sx, sy), 0) + 1
                     spawned += 1

@@ -1,4 +1,4 @@
-"""Game state: entities, collisions, waves, and per-frame update/draw.
+"""Game state: entities, collisions, and per-frame update/draw.
 
 Networked-ready:
 - update() runs the whole sim on a fixed timestep (STEP) via an
@@ -13,9 +13,9 @@ from dataclasses import replace
 import pygame
 
 from .config import (WIDTH, HEIGHT, SPAWN_PROTECT, MAX_BULLETS,
-                    BULLET_SPEED, ENEMY_SCORE,
+                    BULLET_SPEED,
                     ROCK_SPLIT, ROCK_SIZES, BG, STAR_COLOR,
-                    BULLET_COLOR, ENEMY_BULLET_COLOR, WAVE_INTERVAL,
+                    BULLET_COLOR, ENEMY_BULLET_COLOR,
                     TARGETING_ASSIST, TARGETING_COLOR, TARGETING_HORIZON,
                     TARGETING_STEPS, TARGETING_RANGE,
                     TARGETING_USE_ACCEL, TARGETING_MAX_LEAD,
@@ -35,6 +35,7 @@ from .asteroid import Asteroid
 from .bullets import Bullet, EnemyBullet
 from .particles import burst, shield_burst
 from .spawning import spawn_enemy, make_stars, update_field, TestTarget
+from .ai_enemy import AIEnemy, MoteEnemy
 
 from .fog import draw_fog, LightSource
 
@@ -74,9 +75,6 @@ class Game:
         self.particles = []
         self.asteroids = []
         self.enemies = []
-        self.score = 0
-        self.wave = 1
-        self.wave_timer = 0.0
         self.game_over = False
         self.protect_timer = SPAWN_PROTECT
         self.acc = 0.0
@@ -119,9 +117,6 @@ class Game:
         self.particles.clear()
         self.asteroids.clear()
         self.enemies.clear()
-        self.score = 0
-        self.wave = 1
-        self.wave_timer = 0.0
         self.game_over = False
         self.protect_timer = SPAWN_PROTECT
         self.acc = 0.0
@@ -130,10 +125,144 @@ class Game:
         if self.test_mode:
             self._setup_test_scene()
             return
-        update_field(self.asteroids, [self.ship.pos], self.wave, 0, rng=self.rng)
+        update_field(self.asteroids, [self.ship.pos], 0, rng=self.rng)
         spawn_enemy(self.enemies, self.ship, rng=self.rng)
         spawn_enemy(self.enemies, self.ship, rng=self.rng)
         spawn_enemy(self.enemies, self.ship, rng=self.rng)
+
+    # --- networking: whole-sim snapshot (see Ship.snapshot for the
+    # ship-level classification) ---
+    #
+    # SYNCED (serialized, must be identical on both peers):
+    #   ship                 player Ship (21-field tuple, see ship.py)
+    #   enemies              per enemy: variant tag + e.snapshot()
+    #                        tag = 'mote' (MoteEnemy) | 'test' (TestTarget)
+    #                        | 'ai' (AIEnemy). Order matters: MoteEnemy and
+    #                        TestTarget are both AIEnemy subclasses, so check
+    #                        them first.
+    #   bullets, enemy_bullets, missiles
+    #                        per projectile: pos/vel/owner/life (+ boost for
+    #                        missiles). Missile target is stored as the
+    #                        enemy's ship id; apply_snapshot re-wires it.
+    #   asteroids            per rock: pos/vel/size/angle/spin/verts
+    #   rng state            the sim's single rng — the strongest check;
+    #                        without it the peers diverge on the next roll
+    #   game_over, protect_timer
+    #   AIEnemy._next_id     class-level id counter (not instance state —
+    #                        a naive snapshot misses it)
+    #
+    # NOT SYNCED (presentation / config / local timing — never serialized):
+    #   stars                cosmetic background; regenerated locally
+    #   shield               pre-drawn pygame.Surface ring (derived from
+    #                        ship radius)
+    #   cam                  Camera; re-derived from ship.pos on apply
+    #   beams, particles     presentation (0.15 s beam ttl, cosmetic bursts)
+    #   acc                  fixed-timestep accumulator — local timing, not
+    #                        sim state
+    #   screen, font, big_font, light_tex, fog_surf, light_surf
+    #                        render resources
+    #   test_mode, sound     mode flag + side-effect layer
+    #   (score/wave/wave_timer no longer exist — removed in the wave/score
+    #   cleanup; do not re-add them here.)
+
+    def snapshot(self):
+        """Capture the whole sim as ONE plain-data tuple: no pygame
+        objects, no references — safe to pickle / send over the wire."""
+        return (
+            self.ship.snapshot(),
+            tuple((self._enemy_tag(e), e.snapshot()) for e in self.enemies),
+            tuple(b.snapshot() for b in self.bullets),
+            tuple(b.snapshot() for b in self.enemy_bullets),
+            tuple(m.snapshot() for m in self.missiles),
+            tuple(a.snapshot() for a in self.asteroids),
+            self.rng.getstate(),
+            self.game_over,
+            self.protect_timer,
+            AIEnemy._next_id,
+        )
+
+    @staticmethod
+    def _enemy_tag(e):
+        # Order matters: MoteEnemy and TestTarget are both AIEnemy
+        # subclasses, so they must be checked before the base class.
+        if isinstance(e, MoteEnemy):
+            return 'mote'
+        if isinstance(e, TestTarget):
+            return 'test'
+        return 'ai'
+
+    def apply_snapshot(self, s):
+        """Restore a snapshot() tuple into this Game. Entities are
+        constructed via the same paths the sim uses (so invariants hold),
+        then their synced fields are overwritten."""
+        (ship_s, enemies_s, bullets_s, enemy_bullets_s, missiles_s,
+         asteroids_s, rng_state, game_over, protect_timer, next_id) = s
+
+        self.ship.apply_snapshot(ship_s)
+
+        # Enemies: build with a THROWAWAY rng so construction (which rolls
+        # ship.angle and consumes _next_id) neither burns the real rng
+        # stream nor matters — apply_snapshot overwrites the synced fields.
+        throwaway = random.Random(0)
+        origin = pygame.Vector2(0, 0)
+        self.enemies.clear()
+        for tag, e_s in enemies_s:
+            if tag == 'mote':
+                e = MoteEnemy(origin, rng=throwaway)
+            elif tag == 'test':
+                e = TestTarget(origin, rng=throwaway)
+            else:
+                e = AIEnemy(origin, rng=throwaway)
+            e.apply_snapshot(e_s)
+            self.enemies.append(e)
+
+        # Bullets: construct minimally, then overwrite.
+        self.bullets.clear()
+        for b_s in bullets_s:
+            px, py, vx, vy, owner, _life = b_s
+            b = Bullet(pygame.Vector2(px, py), pygame.Vector2(vx, vy),
+                       owner=owner)
+            b.apply_snapshot(b_s)
+            self.bullets.append(b)
+
+        self.enemy_bullets.clear()
+        for b_s in enemy_bullets_s:
+            px, py, vx, vy, owner, _life = b_s
+            b = EnemyBullet(pygame.Vector2(px, py), pygame.Vector2(vx, vy),
+                            owner=owner)
+            b.apply_snapshot(b_s)
+            self.enemy_bullets.append(b)
+
+        # Missiles: same pattern; target is re-wired below, once every
+        # enemy exists.
+        self.missiles.clear()
+        for m_s in missiles_s:
+            px, py, vx, vy, owner, _life, _boost, _tid = m_s
+            m = Missile(pygame.Vector2(px, py), pygame.Vector2(vx, vy),
+                        owner=owner)
+            m.apply_snapshot(m_s)
+            self.missiles.append(m)
+        id_map = {e.ship.id: e for e in self.enemies}
+        for m in self.missiles:
+            m.target = id_map.get(m._target_id)
+
+        # Asteroids: construct minimally; apply_snapshot rebuilds
+        # radius/collision_radius from ROCK_SIZES[size].
+        self.asteroids.clear()
+        for a_s in asteroids_s:
+            px, py, _vx, _vy, size, _angle, _spin, _verts = a_s
+            a = Asteroid(pygame.Vector2(px, py), size)
+            a.apply_snapshot(a_s)
+            self.asteroids.append(a)
+
+        self.rng.setstate(rng_state)
+        self.game_over = game_over
+        self.protect_timer = protect_timer
+        # AFTER constructing enemies: their construction already consumed
+        # ids from the class counter, so restore the snapshotted value now.
+        AIEnemy._next_id = next_id
+        # Camera is not synced — re-derive it from the restored ship.
+        self.cam.pos = self.ship.pos.copy()
 
     def handle_events(self):
         """Returns False when the window should close."""
@@ -216,12 +345,8 @@ class Game:
                 self._sfx("beam")
             
             self.protect_timer -= dt
-            self.wave_timer += dt
-            if self.wave_timer >= WAVE_INTERVAL:
-                self.wave_timer = 0.0
-                self.wave += 1
             if not self.test_mode:
-                update_field(self.asteroids, [self.ship.pos], self.wave, dt,
+                update_field(self.asteroids, [self.ship.pos], dt,
                              rng=self.rng)
 
         # Engine loop: on while the ship is alive and any fitted thruster
@@ -434,7 +559,6 @@ class Game:
                     d2 = pygame.Vector2(math.cos(ang), math.sin(ang))
                     impact = e.pos - d2 * e.collision_radius
                     if not e.register_hit(impact):
-                        self.score += ENEMY_SCORE
                         burst(self.particles, e.pos, 20, big=True, rng=self.rng)
                         self._sfx("explosion")
                         self.enemies.pop(i)
@@ -467,7 +591,6 @@ class Game:
 
     def _beam_hit_asteroid(self, a, hit_pt, beam):
         # Same kill/split as a bullet hitting a rock.
-        self.score += a.score
         burst(self.particles, hit_pt, a.radius, rng=self.rng)
         self._sfx("small_explosion")
         child_size = ROCK_SPLIT[a.size]
@@ -560,7 +683,6 @@ class Game:
                     if e.register_hit(impact):
                         burst(self.particles, impact, 6, rng=self.rng)
                     else:
-                        self.score += ENEMY_SCORE
                         burst(self.particles, e.pos, 20, big=True, rng=self.rng)
                         self._sfx("explosion")
                         self.enemies.pop(i)
@@ -574,7 +696,6 @@ class Game:
         for b in self.bullets[:]:
             for i, a in enumerate(self.asteroids):
                 if b.pos.distance_to(a.pos) < a.collision_radius:
-                    self.score += a.score
                     burst(self.particles, a.pos, a.radius, rng=self.rng)
                     self._sfx("small_explosion")
                     child_size = ROCK_SPLIT[a.size]
@@ -603,7 +724,6 @@ class Game:
                     if alive:
                         burst(self.particles, impact, 6, rng=self.rng)
                     else:
-                        self.score += ENEMY_SCORE
                         burst(self.particles, e.pos, 20, big=True, rng=self.rng)
                         self._sfx("explosion")
                         self.enemies.pop(i)
@@ -617,7 +737,6 @@ class Game:
         for m in self.missiles[:]:
             for i, a in enumerate(self.asteroids):
                 if m.pos.distance_to(a.pos) < a.collision_radius:
-                    self.score += a.score
                     burst(self.particles, a.pos, a.radius, rng=self.rng)
                     self._sfx("small_explosion")
                     child_size = ROCK_SPLIT[a.size]
@@ -692,7 +811,6 @@ class Game:
                 if e.pos.distance_to(a.pos) < a.collision_radius + e.collision_radius:
                     burst(self.particles, e.pos, 20, big=True, rng=self.rng)
                     self._sfx("explosion")
-                    self.score += ENEMY_SCORE
                     self.enemies.pop(i)
                     spawn_enemy(self.enemies, self.ship, rng=self.rng)   # instant respawn
                     break
@@ -765,9 +883,9 @@ class Game:
         if not self.game_over:
             self.ship._draw_scan_pulse(screen, self.cam, self.ship.rpos)
         self._draw_sensor_contacts()
-        draw_hud(screen, self.font, self.score, self.wave, self.enemies, self.ship)
+        draw_hud(screen, self.font, self.enemies, self.ship)
         if self.game_over:
-            draw_game_over(screen, self.big_font, self.font, self.score)
+            draw_game_over(screen, self.big_font, self.font)
 
         if DEBUG_COLLISION:
             self.ship.draw_collision(screen, self.cam)

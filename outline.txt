@@ -7,7 +7,7 @@ ship5/
 ├── enemy.py        # EnemyShip
 ├── bullets.py      # Bullet, EnemyBullet
 ├── particles.py    # Particle, burst()
-├── spawning.py     # spawn_wave, spawn_enemy, make_stars
+├── spawning.py     # update_field, spawn_enemy, make_stars
 ├── fog.py          # light texture + fog-of-war rendering
 ├── hud.py          # HUD + game-over screen
 └── game.py         # Game class: state, collisions, update/draw

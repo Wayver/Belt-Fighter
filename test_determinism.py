@@ -11,8 +11,8 @@ opens. Three runs:
   C: seed 9999   (must differ from A)
 
 The snapshot covers ship, asteroids (pos/vel/size/angle/verts), enemies,
-all projectile lists, score, wave, and the rng state itself — so a
-mismatch pinpoints which subsystem diverged.
+all projectile lists, and the rng state itself — so a mismatch pinpoints
+which subsystem diverged.
 """
 import os
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
@@ -81,8 +81,6 @@ def snapshot(g):
         tuple(sorted((round(p.pos.x, 6), round(p.pos.y, 6),
                       round(p.life, 6))
                     for p in g.particles)),
-        # scalars
-        g.score, g.wave,
         # the strongest check: the rng itself must be at the same point
         g.rng.getstate(),
     )
@@ -116,17 +114,16 @@ def main():
     ok = True
     if a == b:
         print(f"PASS: seed 1234 reproducible "
-              f"({len(a[1])} rocks, {len(a[2])} enemies, "
-              f"score {a[7]}, wave {a[8]})")
+              f"({len(a[1])} rocks, {len(a[2])} enemies)")
     else:
         ok = False
         for i, (x, y) in enumerate(zip(a, b)):
             if x != y:
                 names = ["ship", "asteroids", "enemies", "bullets",
                          "enemy_bullets", "missiles", "particles",
-                         "score", "wave", "rng_state"]
+                         "rng_state"]
                 print(f"FAIL: field {names[i]} differs between runs")
-                if i in (0, 7, 8):
+                if i in (0, 7):
                     print(f"  A: {x}\n  B: {y}")
                 else:
                     print(f"  A: {x[:3]}...\n  B: {y[:3]}...")

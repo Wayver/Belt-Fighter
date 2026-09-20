@@ -272,6 +272,17 @@ LASER_P = ComponentType('laser_p', 'Laser (Port)', ('weapon',),
     laser_discharge_dump=30.0,
     priority=2)
 
+# Silas's eyes: a full 360-degree firing arc. Deliberately overpowered —
+# the cat can blast whatever it's looking at, from any direction.
+LASER_360 = ComponentType('laser_360', 'Laser (360)', ('weapon',),
+    mass=3.0, power_idle=2.0, power_active=12.0,
+    laser_arc_start_deg=-180.0, laser_arc_end_deg=180.0,   # full circle
+    laser_range=600.0,
+    laser_charge_time=0.5,
+    laser_damage=4,
+    laser_discharge_dump=30.0,
+    priority=2)
+
 MISSILE_TYPE = ComponentType('missile', 'Homing Missile', ('weapon',),
     mass=2.0, power_idle=2.0, power_active=8.0,
     missile_speed=MISSILE_SPEED,
@@ -333,7 +344,9 @@ def default_loadout(hull=None):
                 out[s.name] = (RCS_HEAVY if hull.id in ('blackbird', 'dreadnought') else RCS)
         
         elif s.slot_type == 'weapon':
-            if s.name == 'gun_s':
+            if is_silas and s.name in ('eye_s', 'eye_p'):
+                out[s.name] = LASER_360      # the cat's eyes: 360-degree blast
+            elif s.name == 'gun_s':
                 out[s.name] = LASER_S
             elif s.name == 'gun_p':
                 out[s.name] = LASER_P
@@ -360,7 +373,7 @@ def default_loadout(hull=None):
 # What the menu offers per slot type.
 COMPONENT_CATALOG = {
     'thruster': (MAIN_ENGINE, NOSE_THRUSTER, TOOTH_THRUSTER, RCS, RCS_HEAVY),
-    'weapon':   (GUN_TYPE, LASER_TYPE, LASER_S, LASER_P, MISSILE_TYPE),
+    'weapon':   (GUN_TYPE, LASER_TYPE, LASER_S, LASER_P, LASER_360, MISSILE_TYPE),
     'reactor':  (REACTOR_TYPE,),
     'computer': (COMPUTER_TYPE,),
     'shield':   (SHIELD_TYPE, DN_SHIELD_TYPE),
@@ -488,6 +501,51 @@ SILAS_REACTOR  = Slot('reactor', 'reactor', (-6, 0))
 SILAS_COMPUTER = Slot('computer', 'computer', (-2, 0))
 SILAS_SHIELD   = Slot('shield', 'shield', (0, 0))
 
+
+def _silas_panels():
+    """Cat-face detail in local coords: white muzzle, pink nose, dark
+    laser-eye sockets, a little 'w' mouth, and darker inner ears.
+    `mirror` copies each piece to the port side. The eye sockets are
+    centered on the laser slots (8, ±5.5); the nose sits under the
+    cockpit dot (11, 0), which renders as a shine on it."""
+    MUZZLE = (255, 245, 230)   # white, matches the edge
+    NOSE   = (255, 130, 150)   # pink
+    MOUTH  = (110, 60, 35)     # dark brown
+    EYE    = (70, 45, 30)      # dark socket
+    EAR    = (215, 115, 50)    # darker orange
+    panels = []
+
+    def poly(pts, fill, mirror=True):
+        panels.append((tuple(pts), fill))
+        if mirror:
+            panels.append((tuple((x, -y) for x, y in pts), fill))
+
+    # --- muzzle: white patch around the nose + mouth, hugging the
+    # forehead dip (hull edge runs (10, ±5.5) -> (13, 0)) ---
+    poly([(-12.4, 0), (11.6, 2.4), (10.6, 4.0), (8.8, 4.6),
+          (6.8, 4.2), (5.6, 2.6), (5.2, 0),
+          (5.6, -2.6), (6.8, -4.2), (8.8, -4.6),
+          (10.6, -4.0), (11.6, -2.4)], MUZZLE, mirror=False)
+
+    # --- nose: pink triangle; the white cockpit dot (11, 0) lands on it
+    # as a shine ---
+    poly([(-7.4, 2.3), (-10.5, 0), (-7.4, -2.3)], NOSE, mirror=False)
+
+    # --- mouth: a little 'w' just behind the nose (mirrored to port) ---
+    poly([(-10.4, 0.3), (-10.4, 1.5), (-11.4, 0.9)], MOUTH)
+
+    # --- eye sockets: dark almonds centered on the laser slots (8, 5.5).
+    # Kept at x <= 9.8 so the socket stays clear of the ear corner at
+    # (10, 5.5), where the face boundary drops sharply ---
+    poly([(-2.5, 1.5), (1, 6.8), (4.0, 6.5), (4.8, 5.5),
+          (4.0, 4.3), (-1, 4.0)], EYE)
+
+    # --- inner ears: darker orange wedges in the forward-pointing ears ---
+    poly([(16.5, 10.5), (8.5, 11.8), (10.2, 6.8)], EAR)
+
+    return tuple(panels)
+
+
 SILAS_HULL = HullType(
     id='silas',
     polygon=(
@@ -520,6 +578,7 @@ SILAS_HULL = HullType(
     turn_rate_factor=1.15,
     fill=(240, 150, 60),  # orange
     edge=(255, 245, 230), # white
+    panels=_silas_panels(),
 )
 
 

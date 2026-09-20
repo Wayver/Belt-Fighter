@@ -170,11 +170,13 @@ MISSILE_COLOR = (255, 140, 60)
 # --- sound ---
 SFX_MASTER_VOLUME = 0.8   # 0..1 master gain for all SFX
 SFX_LASER_MIN_INTERVAL = 0.12        # min s between laser blips (gun fires ~100/s)
+# (beam needs no throttle: one discharge per charge cycle, ~1/s)
 SFX_ENEMY_LASER_MIN_INTERVAL = 0.15  # min s between enemy laser blips
 SFX_SHIELD_HIT_MIN_INTERVAL = 0.15   # min s between shield pings (3 enemies can hit ~20/s)
 SFX_VOLUMES = {           # per-sound gain 0..1 (tune by ear in S6)
     "laser": 0.5,
-    "enemy_laser": 0.4,
+    "beam": 0.6,
+    "enemy_laser": 0.25,
     "explosion": 0.9,
     "small_explosion": 0.6,
     "shield_hit": 0.5,

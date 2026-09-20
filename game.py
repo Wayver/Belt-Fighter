@@ -210,6 +210,10 @@ class Game:
 
             for beam in beams:
                 self._resolve_beam(beam)
+            if beams:
+                # Hitscan laser: one discharge per charge cycle (~1/s),
+                # so no throttle needed — unlike the rapid-fire gun blip.
+                self._sfx("beam")
             
             self.protect_timer -= dt
             self.wave_timer += dt

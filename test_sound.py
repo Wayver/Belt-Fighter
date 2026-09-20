@@ -13,6 +13,7 @@ from .sound import SoundBank
 # (name, seconds to wait before the next one)
 ORDER = [
     ("laser", 0.8),
+    ("beam", 0.8),
     ("enemy_laser", 0.8),
     ("explosion", 1.0),
     ("small_explosion", 0.8),

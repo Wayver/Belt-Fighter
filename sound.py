@@ -188,6 +188,14 @@ class SoundBank:
         t = self._t(dur)
         self._reg("laser", self._sweep(900, 300, dur) * _np.exp(-8 * t / dur))
 
+        # beam: hitscan laser discharge — a sharp high zap (brighter and
+        # longer than the gun blip; one shot per charge cycle, no throttle)
+        dur = 0.18
+        t = self._t(dur)
+        x = (0.8 * self._sweep(1800, 700, dur)
+             + 0.2 * self._lowpass(self._noise(dur, 7), 4000.0))
+        self._reg("beam", x * _np.exp(-10 * t / dur))
+
         # enemy_laser: lower, slower, a bit of grit
         dur = 0.15
         t = self._t(dur)

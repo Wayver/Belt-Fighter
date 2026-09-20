@@ -201,7 +201,11 @@ class Menu:
         if comp.laser_range:
             parts.append(f"range {comp.laser_range:.0f}")
         if comp.laser_arc_start_deg or comp.laser_arc_end_deg:
-            parts.append(f"arc {comp.laser_arc_start_deg:.0f}..{comp.laser_arc_end_deg:.0f}")
+            span = comp.laser_arc_end_deg - comp.laser_arc_start_deg
+            if span >= 360:
+                parts.append("arc 360")
+            else:
+                parts.append(f"arc {comp.laser_arc_start_deg:.0f}..{comp.laser_arc_end_deg:.0f}")
         if comp.sensor_range:
             parts.append(f"sns {comp.sensor_range:.0f}")
         if comp.scan_cooldown:

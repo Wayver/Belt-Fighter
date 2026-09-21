@@ -24,6 +24,7 @@ from .config import WIDTH, HEIGHT
 from .fog import make_light_texture
 from .game import Game, STEP
 from .ai_enemy import AIEnemy
+from .asteroid import Asteroid
 
 TICKS = 600   # 10 simulated seconds at 60 Hz
 
@@ -90,6 +91,7 @@ def run(seed):
     # reset the class-level enemy id counter so runs A/B are truly
     # identical (ids are cosmetic, but let's not rely on that)
     AIEnemy._next_id = 1
+    Asteroid._next_id = 1
     g = Game(screen, font, big_font, light_tex, fog_surf, light_surf,
              seed=seed)
     for t in range(TICKS):

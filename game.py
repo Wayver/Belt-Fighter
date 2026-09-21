@@ -41,6 +41,9 @@ from .fog import draw_fog, LightSource
 
 from .hud import draw_hud, draw_game_over
 from .camera import Camera
+from .netcode import SnapshotBuffer
+from .config import (INTERP_DELAY, SNAPSHOT_INTERVAL, ROCK_FILL, ROCK_EDGE,
+                    ENEMY_FILL, ENEMY_EDGE)
 
 STEP = 1 / 60   # fixed simulation timestep
 
@@ -80,6 +83,13 @@ class Game:
         self.acc = 0.0
         self.test_mode = test_mode
         self.sound = sound      # SoundBank or None (silent, e.g. headless)
+        # --- networking: remote-interpolation render state (Session 5b.3) ---
+        # sim_time: seconds of sim this Game has advanced. The authoritative
+        # peer stamps each snapshot with it; the remote peer renders
+        # sim_time - INTERP_DELAY (see remote_view).
+        self.sim_time = 0.0
+        self._snap_tick = 0        # sim ticks since the last snapshot stamp
+        self.snap_buf = SnapshotBuffer()
         self.reset()
 
     def _sfx(self, name):
@@ -144,12 +154,13 @@ class Game:
     #                        per projectile: pos/vel/owner/life (+ boost for
     #                        missiles). Missile target is stored as the
     #                        enemy's ship id; apply_snapshot re-wires it.
-    #   asteroids            per rock: pos/vel/size/angle/spin/verts
+    #   asteroids            per rock: id/pos/vel/size/angle/spin/verts
     #   rng state            the sim's single rng — the strongest check;
     #                        without it the peers diverge on the next roll
     #   game_over, protect_timer
     #   AIEnemy._next_id     class-level id counter (not instance state —
     #                        a naive snapshot misses it)
+    #   Asteroid._next_id    same for rocks (Session 5b.1)
     #
     # NOT SYNCED (presentation / config / local timing — never serialized):
     #   stars                cosmetic background; regenerated locally
@@ -179,6 +190,7 @@ class Game:
             self.game_over,
             self.protect_timer,
             AIEnemy._next_id,
+            Asteroid._next_id,
         )
 
     @staticmethod
@@ -196,7 +208,8 @@ class Game:
         constructed via the same paths the sim uses (so invariants hold),
         then their synced fields are overwritten."""
         (ship_s, enemies_s, bullets_s, enemy_bullets_s, missiles_s,
-         asteroids_s, rng_state, game_over, protect_timer, next_id) = s
+         asteroids_s, rng_state, game_over, protect_timer, next_id,
+         rock_next_id) = s
 
         self.ship.apply_snapshot(ship_s)
 
@@ -246,11 +259,14 @@ class Game:
         for m in self.missiles:
             m.target = id_map.get(m._target_id)
 
-        # Asteroids: construct minimally; apply_snapshot rebuilds
-        # radius/collision_radius from ROCK_SIZES[size].
+        # Asteroids: construct minimally (vel=None rolls a throwaway vel
+        # from the GLOBAL random module — the sim's rng is untouched, and
+        # apply_snapshot overwrites it anyway); apply_snapshot rebuilds
+        # radius/collision_radius from ROCK_SIZES[size] and restores the
+        # rock's id.
         self.asteroids.clear()
         for a_s in asteroids_s:
-            px, py, _vx, _vy, size, _angle, _spin, _verts = a_s
+            _aid, px, py, _vx, _vy, size, _angle, _spin, _verts = a_s
             a = Asteroid(pygame.Vector2(px, py), size)
             a.apply_snapshot(a_s)
             self.asteroids.append(a)
@@ -258,9 +274,11 @@ class Game:
         self.rng.setstate(rng_state)
         self.game_over = game_over
         self.protect_timer = protect_timer
-        # AFTER constructing enemies: their construction already consumed
-        # ids from the class counter, so restore the snapshotted value now.
+        # AFTER constructing enemies/asteroids: their construction already
+        # consumed ids from the class counters, so restore the snapshotted
+        # values now (same pattern for both counters).
         AIEnemy._next_id = next_id
+        Asteroid._next_id = rock_next_id
         # Camera is not synced — re-derive it from the restored ship.
         self.cam.pos = self.ship.pos.copy()
 
@@ -293,6 +311,7 @@ class Game:
             self.acc -= STEP
 
     def _step(self, dt, inp):
+        self.sim_time += dt   # sim clock: every fixed step advances it
         if not self.game_over:
             # Targeting sensor: count enemies in range before the ship
             # steps, so _allocate() sees this tick's tracked count.
@@ -891,6 +910,77 @@ class Game:
             self.ship.draw_collision(screen, self.cam)
             for e in self.enemies:
                 e.ship.draw_collision(screen, self.cam)
+
+    # --- networking: remote-interpolation render (Session 5b.3) ---
+    #
+    # The remote peer does NOT run the sim for remote entities. It pushes
+    # each received snapshot (stamped with the authoritative peer's sim_time)
+    # into self.snap_buf, then renders INTERP_DELAY seconds in the PAST:
+    # positions_at(sim_time - INTERP_DELAY) interpolates between the two
+    # snapshots that bracket that time. The local player's own ship, bullets,
+    # beams, particles, and fog are drawn by the normal draw() path — this
+    # hook only draws the REMOTE entities (ship, enemies, asteroids) at their
+    # interpolated positions, so the two paths never fight over a pixel.
+
+    def remote_view(self, dt):
+        """Draw the remote entities at their interpolated positions.
+
+        Called by the remote peer's render loop INSTEAD of (or before) the
+        local draw() for the shared entities. It reads only self.snap_buf and
+        self.sim_time — it never mutates sim state, so it is safe to call
+        every frame and it leaves the local path untouched.
+
+        Returns the interpolated positions dict (or None when the buffer has
+        not yet filled a window) so a caller can, e.g., skip the frame or
+        draw a "waiting for snapshots" state.
+        """
+        screen = self.screen
+        self.cam.update(dt, self.ship)
+        screen.fill(BG)
+        for x, y, r in self.stars:
+            sx = (x - self.cam.pos.x * 0.2) % WIDTH
+            sy = (y - self.cam.pos.y * 0.2) % HEIGHT
+            pygame.draw.circle(screen, STAR_COLOR, (sx, sy), r)
+
+        pos = self.snap_buf.positions_at(self.sim_time - INTERP_DELAY)
+        if pos is None:
+            # Not enough snapshots yet to interpolate: draw nothing for the
+            # remote entities (the caller may show a waiting state).
+            return None
+
+        # Asteroids: fill + edge polygon at the interpolated center. The
+        # shape (verts) and spin come from the latest snapshot's data; only
+        # the center is interpolated, which is what the buffer provides.
+        for (x, y) in pos['asteroids']:
+            self._draw_remote_rock(screen, x, y)
+        for (x, y) in pos['enemies']:
+            self._draw_remote_enemy(screen, x, y)
+        sx, sy = self.cam.to_screen(pygame.Vector2(*pos['ship']))
+        pygame.draw.circle(screen, (200, 210, 225), (int(sx), int(sy)), 6)
+
+        draw_hud(screen, self.font, self.enemies, self.ship)
+        return pos
+
+    def _draw_remote_rock(self, screen, x, y):
+        """Draw a remote asteroid at an interpolated world position.
+
+        The buffer only interpolates the CENTER (x, y); the rock's shape and
+        orientation are presentation detail. We draw a simple filled circle
+        sized by the latest snapshot's rock — good enough for the remote
+        view, and it keeps this hook free of per-rock state it does not own.
+        """
+        s = self.cam.to_screen(pygame.Vector2(x, y))
+        # Latest rock snapshot for the size (first rock; the remote view is
+        # a coarse stand-in, not a pixel-faithful replica).
+        r = 20
+        pygame.draw.circle(screen, ROCK_FILL, (int(s.x), int(s.y)), r)
+        pygame.draw.circle(screen, ROCK_EDGE, (int(s.x), int(s.y)), r, 2)
+
+    def _draw_remote_enemy(self, screen, x, y):
+        """Draw a remote enemy at an interpolated world position (coarse)."""
+        s = self.cam.to_screen(pygame.Vector2(x, y))
+        pygame.draw.circle(screen, ENEMY_FILL, (int(s.x), int(s.y)), 10)
+        pygame.draw.circle(screen, ENEMY_EDGE, (int(s.x), int(s.y)), 10, 2)
 
 # --- test range: static scene for laser occlusion testing ---
     TEST_ROCK_POS   = (960, 340)   # 300 px ahead, dead center (large)

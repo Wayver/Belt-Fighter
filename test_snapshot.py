@@ -31,6 +31,7 @@ from .config import WIDTH, HEIGHT
 from .fog import make_light_texture
 from .game import Game, STEP
 from .ai_enemy import AIEnemy
+from .asteroid import Asteroid
 
 TICKS = 600   # 10 simulated seconds at 60 Hz (same as test_determinism)
 SEED = 1234
@@ -127,6 +128,7 @@ def main():
 
     # --- Game A: run N ticks, then snapshot ---
     AIEnemy._next_id = 1   # deterministic construction ids
+    Asteroid._next_id = 1
     a = Game(screen, font, big_font, light_tex, fog_surf, light_surf,
              seed=SEED)
     for t in range(TICKS):
@@ -136,6 +138,7 @@ def main():
     # --- Game B: FRESH, same seed (clean baseline), then restore ---
     AIEnemy._next_id = 1   # keep B's construction clean (apply_snapshot
                            # restores the counter anyway)
+    Asteroid._next_id = 1
     b = Game(screen, font, big_font, light_tex, fog_surf, light_surf,
              seed=SEED)
     b.apply_snapshot(snap)

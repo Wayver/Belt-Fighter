@@ -8,8 +8,13 @@ from .config import WIDTH, HEIGHT, ROCK_SIZES, ROCK_FILL, ROCK_EDGE
 
 
 class Asteroid:
+    _next_id = 1   # stable per-rock id (mirror of AIEnemy._next_id); the
+                   # player ship is id 0, enemies take their own counter
+
     def __init__(self, pos, size, vel=None, rng=None):
         rng = rng or random
+        self.id = self._next_id
+        Asteroid._next_id += 1
         cfg = ROCK_SIZES[size]
         self.size = size
         self.radius = cfg['radius']
@@ -37,12 +42,16 @@ class Asteroid:
 
     # --- networking ---
     #
-    # SYNCED: pos, vel, size, angle, spin, verts (the rock shape — both
-    # peers must draw the same rock). radius / collision_radius are
-    # derived from size via ROCK_SIZES, so they are rebuilt, not stored.
+    # SYNCED: id, pos, vel, size, angle, spin, verts (the rock shape — both
+    # peers must draw the same rock). id is assigned once from the
+    # Asteroid._next_id class counter and never reused within a run — a
+    # stable identity across snapshots (Session 5b.1). radius /
+    # collision_radius are derived from size via ROCK_SIZES, so they are
+    # rebuilt, not stored.
 
     def snapshot(self):
         return (
+            self.id,
             self.pos.x, self.pos.y,
             self.vel.x, self.vel.y,
             self.size,
@@ -51,7 +60,8 @@ class Asteroid:
         )
 
     def apply_snapshot(self, s):
-        (px, py, vx, vy, size, angle, spin, verts) = s
+        (aid, px, py, vx, vy, size, angle, spin, verts) = s
+        self.id = aid
         self.size = size
         cfg = ROCK_SIZES[size]
         self.radius = cfg['radius']

@@ -134,6 +134,15 @@ PARTICLE_COLORS = [(200, 210, 225), (150, 160, 175), (255, 150, 50)]
 TICK = 1 / 60        # fixed sim step, seconds
 MAX_FRAME_DT = 0.25  # clamp frame dt so a hiccup can't trigger a catch-up spiral
 
+# --- networking: snapshot cadence + interpolation delay ---
+# The authoritative peer sends a Game.snapshot() every SNAPSHOT_INTERVAL sim
+# ticks (6 ticks at the 60 Hz sim = 10 snapshots/s). The remote peer renders
+# INTERP_DELAY seconds in the PAST, interpolating between the two snapshots
+# that bracket that time — so it always has the next snapshot in hand before
+# it needs to render the current one (no rubber-banding, no extrapolation).
+SNAPSHOT_INTERVAL = 6    # sim ticks between snapshots (6 -> 10 Hz at 60 Hz sim)
+INTERP_DELAY = 0.1       # seconds the remote render lags the sim
+
 
 # tartet assist
 TARGETING_ASSIST  = True

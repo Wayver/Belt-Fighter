@@ -265,6 +265,12 @@ class Connection:
                 self.sock.sendall(self._send_buf[0])
             except (BlockingIOError, socket.timeout):
                 break               # buffer full (or timed out): keep the rest
+            except ConnectionError:
+                # The peer is gone (RST / reset / broken pipe): mark the
+                # connection closed so the game loop notices via self.closed
+                # and stop trying to send. (Session 6.7 — see poll().)
+                self.closed = True
+                break
             del self._send_buf[0]
             sent += 1
         return sent
@@ -293,6 +299,17 @@ class Connection:
             # A recv TIMEOUT is not a close (the handshake sets a short
             # timeout so its wait loops can check their deadline): just
             # return whatever complete frames are already buffered.
+            msgs, self._recv_buf = extract_frames(self._recv_buf)
+            return msgs
+        except ConnectionError:
+            # A real socket error (RST / reset / aborted): the peer is gone.
+            # Treat it as a close (like a FIN) so the game loop notices via
+            # self.closed instead of crashing. (Session 6.7: the e2e test
+            # surfaced this — a peer that closes while the other side still
+            # has unread data makes the kernel send a RST, and the other
+            # side's recv raises ConnectionResetError rather than returning
+            # b"".)
+            self.closed = True
             msgs, self._recv_buf = extract_frames(self._recv_buf)
             return msgs
         if data:

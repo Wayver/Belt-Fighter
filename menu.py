@@ -1,12 +1,17 @@
-"""Ship selection menu: pick a hull, then fit components per slot.
+"""Ship selection menu: pick a mode, a hull, then fit components per slot.
 
-Two screens, matching the game's monospace style:
-  1. 'hull'    — choose from PLAYER_HULLS (UP/DOWN, ENTER)
-  2. 'loadout' — cycle a component per slot (UP/DOWN slot, LEFT/RIGHT part,
+Four screens, matching the game's monospace style:
+  1. 'mode'    — choose single / host / join (UP/DOWN, ENTER)
+  2. 'join'    — join only: type the host's IP + port (letters/digits/. and
+                 ':' for the port, ENTER connect, ESC back)
+  3. 'hull'    — choose from PLAYER_HULLS (UP/DOWN, ENTER)
+  4. 'loadout' — cycle a component per slot (UP/DOWN slot, LEFT/RIGHT part,
                  ENTER launch, ESC/BACKSPACE back)
 
-Produces (self.hull, self.loadout) for Game/Ship. Pure data + drawing;
-never touches sim code.
+Produces (self.hull, self.loadout) for Game/Ship, plus the connection mode:
+self.mode ('single'/'host'/'join'), self.host_ip, self.host_port (host: the
+port to listen on; join: the host to connect to). Pure data + drawing; never
+touches sim code.
 """
 import math
 
@@ -21,12 +26,23 @@ ACCENT = (120, 200, 255)
 WARN = (255, 160, 80)
 SEL_BG = (40, 48, 64)
 
+MODES = [
+    ("single", "SINGLE PLAYER", "solo run against the AI"),
+    ("host",   "HOST GAME",     "wait for one player to join"),
+    ("join",   "JOIN GAME",     "connect to a host by IP"),
+]
+
 
 class Menu:
     def __init__(self, font, big_font):
         self.font = font
         self.big_font = big_font
-        self.state = 'hull'        # 'hull' -> 'loadout' -> done
+        self.state = 'mode'        # 'mode' -> 'join' -> 'hull' -> 'loadout' -> done
+        self.mode_index = 0
+        self.mode = 'single'       # 'single' | 'host' | 'join'
+        self.join_text = ""        # join: raw 'IP:port' being typed
+        self.host_ip = ""          # join: parsed host to connect to (on ENTER)
+        self.host_port = 0         # join: parsed host port (on ENTER)
         self.hull_index = 0
         self.slot_index = 0
         self.slot_choice = self._stock_choices(self._hull()) 
@@ -55,9 +71,28 @@ class Menu:
                 for s in self._hull().slots}
 
     def _confirm(self):
+        """Launch: record the chosen hull/loadout (and mode) and finish."""
         self.hull = self._hull()
         self.loadout = self._current_loadout()
         self.done = True
+
+    def _join_target(self):
+        """Parse the typed 'IP:port' into (self.host_ip, self.host_port).
+
+        Returns True when the entry is usable (a non-empty IP and a port in
+        1..65535); the caller keeps the join screen up otherwise.
+        """
+        text = self.join_text.strip()
+        if ":" in text:
+            ip, _, port_s = text.rpartition(":")
+        else:
+            ip, port_s = text, ""
+        self.host_ip = ip.strip()
+        try:
+            self.host_port = int(port_s)
+        except ValueError:
+            self.host_port = 0
+        return bool(self.host_ip) and 1 <= self.host_port <= 65535
 
     # --- events ---
 
@@ -67,9 +102,33 @@ class Menu:
             if event.type == pygame.QUIT:
                 return False
             elif event.type == pygame.KEYDOWN:
-                if self.state == 'hull':
+                if self.state == 'mode':
                     if event.key == pygame.K_ESCAPE:
                         return False
+                    elif event.key in (pygame.K_UP, pygame.K_DOWN):
+                        d = 1 if event.key == pygame.K_DOWN else -1
+                        self.mode_index = (self.mode_index + d) % len(MODES)
+                    elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                        self.mode = MODES[self.mode_index][0]
+                        self.state = 'join' if self.mode == 'join' else 'hull'
+                elif self.state == 'join':
+                    if event.key == pygame.K_ESCAPE:
+                        self.state = 'mode'
+                    elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                        if self._join_target():
+                            self.state = 'hull'
+                    elif event.key == pygame.K_BACKSPACE:
+                        self.join_text = self.join_text[:-1]
+                    elif event.key == pygame.K_PERIOD:
+                        self.join_text += "."
+                    elif event.key == pygame.K_COLON:
+                        self.join_text += ":"
+                    elif event.unicode and event.unicode.isprintable() \
+                            and event.unicode.isalnum():
+                        self.join_text += event.unicode
+                elif self.state == 'hull':
+                    if event.key == pygame.K_ESCAPE:
+                        self.state = 'mode'
                     elif event.key in (pygame.K_UP, pygame.K_DOWN):
                         n = len(PLAYER_HULLS)
                         d = 1 if event.key == pygame.K_DOWN else -1
@@ -98,10 +157,66 @@ class Menu:
 
     def draw(self, screen):
         screen.fill(BG)
-        if self.state == 'hull':
+        if self.state == 'mode':
+            self._draw_mode_screen(screen)
+        elif self.state == 'join':
+            self._draw_join_screen(screen)
+        elif self.state == 'hull':
             self._draw_hull_screen(screen)
         else:
             self._draw_loadout_screen(screen)
+
+    def _draw_mode_screen(self, screen):
+        title = self.big_font.render("BELT FIGHTER", True, BRIGHT)
+        screen.blit(title, (WIDTH / 2 - title.get_width() / 2, 60))
+
+        x = int(WIDTH * 0.5)
+        y = int(HEIGHT * 0.38)
+        for i, (mode, label, desc) in enumerate(MODES):
+            sel = i == self.mode_index
+            if sel:
+                pygame.draw.rect(screen, SEL_BG, (x - 16, y - 22, 460, 30))
+            screen.blit(self.font.render(label, True,
+                                         BRIGHT if sel else DIM), (x, y - 18))
+            if sel:
+                screen.blit(self.font.render(desc, True, ACCENT), (x, y + 12))
+            y += 64
+
+        hint = self.font.render(
+            "UP/DOWN select   ENTER continue   ESC quit", True, DIM)
+        screen.blit(hint, (8, HEIGHT - 24))
+
+    def _draw_join_screen(self, screen):
+        title = self.big_font.render("JOIN GAME", True, BRIGHT)
+        screen.blit(title, (WIDTH / 2 - title.get_width() / 2, 40))
+
+        x = int(WIDTH * 0.35)
+        y = int(HEIGHT * 0.42)
+        screen.blit(self.font.render("HOST ADDRESS  (IP:port)", True, DIM),
+                    (x, y))
+        box = (x - 10, y + 26, 420, 34)
+        pygame.draw.rect(screen, SEL_BG, box)
+        pygame.draw.rect(screen, ACCENT, box, 2)
+        caret = "_" if (pygame.time.get_ticks() // 400) % 2 == 0 else ""
+        screen.blit(self.font.render(self.join_text + caret, True, BRIGHT),
+                    (x, y + 30))
+
+        # live validation (pure — the parse that mutates host_ip/host_port
+        # only happens on ENTER, in _join_target)
+        text = self.join_text.strip()
+        if text:
+            ip, _, port_s = text.rpartition(":")
+            try:
+                p = int(port_s)
+            except ValueError:
+                p = 0
+            if not ip.strip() or not 1 <= p <= 65535:
+                screen.blit(self.font.render(
+                    "need IP:port  (port 1-65535)", True, WARN), (x, y + 70))
+
+        hint = self.font.render(
+            "type IP:port   ENTER continue   ESC back", True, DIM)
+        screen.blit(hint, (8, HEIGHT - 24))
 
     def _draw_hull_preview(self, screen, hull, cx, cy, scale, highlight=None):
         """Hull polygon + slot dots, oriented like the in-game ship (nose up)."""
@@ -154,7 +269,7 @@ class Menu:
             y += 30
 
         hint = self.font.render(
-            "UP/DOWN select   ENTER fit components   ESC quit", True, DIM)
+            "UP/DOWN select   ENTER fit components   ESC back to mode", True, DIM)
         screen.blit(hint, (8, HEIGHT - 24))
 
     def _draw_loadout_screen(self, screen):

@@ -142,6 +142,7 @@ MAX_FRAME_DT = 0.25  # clamp frame dt so a hiccup can't trigger a catch-up spira
 # it needs to render the current one (no rubber-banding, no extrapolation).
 SNAPSHOT_INTERVAL = 6    # sim ticks between snapshots (6 -> 10 Hz at 60 Hz sim)
 INTERP_DELAY = 0.1       # seconds the remote render lags the sim
+NET_PORT = 7777          # default host listen port (2P host/client, Session 6.5)
 
 
 # tartet assist

@@ -51,7 +51,7 @@ STEP = 1 / 60   # fixed simulation timestep
 class Game:
     def __init__(self, screen, font, big_font, light_tex, fog_surf, light_surf,
                 hull=None, loadout=None, test_mode=False, seed=None, sound=None,
-                local_index=0):
+                local_index=0, players=1):
         self.screen = screen
         self.font = font
         self.big_font = big_font
@@ -67,7 +67,15 @@ class Game:
         # Single-player is a 1-ship list; 2P is 2 ships in the same world.
         # `self.ship` (the property below) is players[0] — the backward-
         # compat alias the sim, the HUD, and the tests still read.
-        self.players = [Ship(hull=hull, loadout=loadout)]
+        # players: 1 = single-player (the local hull/loadout); 2 = 2P host
+        # (Session 6.5) — player 0 is the host's ship, player 1 is a
+        # PLACEHOLDER (the client's hull/loadout is unknown until the join
+        # handshake). The host replaces the placeholder after the handshake
+        # via `set_player_ship` (the client's shield ring is rebuilt then).
+        if players == 1:
+            self.players = [Ship(hull=hull, loadout=loadout)]
+        else:
+            self.players = [Ship(hull=hull, loadout=loadout), Ship()]
         # local_index: which player this Game controls locally (0 = host's
         # own ship, 1 = the client's). The prediction ghost tracks
         # players[local_index] (Session 6.1 layout; the host applies the
@@ -75,15 +83,7 @@ class Game:
         self.local_index = local_index
         # Per-player shield ring (Session 6.2a): one pre-drawn Surface per
         # player, sized by that player's hull radius (hulls may differ in 2P).
-        self.shields = []
-        for p in self.players:
-            r = p.collision_radius
-            sh = pygame.Surface((int(r * 2 + 10), int(r * 2 + 10)),
-                                pygame.SRCALPHA)
-            pygame.draw.circle(sh, (120, 200, 255, 100),
-                               (sh.get_width() // 2, sh.get_height() // 2),
-                               r + 5, 2)
-            self.shields.append(sh)
+        self.shields = [self._make_shield(p) for p in self.players]
 
         self.cam = Camera(self.ship.pos)
         self.bullets = []
@@ -122,6 +122,30 @@ class Game:
         the tests — keeps working; 2P code uses self.players directly.
         Read-only: assign to self.players, not self.ship."""
         return self.players[0]
+
+    def _make_shield(self, p):
+        """Pre-drawn shield ring for one player ship, sized by that hull's
+        collision radius (hulls may differ in 2P)."""
+        r = p.collision_radius
+        sh = pygame.Surface((int(r * 2 + 10), int(r * 2 + 10)),
+                            pygame.SRCALPHA)
+        pygame.draw.circle(sh, (120, 200, 255, 100),
+                           (sh.get_width() // 2, sh.get_height() // 2),
+                           r + 5, 2)
+        return sh
+
+    def set_player_ship(self, i, ship):
+        """Replace player slot `i` with a built Ship (Session 6.5).
+
+        The host calls this once, after the join handshake, to swap the
+        player-1 placeholder for the client's real hull/loadout. The
+        placeholder has never been stepped (the handshake happens before
+        the first tick), so replacing it in place is safe; the shield ring
+        is rebuilt for the new hull's radius. The caller must build the
+        Ship itself (it owns the hull/loadout from the wire).
+        """
+        self.players[i] = ship
+        self.shields[i] = self._make_shield(ship)
 
     def _sfx(self, name):
         """Play a sound if a SoundBank is attached. Pure side effect:

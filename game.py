@@ -41,7 +41,7 @@ from .fog import draw_fog, LightSource
 
 from .hud import draw_hud, draw_game_over
 from .camera import Camera
-from .netcode import SnapshotBuffer
+from .netcode import SnapshotBuffer, PredictedShip
 from .config import (INTERP_DELAY, SNAPSHOT_INTERVAL, ROCK_FILL, ROCK_EDGE,
                     ENEMY_FILL, ENEMY_EDGE)
 
@@ -50,7 +50,8 @@ STEP = 1 / 60   # fixed simulation timestep
 
 class Game:
     def __init__(self, screen, font, big_font, light_tex, fog_surf, light_surf,
-                hull=None, loadout=None, test_mode=False, seed=None, sound=None):
+                hull=None, loadout=None, test_mode=False, seed=None, sound=None,
+                local_index=0):
         self.screen = screen
         self.font = font
         self.big_font = big_font
@@ -62,13 +63,27 @@ class Game:
         self.rng = random.Random(seed)
         self.stars = make_stars(rng=self.rng)
 
-        self.ship = Ship(hull=hull, loadout=loadout)
-        r = self.ship.collision_radius
-        self.shield = pygame.Surface((int(r * 2 + 10), int(r * 2 + 10)),
-                                     pygame.SRCALPHA)
-        pygame.draw.circle(self.shield, (120, 200, 255, 100),
-                           (self.shield.get_width() // 2, self.shield.get_height() // 2),
-                           r + 5, 2)
+        # Player ships (Session 6.1): a list, not a single attribute.
+        # Single-player is a 1-ship list; 2P is 2 ships in the same world.
+        # `self.ship` (the property below) is players[0] — the backward-
+        # compat alias the sim, the HUD, and the tests still read.
+        self.players = [Ship(hull=hull, loadout=loadout)]
+        # local_index: which player this Game controls locally (0 = host's
+        # own ship, 1 = the client's). The prediction ghost tracks
+        # players[local_index] (Session 6.1 layout; the host applies the
+        # remote player's input in 6.2).
+        self.local_index = local_index
+        # Per-player shield ring (Session 6.2a): one pre-drawn Surface per
+        # player, sized by that player's hull radius (hulls may differ in 2P).
+        self.shields = []
+        for p in self.players:
+            r = p.collision_radius
+            sh = pygame.Surface((int(r * 2 + 10), int(r * 2 + 10)),
+                                pygame.SRCALPHA)
+            pygame.draw.circle(sh, (120, 200, 255, 100),
+                               (sh.get_width() // 2, sh.get_height() // 2),
+                               r + 5, 2)
+            self.shields.append(sh)
 
         self.cam = Camera(self.ship.pos)
         self.bullets = []
@@ -90,7 +105,23 @@ class Game:
         self.sim_time = 0.0
         self._snap_tick = 0        # sim ticks since the last snapshot stamp
         self.snap_buf = SnapshotBuffer()
+        self.ghost = PredictedShip()   # local-ship prediction ghost (5b.4b)
+        # Remote player's latest input (Session 6.2a): the host stores the
+        # client's ShipInput here (set_remote_input) and _step applies it to
+        # player 1. Empty default = no thrust/fire; single-player never sets
+        # it (only player 0 exists), so the sim is untouched.
+        self.remote_input = ShipInput()
         self.reset()
+
+    @property
+    def ship(self):
+        """Backward-compat alias: the local player's ship (players[0]).
+
+        Session 6.1 generalized the sim to a players list (2P: two ships in
+        the same world). Everything that reads self.ship — the sim, the HUD,
+        the tests — keeps working; 2P code uses self.players directly.
+        Read-only: assign to self.players, not self.ship."""
+        return self.players[0]
 
     def _sfx(self, name):
         """Play a sound if a SoundBank is attached. Pure side effect:
@@ -109,21 +140,25 @@ class Game:
             self.sound.set_thruster(on)
 
     def reset(self):
-        self.ship.pos = pygame.Vector2(WIDTH / 2, HEIGHT / 2)
-        self.ship.vel = pygame.Vector2(0, 0)
-        self.ship.angle = -math.pi / 2
-        self.ship.prev_pos = self.ship.pos.copy()
-        self.ship.prev_angle = self.ship.angle
-        self.ship.reset_shield()
-        self.ship.targeting_on = False
-        self.ship.tracked = 0
+        # Reset ALL player ships (Session 6.2a): each to center, idle.
+        # (Both players spawn at center in v1 — no ship-vs-ship collision,
+        # so they pass through each other.)
+        for p in self.players:
+            p.pos = pygame.Vector2(WIDTH / 2, HEIGHT / 2)
+            p.vel = pygame.Vector2(0, 0)
+            p.angle = -math.pi / 2
+            p.prev_pos = p.pos.copy()
+            p.prev_angle = p.angle
+            p.reset_shield()
+            p.targeting_on = False
+            p.tracked = 0
+            p.reset_missiles()
+            p.reset_lasers()
+            p.reset_sensors()
         self.bullets.clear()
         self.enemy_bullets.clear()
         self.beams.clear()
         self.missiles.clear()
-        self.ship.reset_missiles()
-        self.ship.reset_lasers()
-        self.ship.reset_sensors()
         self.particles.clear()
         self.asteroids.clear()
         self.enemies.clear()
@@ -135,7 +170,8 @@ class Game:
         if self.test_mode:
             self._setup_test_scene()
             return
-        update_field(self.asteroids, [self.ship.pos], 0, rng=self.rng)
+        update_field(self.asteroids, [p.pos for p in self.players], 0,
+                     rng=self.rng)
         spawn_enemy(self.enemies, self.ship, rng=self.rng)
         spawn_enemy(self.enemies, self.ship, rng=self.rng)
         spawn_enemy(self.enemies, self.ship, rng=self.rng)
@@ -144,7 +180,9 @@ class Game:
     # ship-level classification) ---
     #
     # SYNCED (serialized, must be identical on both peers):
-    #   ship                 player Ship (21-field tuple, see ship.py)
+    #   players              index 0: tuple of one Ship.snapshot() per
+    #                        player (21-field tuple each, see ship.py).
+    #                        2P: both ships in the same world (6.1).
     #   enemies              per enemy: variant tag + e.snapshot()
     #                        tag = 'mote' (MoteEnemy) | 'test' (TestTarget)
     #                        | 'ai' (AIEnemy). Order matters: MoteEnemy and
@@ -180,7 +218,7 @@ class Game:
         """Capture the whole sim as ONE plain-data tuple: no pygame
         objects, no references — safe to pickle / send over the wire."""
         return (
-            self.ship.snapshot(),
+            tuple(p.snapshot() for p in self.players),
             tuple((self._enemy_tag(e), e.snapshot()) for e in self.enemies),
             tuple(b.snapshot() for b in self.bullets),
             tuple(b.snapshot() for b in self.enemy_bullets),
@@ -207,11 +245,14 @@ class Game:
         """Restore a snapshot() tuple into this Game. Entities are
         constructed via the same paths the sim uses (so invariants hold),
         then their synced fields are overwritten."""
-        (ship_s, enemies_s, bullets_s, enemy_bullets_s, missiles_s,
+        (players_s, enemies_s, bullets_s, enemy_bullets_s, missiles_s,
          asteroids_s, rng_state, game_over, protect_timer, next_id,
          rock_next_id) = s
 
-        self.ship.apply_snapshot(ship_s)
+        # Player ships (Session 6.1): index 0 is a tuple of one
+        # Ship.snapshot() per player; apply each to the matching slot.
+        for p, p_s in zip(self.players, players_s):
+            p.apply_snapshot(p_s)
 
         # Enemies: build with a THROWAWAY rng so construction (which rolls
         # ship.angle and consumes _next_id) neither burns the real rng
@@ -309,75 +350,73 @@ class Game:
         while self.acc >= STEP:
             self._step(STEP, inp)
             self.acc -= STEP
-
     def _step(self, dt, inp):
         self.sim_time += dt   # sim clock: every fixed step advances it
         if not self.game_over:
-            # Targeting sensor: count enemies in range before the ship
-            # steps, so _allocate() sees this tick's tracked count.
-            self.ship.tracked = sum(
-                1 for e in self.enemies
-                if e.pos.distance_to(self.ship.pos) <= TARGETING_RANGE)
-            
+            # Movement + fire for EVERY player (Session 6.2a). Player 0 uses
+            # the local keys' input; the remote player (index 1) uses the
+            # host's latest received input (self.remote_input). Single-player
+            # is a 1-ship list, so this loop runs once with the local input —
+            # bit-identical to the old single-ship path.
+            for i, p in enumerate(self.players):
+                p_inp = inp if i == 0 else self.remote_input
+                # Per-ship targeting (Session 6.2b): each player gets its own
+                # tracked count / laser target / missile target / sensor
+                # contacts, all set BEFORE p.update() so this tick's
+                # _allocate()/_update_lasers()/_update_missiles() see them.
+                # Player 0 is self.ship, so single-player is bit-identical.
+                p.tracked = sum(
+                    1 for e in self.enemies
+                    if e.pos.distance_to(p.pos) <= TARGETING_RANGE)
+                p.laser_target = self._pick_laser_target(p)
+                p.missile_target = self._pick_missile_target(p)
+                self._update_contacts(p)
+                if p_inp.fire and len(self.bullets) >= MAX_BULLETS:
+                    p_inp = replace(p_inp, fire=False)   # world cap: no room
+                if p_inp.missile_fire and len(self.missiles) >= MAX_MISSILES:
+                    p_inp = replace(p_inp, missile_fire=False)
+                shots, beams, missiles = p.update(dt, p_inp)
 
+                for shot in shots:
+                    self.bullets.append(Bullet(shot.pos, shot.vel,
+                                               owner=shot.owner))
+                # S3: fire sounds. The gun fires ~100 shots/s (FIRE_COOLDOWN
+                # 0.01), so the laser blip is throttled to a human rate.
+                if shots:
+                    self._sfx_throttled("laser", SFX_LASER_MIN_INTERVAL)
 
-            # Laser target: nearest enemy in range, set before the ship
-            # steps so _update_lasers() sees it this tick.
-            self.ship.laser_target = self._pick_laser_target()
-            
-            # Missile target: same pattern, for the lock state machine.
-            self.ship.missile_target = self._pick_missile_target()
+                for m in missiles:
+                    self.missiles.append(Missile(m.pos, m.vel, owner=m.owner,
+                                                 target=m.target))
+                if missiles:
+                    self._sfx("missile_launch")
 
-            # Sensor contacts: passive + active reveals, same pattern.
-            self._update_contacts()
-
-
-            if inp.fire and len(self.bullets) >= MAX_BULLETS:
-                inp = replace(inp, fire=False)   # world cap: no room, no shot
-            #shots, beams, missiles = self.ship.update(dt, inp)
-            
-            if inp.missile_fire and len(self.missiles) >= MAX_MISSILES:
-                inp = replace(inp, missile_fire=False)
-            shots, beams, missiles = self.ship.update(dt, inp)
-
-            for shot in shots:
-                self.bullets.append(Bullet(shot.pos, shot.vel, owner=shot.owner))
-
-            # S3: fire sounds. The gun fires ~100 shots/s (FIRE_COOLDOWN
-            # 0.01), so the laser blip is throttled to a human rate.
-            if shots:
-                self._sfx_throttled("laser", SFX_LASER_MIN_INTERVAL)
-            
-
-            for m in missiles:
-                self.missiles.append(Missile(m.pos, m.vel, owner=m.owner,
-                                             target=m.target))
-            if missiles:
-                self._sfx("missile_launch")
-            
-
-            for beam in beams:
-                self._resolve_beam(beam)
-            if beams:
-                # Hitscan laser: one discharge per charge cycle (~1/s),
-                # so no throttle needed — unlike the rapid-fire gun blip.
-                self._sfx("beam")
+                for beam in beams:
+                    self._resolve_beam(beam)
+                if beams:
+                    # Hitscan laser: one discharge per charge cycle (~1/s),
+                    # so no throttle needed — unlike the rapid-fire gun blip.
+                    self._sfx("beam")
             
             self.protect_timer -= dt
             if not self.test_mode:
-                update_field(self.asteroids, [self.ship.pos], dt,
-                             rng=self.rng)
+                update_field(self.asteroids, [p.pos for p in self.players],
+                             dt, rng=self.rng)
 
         # Engine loop: on while the ship is alive and any fitted thruster
         # has resolved force (demand * allocation > 0). Death or a power
         # brownout cuts the sound; set_thruster(False) is a cheap no-op
         # when the loop is already off.
         self._sfx_thruster(not self.game_over
-                           and any(t.force > 0.0 for t in self.ship.thrusters))
+                           and any(t.force > 0.0
+                                   for p in self.players
+                                   for t in p.thrusters))
 
         enemy_fired = False
         for e in self.enemies:
-            shots = e.update(dt, self.ship, self.asteroids)
+            # Each enemy targets the NEAREST player (Session 6.2a). With one
+            # player this is that player — bit-identical to the old path.
+            shots = e.update(dt, self._nearest_player(e.pos), self.asteroids)
             for shot in shots:
                 self.enemy_bullets.append(EnemyBullet(shot.pos, shot.vel, owner=shot.owner))
             if shots:
@@ -410,12 +449,24 @@ class Game:
             b[4] += dt
         self.beams = [b for b in self.beams if b[4] < b[5]]
 
+    def set_remote_input(self, inp):
+        """Store the remote player's latest ShipInput (Session 6.2a). The
+        host calls this when an 'input' message arrives; _step applies it to
+        player 1 (index 1) each tick. Single-player never calls it."""
+        self.remote_input = inp
+
+    def _nearest_player(self, pos):
+        """The player ship nearest to `pos` (Session 6.2a). Enemies target
+        the nearest player; with one player this is that player."""
+        return min(self.players,
+                   key=lambda p: p.pos.distance_squared_to(pos))
+
     
-    def _build_lights(self):
+    def _build_lights(self, ship):
         """Whitelist of things that shine through the fog of war.
-        Returns a list of LightSource in world coords, built fresh each frame."""
+        Returns a list of LightSource in world coords, built fresh each frame.
+        (Session 6.2b: per-ship — called with the local ship.)"""
         lights = []
-        ship = self.ship
 
 
         # --- Targeting reticle: a small light at each predicted lead point.
@@ -451,15 +502,15 @@ class Game:
         return lights
 
 
-    def _update_contacts(self):
+    def _update_contacts(self, ship):
         """Build the ship's contact list from the fitted sensor.
 
         Passive: enemies in sensor_range whose active power draw
         (power_used - idle) crosses the signature threshold. Active:
         while a ping's reveal lasts, everything in scan_range is
         confirmed. A confirmed contact replaces a passive one.
+        (Session 6.2b: per-ship, called once per player.)
         """
-        ship = self.ship
         c = ship.sensor_comp
         ship.contacts = []
         if c is None:
@@ -521,30 +572,31 @@ class Game:
                 txt = self.font.render(f"{dist:.0f}", True, color)
                 screen.blit(txt, (p.x - txt.get_width() / 2, p.y + 10))
 
-    def _pick_laser_target(self):
-        """Nearest enemy within the max laser range; None if no laser fitted."""
-        max_range = max((w.comp.laser_range for w in self.ship.weapons
+    def _pick_laser_target(self, ship):
+        """Nearest enemy within the max laser range; None if no laser fitted.
+        (Session 6.2b: per-ship, called once per player.)"""
+        max_range = max((w.comp.laser_range for w in ship.weapons
                          if w.comp.laser_range > 0), default=0.0)
         if max_range <= 0:
             return None
         best, best_d = None, max_range
         for e in self.enemies:
-            d = e.pos.distance_to(self.ship.pos)
+            d = e.pos.distance_to(ship.pos)
             if d <= best_d:
                 best, best_d = e, d
         return best
 
 
-    def _pick_missile_target(self):
+    def _pick_missile_target(self, ship):
         """Nearest enemy within the max missile lock range; None if no
-        missile fitted."""
-        max_range = max((w.comp.missile_lock_range for w in self.ship.weapons
+        missile fitted. (Session 6.2b: per-ship, called once per player.)"""
+        max_range = max((w.comp.missile_lock_range for w in ship.weapons
                          if w.comp.missile_speed > 0), default=0.0)
         if max_range <= 0:
             return None
         best, best_d = None, max_range
         for e in self.enemies:
-            d = e.pos.distance_to(self.ship.pos)
+            d = e.pos.distance_to(ship.pos)
             if d <= best_d:
                 best, best_d = e, d
         return best
@@ -677,16 +729,17 @@ class Game:
         return abs(d_f) <= abs(d_e) + TARGETING_ALIGN_TOL
 
 
-    def _handle_ship_hit(self, source_pos):
-        """Handle a hit on the ship. Returns True if the ship survives."""
-        if self.ship.register_hit():
-            impact = self.ship.shield_impact_point(source_pos)
+    def _handle_ship_hit(self, ship, source_pos):
+        """Handle a hit on a player ship (Session 6.2a: takes the ship).
+        Returns True if the ship survives."""
+        if ship.register_hit():
+            impact = ship.shield_impact_point(source_pos)
             shield_burst(self.particles, impact, rng=self.rng)
             # Throttled: 3 enemies can hit ~20/s; the ping is 0.3 s long.
             self._sfx_throttled("shield_hit", SFX_SHIELD_HIT_MIN_INTERVAL)
             return True
         self.game_over = True
-        burst(self.particles, self.ship.pos, 30, big=True, rng=self.rng)
+        burst(self.particles, ship.pos, 30, big=True, rng=self.rng)
         self._sfx("explosion")
         self._sfx("game_over")
         return False
@@ -792,37 +845,51 @@ class Game:
                     b.life = 0.0          # was: self.enemy_bullets.remove(b)
                     break
 
-        # enemy bullet vs ship (shield surface if up, else swept hull)
+        # enemy bullet vs EACH player ship (Session 6.2a: shield surface if
+        # up, else swept hull). A bullet is consumed by the first ship it
+        # hits; one dead ship ends the game (game_over).
         if self.protect_timer <= 0:
             for b in self.enemy_bullets:
                 if b.life <= 0:
                     continue
-                if self.ship.shield_on:
-                    if self.ship.shield_contains(b.pos):
-                        b.life = 0.0      # was: self.enemy_bullets.remove(b)
-                        if not self._handle_ship_hit(b.pos):
-                            break
-                else:
-                    hit, hit_pt = self.ship.collision_segment(b.prev_pos, b.pos)
-                    if hit:
-                        b.life = 0.0      # was: self.enemy_bullets.remove(b)
-                        if not self._handle_ship_hit(pygame.Vector2(hit_pt)):
-                            break
+                for p in self.players:
+                    if p.shield_on:
+                        if p.shield_contains(b.pos):
+                            b.life = 0.0
+                            if not self._handle_ship_hit(p, b.pos):
+                                break
+                            break   # bullet consumed by this ship
+                    else:
+                        hit, hit_pt = p.collision_segment(b.prev_pos, b.pos)
+                        if hit:
+                            b.life = 0.0
+                            if not self._handle_ship_hit(p,
+                                                         pygame.Vector2(hit_pt)):
+                                break
+                            break   # bullet consumed by this ship
+                if self.game_over:
+                    break
 
 
-        # ship vs enemy (ram) — SAT on both hull polygons
+        # EACH player ship vs enemy (ram) — SAT on both hull polygons
         if self.protect_timer <= 0 and not self.game_over:
-            for e in self.enemies:
-                if self.ship.collision_overlaps_ship(e.ship):
-                    if not self._handle_ship_hit(e.pos):
-                        break
+            for p in self.players:
+                for e in self.enemies:
+                    if p.collision_overlaps_ship(e.ship):
+                        if not self._handle_ship_hit(p, e.pos):
+                            break
+                if self.game_over:
+                    break
 
-        # ship vs asteroid — swept hull polygon vs circle (speed-independent)
+        # EACH player ship vs asteroid — swept hull polygon vs circle
         if self.protect_timer <= 0 and not self.game_over:
-            for a in self.asteroids:
-                if self.ship.collision_swept_overlaps_circle(a.pos, a.collision_radius):
-                    if not self._handle_ship_hit(a.pos):
-                        break
+            for p in self.players:
+                for a in self.asteroids:
+                    if p.collision_swept_overlaps_circle(a.pos, a.collision_radius):
+                        if not self._handle_ship_hit(p, a.pos):
+                            break
+                if self.game_over:
+                    break
         
         # enemy vs asteroid (rocks are hazards for everyone)
         for i, e in enumerate(self.enemies[:]):
@@ -891,13 +958,17 @@ class Game:
         for p in self.particles:
             p.draw(screen, self.cam)
         if not self.game_over:
-            self.ship.sync_render(self.acc / STEP)
-            self.ship.draw(screen, self.cam, self.ship.rpos, self.ship.rangle)
-            if self.protect_timer > 0:
-                ssx, ssy = self.cam.to_screen(self.ship.rpos)
-                screen.blit(self.shield, (ssx - self.shield.get_width() // 2,
-                                      ssy - self.shield.get_height() // 2))
-        draw_fog(screen, self.ship, self.cam, self.light_tex, self.fog_surf, self.light_surf, self._build_lights())
+            # Draw EVERY player ship (Session 6.2a), each with its own
+            # shield ring (self.shields[i], sized by that hull's radius).
+            for i, p in enumerate(self.players):
+                p.sync_render(self.acc / STEP)
+                p.draw(screen, self.cam, p.rpos, p.rangle)
+                if self.protect_timer > 0:
+                    sh = self.shields[i]
+                    ssx, ssy = self.cam.to_screen(p.rpos)
+                    screen.blit(sh, (ssx - sh.get_width() // 2,
+                                     ssy - sh.get_height() // 2))
+        draw_fog(screen, self.ship, self.cam, self.light_tex, self.fog_surf, self.light_surf, self._build_lights(self.ship))
         # Scan pulse above the fog: a bright ring sweeping through the dark
         if not self.game_over:
             self.ship._draw_scan_pulse(screen, self.cam, self.ship.rpos)
@@ -955,8 +1026,72 @@ class Game:
             self._draw_remote_rock(screen, x, y)
         for (x, y) in pos['enemies']:
             self._draw_remote_enemy(screen, x, y)
-        sx, sy = self.cam.to_screen(pygame.Vector2(*pos['ship']))
-        pygame.draw.circle(screen, (200, 210, 225), (int(sx), int(sy)), 6)
+        # All player ships (Session 6.1): the buffer's 'ships' list, by index.
+        for (x, y) in pos['ships']:
+            sx, sy = self.cam.to_screen(pygame.Vector2(x, y))
+            pygame.draw.circle(screen, (200, 210, 225), (int(sx), int(sy)), 6)
+
+        draw_hud(screen, self.font, self.enemies, self.ship)
+        return pos
+
+    def push_snapshot(self, sim_time, snap):
+        """The single seam where a received authoritative snapshot enters
+        the remote peer: record it in the interpolation buffer, then feed
+        the local ship's prediction ghost — seed on the first snapshot,
+        reconcile (full-snap) on every one after. snap[0] is the tuple of
+        per-player ship snapshots (Session 6.1); the ghost is the LOCAL
+        player's ship, so it takes snap[0][self.local_index]. The network
+        layer (and the 5b.4c test) call this."""
+        self.snap_buf.push(sim_time, snap)
+        local_s = snap[0][self.local_index]
+        self.ghost.seed(local_s) if not self.ghost.seeded \
+            else self.ghost.reconcile(local_s)
+
+    def predicted_view(self, dt, keys):
+        """Draw the frame with the LOCAL ship taken from the prediction
+        ghost instead of the sim (client-side prediction, Session 5b.4b).
+
+        Mirrors remote_view, except the local ship is the ghost: each frame
+        the ghost is stepped with the local player's input at the fixed
+        timestep, and the ghost's ship is drawn at its own (predicted)
+        position. Remote entities (enemies, asteroids) still come from the
+        interpolation buffer at sim_time - INTERP_DELAY, exactly as
+        remote_view does. The buffer's 'ship' entry is NOT drawn — it IS
+        the local ship, now predicted.
+
+        The ghost is PRESENTATION-ONLY: it is never fed back into the sim
+        (update() still runs on self.ship). Returns the interpolated
+        positions dict (or None while waiting for the first snapshot).
+        """
+        if not self.ghost.seeded:
+            # No authoritative snapshot has arrived yet: nothing to predict
+            # from. The caller may show a waiting state.
+            return None
+
+        inp = ShipInput.from_keys(keys)
+        self.ghost.step(STEP, inp)
+
+        screen = self.screen
+        self.cam.update(dt, self.ghost.ship)
+        screen.fill(BG)
+        for x, y, r in self.stars:
+            sx = (x - self.cam.pos.x * 0.2) % WIDTH
+            sy = (y - self.cam.pos.y * 0.2) % HEIGHT
+            pygame.draw.circle(screen, STAR_COLOR, (sx, sy), r)
+
+        pos = self.snap_buf.positions_at(self.sim_time - INTERP_DELAY)
+        if pos is None:
+            # Not enough snapshots yet to interpolate the remote entities.
+            return None
+
+        for (x, y) in pos['asteroids']:
+            self._draw_remote_rock(screen, x, y)
+        for (x, y) in pos['enemies']:
+            self._draw_remote_enemy(screen, x, y)
+
+        # The LOCAL ship, from the ghost (its own flame_mags render).
+        self.ghost.ship.draw(screen, self.cam,
+                             self.ghost.ship.pos, self.ghost.ship.angle)
 
         draw_hud(screen, self.font, self.enemies, self.ship)
         return pos

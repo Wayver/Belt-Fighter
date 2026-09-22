@@ -8,7 +8,7 @@ Headless: sets SDL_VIDEODRIVER=dummy before pygame.init(), so no window
 opens. The SDL dummy-driver boilerplate, Keys, and script_input are copied
 from test_snapshot.py so the input pattern is identical.
 
-Four proofs:
+Five proofs:
 
   a. INTERPOLATION — interp_positions() (netcode.py) is a pure function of
      two Game snapshots, with ID-BASED entity matching (Session 5b-1):
@@ -48,6 +48,26 @@ Four proofs:
      extrapolation bug shows up as a jump far beyond the sim's real
      motion. The ship is the probe: always present, no id matching
      needed, a clean signal while rocks/enemies churn.
+
+  e. PREDICTION — the local-ship ghost (netcode.PredictedShip, wired into
+     Game in Session 5b.4b) tracks the authoritative ship with bounded
+     drift. The authoritative Game runs RUN_TICKS ticks with
+     script_input(t); every SNAPSHOT_INTERVAL ticks the ghost is reconciled
+     to the sim's snapshot (via the 5b.4b push_snapshot seam), and between
+     reconciles the ghost is stepped with the same input as the sim. Two
+     bounds:
+       1. NO-TELEPORT — the ghost's per-frame ship displacement never
+          exceeds the sim's OWN peak (+1e-3). (Flagged risk: the ghost is
+          never browned out by weapon power draw, so it can move slightly
+          faster than the sim; the bound is against the sim's PEAK, not the
+          per-tick value, so a small excess is expected. Fallback if too
+          tight: loosen to sim_peak * (1 + small) + eps.)
+       2. DRIFT — after each reconcile, the ghost is within
+          sim_peak * SNAPSHOT_INTERVAL + eps of the authoritative ship.
+     The "ship actually moved" guard (max_auth above a floor) prevents the
+     vacuous never-moved case. The max drift is REPORTED (not required to
+     be non-zero — a zero-drift result is a legitimate pass, per the pinned
+     decision).
 """
 import math
 import os
@@ -62,6 +82,7 @@ from .game import Game, STEP
 from .ai_enemy import AIEnemy
 from .asteroid import Asteroid
 from .netcode import interp_positions, SnapshotBuffer
+from .intent import ShipInput
 
 WARMUP = 300   # ticks before the first pair of snapshots (sim is hot)
 K = 6          # ticks between snap_prev and snap_curr = one snapshot
@@ -153,11 +174,12 @@ SYNCED_NAMES = ["ship pos/vel/angle", "enemy pos", "asteroid pos", "rng_state"]
 
 
 def snap_positions(s):
-    """The (x, y) positions a Game snapshot implies for the ship, each
-    enemy, and each asteroid — the oracle interp_positions is checked
-    against. Mirrors the layout documented in netcode.py."""
+    """The (x, y) positions a Game snapshot implies for each player ship,
+    each enemy, and each asteroid — the oracle interp_positions is checked
+    against. Mirrors the layout documented in netcode.py (Session 6.1:
+    index 0 is a tuple of per-player ship snapshots)."""
     return {
-        'ship': (s[0][0], s[0][1]),
+        'ships': [(p[0], p[1]) for p in s[0]],
         'enemies': [(e_s[0][0], e_s[0][1]) for _tag, e_s in s[1]],
         'asteroids': [(a_s[1], a_s[2]) for a_s in s[5]],
     }
@@ -202,9 +224,13 @@ def id_oracle(prev_s, curr_s, alpha):
 
     prev_e = {_eid(t[1]): (t[1][0][0], t[1][0][1]) for t in prev_s[1]}
     prev_r = {_akey(t): (t[1], t[2]) for t in prev_s[5]}
+    # Player ships are matched by INDEX (Session 6.1) — ships don't turn
+    # over, so slot i of curr_s[0] is the same ship as slot i of prev_s[0].
+    prev_ships = {i: (p[0], p[1]) for i, p in enumerate(prev_s[0])}
 
     return {
-        'ship': mix((prev_s[0][0], prev_s[0][1]), (curr_s[0][0], curr_s[0][1])),
+        'ships': [mix(prev_ships.get(i), (c[0], c[1]))
+                  for i, c in enumerate(curr_s[0])],
         'enemies': [mix(prev_e.get(_eid(t[1])), (t[1][0][0], t[1][0][1]))
                     for t in curr_s[1]],
         'asteroids': [mix(prev_r.get(_akey(t)), (t[1], t[2]))
@@ -222,18 +248,16 @@ def check_positions(label, got, want):
     """Compare interp_positions output against the oracle. Returns True if
     identical; on mismatch prints which entity/field differs."""
     ok = True
-    for key in ('ship', 'enemies', 'asteroids'):
-        g_list = [got[key]] if key == 'ship' else got[key]
-        w_list = [want[key]] if key == 'ship' else want[key]
-        if len(g_list) != len(w_list):
-            print(f"FAIL: {label} — {key}: {len(g_list)} entries, "
-                  f"want {len(w_list)}")
+    for key in ('ships', 'enemies', 'asteroids'):
+        if len(got[key]) != len(want[key]):
+            print(f"FAIL: {label} — {key}: {len(got[key])} entries, "
+                  f"want {len(want[key])}")
             ok = False
             continue
-        for i, (gp, wp) in enumerate(zip(g_list, w_list)):
+        for i, (gp, wp) in enumerate(zip(got[key], want[key])):
             if gp != wp:
-                name = key if key == 'ship' else f"{key}[{i}]"
-                print(f"FAIL: {label} — {name} differs: got {gp}, want {wp}")
+                print(f"FAIL: {label} — {key}[{i}] differs: "
+                      f"got {gp}, want {wp}")
                 ok = False
     return ok
 
@@ -404,7 +428,12 @@ def main():
     Asteroid._next_id = 1
     d = Game(screen, font, big_font, light_tex, fog_surf, light_surf,
              seed=SEED)
-    buf = SnapshotBuffer()
+    # max_snapshots=200: the default cap of 8 would truncate the buffer to
+    # the last 8 snaps (sim time 9.2-9.9) by the time the sweep runs, and
+    # the sweep would then sit on the "before the first snapshot" clamp
+    # for most of its frames — a 0.0px constant, not a real interpolation
+    # check. 200 holds all 100 snaps so the sweep spans the full 10 s.
+    buf = SnapshotBuffer(max_snapshots=200)
     ship_track = []
     snap_times = []
     for t in range(RUN_TICKS):
@@ -431,7 +460,7 @@ def main():
             print(f"FAIL: no-teleport — positions_at returned None at "
                   f"render_t={INTERP_DELAY + i * STEP}")
             break
-        render_track.append(P['ship'])
+        render_track.append(P['ships'][0])
     else:
         max_buf = _disp_track(render_track)
         if len(render_track) < 30:
@@ -447,6 +476,90 @@ def main():
             print(f"FAIL: no-teleport — buffer ship disp {max_buf:.3f}px "
                   f"exceeds the sim's own peak {max_auth:.3f}px (+1e-3): "
                   f"the remote render teleported")
+
+    # --- (e) prediction: the local-ship ghost (netcode.PredictedShip,
+    # wired into Game in Session 5b.4b) tracks the authoritative ship with
+    # bounded drift. The authoritative Game runs RUN_TICKS ticks with
+    # script_input(t); every SNAPSHOT_INTERVAL ticks the ghost is
+    # reconciled to the sim's snapshot (via the 5b.4b push_snapshot seam,
+    # which also feeds the interpolation buffer), and between reconciles
+    # the ghost is stepped with the SAME input as the sim. Two bounds:
+    #   1. NO-TELEPORT — the ghost's per-frame ship displacement never
+    #      exceeds the sim's OWN peak (+1e-3). Flagged risk: the ghost is
+    #      never browned out by weapon power draw, so it can move slightly
+    #      faster than the sim; the bound is against the sim's PEAK, not
+    #      the per-tick value, so a small excess is expected.
+    #   2. DRIFT — after each reconcile, the ghost is within
+    #      sim_peak * SNAPSHOT_INTERVAL + eps of the authoritative ship.
+    # The "ship actually moved" guard (max_auth above a floor) prevents
+    # the vacuous never-moved case. The max drift is REPORTED, not
+    # required to be non-zero (a zero-drift result is a legitimate pass).
+    AIEnemy._next_id = 1
+    Asteroid._next_id = 1
+    e = Game(screen, font, big_font, light_tex, fog_surf, light_surf,
+             seed=SEED)
+    ship_track = []
+    ghost_step_disp = []
+    max_drift = 0.0
+    for t in range(RUN_TICKS):
+        if t % SNAPSHOT_INTERVAL == 0:
+            # Drift at this reconcile: how far the ghost is from the
+            # authoritative ship BEFORE the reconcile snaps it back.
+            # (At t=0 the ghost is not seeded yet — nothing to measure.)
+            if e.ghost.seeded:
+                max_drift = max(max_drift, math.hypot(
+                    e.ghost.ship.pos.x - e.ship.pos.x,
+                    e.ghost.ship.pos.y - e.ship.pos.y))
+            e.push_snapshot(t * STEP, e.snapshot())
+        ship_track.append((e.ship.pos.x, e.ship.pos.y))
+        if t < RUN_TICKS - 1:
+            keys = script_input(t)
+            e.update(STEP, keys)
+            # The ghost takes a ShipInput (not raw keys) — Game.update and
+            # predicted_view both derive one via ShipInput.from_keys, so do
+            # the same here to give the ghost the SAME input as the sim.
+            # Measure the ghost's INTEGRATION displacement (the step), not
+            # the reconcile snap: the snap is a correction (bounded by the
+            # drift check below), not the ghost's motion. Measuring the
+            # recorded-position difference would count the snap as a
+            # "per-frame displacement" and false-positive the no-teleport
+            # bound.
+            before = (e.ghost.ship.pos.x, e.ghost.ship.pos.y)
+            e.ghost.step(STEP, ShipInput.from_keys(keys))
+            after = (e.ghost.ship.pos.x, e.ghost.ship.pos.y)
+            ghost_step_disp.append(math.hypot(after[0] - before[0],
+                                              after[1] - before[1]))
+
+    max_auth = _disp_track(ship_track)
+    if max_auth < 1.0:
+        ok = False
+        print(f"FAIL: prediction — the ship barely moved (max per-frame "
+              f"disp {max_auth:.3f}px < 1.0px); the drift/no-teleport "
+              f"checks would be vacuous. Pick a seed/input that moves.")
+    else:
+        max_ghost = max(ghost_step_disp)
+        drift_bound = max_auth * SNAPSHOT_INTERVAL + 1e-3
+        if max_ghost <= max_auth + 1e-3:
+            print(f"PASS: prediction no-teleport — {len(ghost_step_disp)} "
+                  f"steps, max ghost disp {max_ghost:.3f}px <= sim peak "
+                  f"{max_auth:.3f}px (+1e-3)")
+        else:
+            ok = False
+            print(f"FAIL: prediction no-teleport — ghost ship disp "
+                  f"{max_ghost:.3f}px exceeds the sim's own peak "
+                  f"{max_auth:.3f}px (+1e-3): the predicted ship "
+                  f"teleported (flagged risk — loosen the bound if the "
+                  f"ghost's full-thrust allocation is the cause)")
+        if max_drift <= drift_bound:
+            print(f"PASS: prediction drift — max ghost drift "
+                  f"{max_drift:.3f}px <= sim peak x interval "
+                  f"{drift_bound:.3f}px (reported, not required non-zero)")
+        else:
+            ok = False
+            print(f"FAIL: prediction drift — max ghost drift "
+                  f"{max_drift:.3f}px exceeds sim peak x interval "
+                  f"{drift_bound:.3f}px: the reconcile is not bounding "
+                  f"the prediction")
 
     print(f"PASS: cadence knobs — SNAPSHOT_INTERVAL={SNAPSHOT_INTERVAL} "
           f"ticks, INTERP_DELAY={INTERP_DELAY}s")

@@ -1080,8 +1080,15 @@ class Game:
         timestep, and the ghost's ship is drawn at its own (predicted)
         position. Remote entities (enemies, asteroids) still come from the
         interpolation buffer at sim_time - INTERP_DELAY, exactly as
-        remote_view does. The buffer's 'ship' entry is NOT drawn — it IS
-        the local ship, now predicted.
+        remote_view does. The buffer's 'ships' entry is drawn for every
+        player EXCEPT the local one (Session 6.6: the remote ship in 2P);
+        the local ship's buffer entry is NOT drawn — it IS the local ship,
+        now predicted.
+
+        The HUD reads the ghost ship (the local player's power/shield/vel)
+        and the buffer's enemy count — self.ship (players[0]) and
+        self.enemies are the host's ship / the client's stale initial spawn
+        on a client, so they would be wrong here.
 
         The ghost is PRESENTATION-ONLY: it is never fed back into the sim
         (update() still runs on self.ship). Returns the interpolated
@@ -1112,12 +1119,25 @@ class Game:
             self._draw_remote_rock(screen, x, y)
         for (x, y) in pos['enemies']:
             self._draw_remote_enemy(screen, x, y)
+        # Remote ships (Session 6.6): every player EXCEPT the local one, from
+        # the buffer by index (Session 6.1: ships matched by index). The local
+        # ship is the ghost, drawn below — so skip it here.
+        for i, (x, y) in enumerate(pos['ships']):
+            if i == self.local_index:
+                continue
+            sx, sy = self.cam.to_screen(pygame.Vector2(x, y))
+            pygame.draw.circle(screen, (200, 210, 225), (int(sx), int(sy)), 6)
 
         # The LOCAL ship, from the ghost (its own flame_mags render).
         self.ghost.ship.draw(screen, self.cam,
                              self.ghost.ship.pos, self.ghost.ship.angle)
 
-        draw_hud(screen, self.font, self.enemies, self.ship)
+        # HUD: the LOCAL (ghost) ship's power/shield/velocity, and the real
+        # (interpolated) enemy count from the buffer. self.ship is players[0]
+        # (the HOST's ship on a client) and self.enemies is the client's stale
+        # initial spawn (the client never runs the sim), so both would be
+        # wrong here.
+        draw_hud(screen, self.font, pos['enemies'], self.ghost.ship)
         return pos
 
     def _draw_remote_rock(self, screen, x, y):

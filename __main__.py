@@ -6,7 +6,9 @@ Three modes (chosen on the menu's mode screen, Session 6.4):
            sim, apply the client's input, broadcast a snapshot every
            SNAPSHOT_INTERVAL ticks. ESC/QUIT or a client disconnect
            returns to the menu (pinned decision #8: no reconnect in v1).
-  join   — Session 6.6 (not wired yet; a notice is shown).
+  join   — Session 6.6: connect to a host, run the client sim (predict the
+           local ship, interpolate the remote entities), send input every
+           frame, push each snapshot, render via predicted_view.
 """
 import socket
 import sys
@@ -17,13 +19,16 @@ from .config import WIDTH, HEIGHT, FPS, NET_PORT, BG, SNAPSHOT_INTERVAL
 from .fog import make_light_texture
 from .game import Game, STEP
 from .menu import Menu
-from .net import (Host, do_handshake_host,
+from .net import (Host, connect, do_handshake_host, do_handshake_client,
                   serialize_hull, serialize_loadout,
                   deserialize_hull, deserialize_loadout,
-                  serialize_snapshot, deserialize_input,
+                  serialize_snapshot, deserialize_snapshot,
+                  serialize_input, deserialize_input,
                   T_INPUT, T_SNAP)
+from .netcode import PredictedShip
 from .ship import Ship
 from .sound import SoundBank
+from .intent import ShipInput
 
 
 def _lan_ip():
@@ -168,6 +173,130 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
         host.close()
 
 
+def _draw_joining(screen, font, big_font, ip, port):
+    """The client's 'connecting' screen (drawn while connect/handshake run)."""
+    screen.fill(BG)
+    title = big_font.render("CONNECTING", True, (200, 210, 225))
+    screen.blit(title, (WIDTH // 2 - title.get_width() // 2,
+                        HEIGHT // 2 - 120))
+    line1 = font.render("to  %s:%d" % (ip, port), True, (120, 200, 255))
+    screen.blit(line1, (WIDTH // 2 - line1.get_width() // 2,
+                        HEIGHT // 2 - 40))
+    hint = font.render("one moment...", True, (110, 120, 140))
+    screen.blit(hint, (WIDTH // 2 - hint.get_width() // 2,
+                       HEIGHT // 2 + 20))
+
+
+def run_client(screen, font, big_font, clock, sfx, menu, seed,
+               light_tex, fog_surf, light_surf):
+    """Join a 2P game (Session 6.6).
+
+    Phases: (1) a 'connecting' screen while the BLOCKING connect +
+    join/welcome handshake run (the socket is still blocking here); (2) build
+    the 2-ship sim — player 0 is the HOST's ship (from the welcome), player 1
+    is the client's own ship (the menu choice), local_index=1; (3) the
+    client game loop: send the local input every frame, push each received
+    snapshot into the interpolation buffer + prediction ghost, and render via
+    predicted_view (local ship = the ghost, remote entities = the buffer).
+    Returns to the caller (the menu) on ESC/QUIT or a disconnect (pinned
+    decision #8: no reconnect in v1).
+    """
+    ip, port = menu.host_ip, menu.host_port
+    _draw_joining(screen, font, big_font, ip, port)
+    pygame.display.flip()
+    try:
+        conn = connect(ip, port)
+    except OSError:
+        _notice(screen, font, big_font, clock,
+                ["COULD NOT CONNECT", "no host at %s:%d" % (ip, port)])
+        return
+
+    # The join/welcome handshake (blocking; the socket is still blocking).
+    # Returns the host's (hull, loadout) -> player 0, or (None, None) when the
+    # host goes away / the join times out.
+    wh, wl = do_handshake_client(conn, serialize_hull(menu.hull),
+                                 serialize_loadout(menu.loadout))
+    if wh is None:
+        conn.close()
+        _notice(screen, font, big_font, clock,
+                ["COULD NOT JOIN", "the host went away or took too long"])
+        return
+
+    # Build the 2-ship sim: player 0 = the host's ship (from the welcome),
+    # player 1 = the client's own ship (the menu choice). local_index=1: the
+    # prediction ghost tracks the LOCAL ship (player 1). The constructor puts
+    # `hull` in player 0, so pass the HOST's hull there and set player 1 to
+    # the client's own ship explicitly (the constructor's player-1 slot is a
+    # default-hull placeholder).
+    whull = deserialize_hull(wh)
+    wlout = deserialize_loadout(whull, wl)
+    game = Game(screen, font, big_font, light_tex, fog_surf, light_surf,
+                hull=whull, loadout=wlout,
+                seed=seed, sound=sfx, players=2, local_index=1)
+    game.set_player_ship(1, Ship(hull=menu.hull, loadout=menu.loadout))
+    # The prediction ghost must predict the LOCAL ship (player 1 = the
+    # client's own hull/loadout), not the default-hull placeholder Game
+    # builds. Rebuild it with the client's fit (same seam the host uses for
+    # its ship, but the ghost is a private presentation object).
+    game.ghost = PredictedShip(hull=menu.hull, loadout=menu.loadout)
+    # Flip the socket to non-blocking for the game loop (the handshake used a
+    # 0.05 s recv timeout; it must be cleared before the loop).
+    conn.set_nonblocking()
+
+    while True:
+        dt = min(clock.tick(FPS) / 1000.0, 0.05)
+        # Advance the client's render clock in real time. The client never
+        # runs the sim (update() is host-only), so without this sim_time would
+        # stay 0 and predicted_view would render at sim_time - INTERP_DELAY =
+        # -0.1, i.e. frozen on the first snapshot. The host's sim_time advances
+        # at real-time rate (fixed-step accumulator), and both clocks start at
+        # 0, so advancing by the real frame dt keeps the render clock in sync
+        # with the authoritative time the snapshots are stamped with — the
+        # render point (sim_time - INTERP_DELAY) then sweeps smoothly through
+        # the interpolation window instead of stuttering at 10 Hz.
+        game.sim_time += dt
+        if not game.handle_events():
+            break
+        keys = pygame.key.get_pressed()
+        # Send the local input every frame (pinned #5: the host applies the
+        # LATEST received input each tick).
+        conn.send({"type": T_INPUT, "inp": serialize_input(
+            ShipInput.from_keys(keys))})
+        # Poll the host: push each snapshot into the interpolation buffer +
+        # the prediction ghost (seed on the first, reconcile on the rest).
+        for m in conn.poll():
+            if m.get("type") == T_SNAP:
+                game.push_snapshot(m["sim_time"],
+                                   deserialize_snapshot(m["snap"]))
+        if conn.closed:
+            conn.close()
+            _notice(screen, font, big_font, clock,
+                    ["DISCONNECTED", "the host left"])
+            break
+        conn.drain_send()
+        # Render: local ship from the prediction ghost, remote entities from
+        # the interpolation buffer. None until the buffer holds a window
+        # (two snapshots) — draw a waiting state meanwhile.
+        if game.predicted_view(dt, keys) is None:
+            _draw_waiting_client(screen, font, big_font)
+        pygame.display.flip()
+    conn.close()
+
+
+def _draw_waiting_client(screen, font, big_font):
+    """The client's 'waiting for snapshots' state (before the buffer holds a
+    window to interpolate). Drawn over the cleared screen while predicted_view
+    returns None."""
+    screen.fill(BG)
+    title = big_font.render("WAITING FOR THE HOST", True, (200, 210, 225))
+    screen.blit(title, (WIDTH // 2 - title.get_width() // 2,
+                        HEIGHT // 2 - 40))
+    hint = font.render("syncing to the authoritative sim...", True,
+                       (110, 120, 140))
+    screen.blit(hint, (WIDTH // 2 - hint.get_width() // 2,
+                       HEIGHT // 2 + 20))
+
+
 def main():
     pygame.init()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
@@ -202,10 +331,9 @@ def main():
             continue          # back to the menu (pinned #8: no reconnect)
 
         if menu.mode == 'join':
-            # Session 6.6 wires the client side; until then, be honest.
-            _notice(screen, font, big_font, clock,
-                    ["JOIN GAME", "not wired yet (Session 6.6)"])
-            continue
+            run_client(screen, font, big_font, clock, sfx, menu, seed,
+                       light_tex, fog_surf, light_surf)
+            continue          # back to the menu (pinned #8: no reconnect)
 
         # --- single player (the classic path, unchanged) ---
         game = Game(screen, font, big_font, light_tex, fog_surf, light_surf,

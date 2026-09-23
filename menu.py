@@ -119,12 +119,14 @@ class Menu:
                             self.state = 'hull'
                     elif event.key == pygame.K_BACKSPACE:
                         self.join_text = self.join_text[:-1]
-                    elif event.key == pygame.K_PERIOD:
-                        self.join_text += "."
-                    elif event.key == pygame.K_COLON:
-                        self.join_text += ":"
-                    elif event.unicode and event.unicode.isprintable() \
-                            and event.unicode.isalnum():
+                    # Accept the CHARACTER PRODUCED (event.unicode), not the
+                    # physical key: K_PERIOD/K_COLON are US-layout key
+                    # positions, so on any other layout (UK/DE/FR/...) the
+                    # ':' key is physically K_SEMICOLON and never matched.
+                    # The unicode is the layout's actual output, so this
+                    # works everywhere. Whitelist: alnum (hostnames), '.', ':'.
+                    elif event.unicode and (event.unicode.isalnum()
+                                            or event.unicode in ".:"):
                         self.join_text += event.unicode
                 elif self.state == 'hull':
                     if event.key == pygame.K_ESCAPE:

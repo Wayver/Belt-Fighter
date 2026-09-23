@@ -31,6 +31,11 @@ What it proves (the 6.6 client wiring, end to end):
   * the host APPLIED the client's input (the host's player 1 — the client's
     ship — moved), proving input flowed client -> host -> sim.
   * the client's render path works (predicted_view returns a real frame).
+  * the interpolation buffer carries the remote ship's ANGLE (Session 6.8):
+    the 'ships' entries are (x, y, angle) and the angle tracks the
+    authoritative sim's angle (within the interpolation window's own
+    angular span) — this is what lets the client draw the remote hull at
+    its interpolated orientation instead of a dot.
 
 The scripted input holds W (thrust forward) on BOTH peers: the client sends
 it every frame and the host applies it to player 1, so both the client's
@@ -42,13 +47,14 @@ import os
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
+import math
 import socket
 import threading
 import time
 
 import pygame
 
-from .config import WIDTH, HEIGHT, FPS
+from .config import WIDTH, HEIGHT, FPS, INTERP_DELAY
 from .fog import make_light_texture
 from .game import Game
 from .hulls import PLAYER_HULLS, default_loadout
@@ -193,6 +199,33 @@ def main():
         # now that the ghost is seeded and the buffer holds a window.
         check("predicted_view renders a frame (non-None)",
               client.predicted_view(0.016, _KEYS) is not None)
+
+        # Session 6.8: the buffer carries the remote ship's ANGLE as well as
+        # its position, so the client can draw the remote hull at its
+        # interpolated orientation. The 'ships' entries must be (x, y, angle)
+        # 3-tuples, and the interpolated angle must track the authoritative
+        # sim's angle. The scripted input holds W only (no Q/E), so the host
+        # ship does not turn — its angle stays at spawn (-pi/2) — which makes
+        # "the client's buffer angle equals the host's angle" a clean,
+        # non-vacuous check that the angle actually flowed through the
+        # snapshot -> buffer -> interpolation path (a constant/garbage angle
+        # or a dropped field would fail).
+        P = client.snap_buf.positions_at(client.sim_time - INTERP_DELAY)
+        if P is None or not P['ships']:
+            check("buffer ships carry an angle (6.8)", False,
+                  "no window/ship to inspect")
+        else:
+            entry = P['ships'][0]
+            check("buffer ships entry is (x, y, angle)",
+                  isinstance(entry, tuple) and len(entry) == 3,
+                  "got %r" % (entry,))
+            if isinstance(entry, tuple) and len(entry) == 3:
+                da = abs((entry[2] - host.players[0].angle + math.pi)
+                         % (2 * math.pi) - math.pi)
+                check("buffer ship angle tracks the authoritative angle (6.8)",
+                      da < 0.05,
+                      "client=%.3f host=%.3f (d=%.4f rad)"
+                      % (entry[2], host.players[0].angle, da))
 
     if host is not None:
         d = host.players[1].pos.distance_to(

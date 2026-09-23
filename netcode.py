@@ -18,6 +18,12 @@ Entities are matched by IDENTITY (enemies by ship id, asteroids by rock
 id) so interpolation survives entity turnover — see `interp_positions`
 for the membership rules.
 
+Player ships carry their ANGLE too (Session 6.8): the buffer returns
+(x, y, angle) per ship, with the angle lerp'd the same way
+`Ship.sync_render` does (the wrapped delta, via `lerp_angle`), so the
+remote peer can draw the remote hull at its interpolated orientation
+instead of a dot.
+
 Snapshot layout (see Game.snapshot in game.py):
     [0] players_s tuple of one Ship.snapshot() per player (Session 6.1):
                   ship_s = pos.x=[0], pos.y=[1], vel.x=[2], vel.y=[3],
@@ -89,16 +95,24 @@ def _asteroid_key(a_s):
 
 
 def interp_positions(prev_s, curr_s, alpha):
-    """Interpolated (x, y) positions for each player ship, each enemy, and
-    each asteroid, between two Game snapshots.
+    """Interpolated poses for each player ship ((x, y, angle), Session 6.8)
+    and (x, y) positions for each enemy and each asteroid, between two
+    Game snapshots.
 
     prev_s / curr_s are the 11-tuples from Game.snapshot(); alpha in [0, 1]
     is clamped (never extrapolate into the future). Returns a plain dict —
     no pygame objects, no sim state touched:
 
-        {'ships': [(x, y), ...],
+        {'ships': [(x, y, angle), ...],
          'enemies': [(x, y), ...],
          'asteroids': [(x, y), ...]}
+
+    Ships carry their angle (Session 6.8): ship_s[4] is the RAW unbounded
+    angle (see Ship.snapshot), so it is lerp'd with `lerp_angle` — the
+    wrapped-delta lerp `Ship.sync_render` uses — never a plain lerp of the
+    raw values (which would swing the wrong way around the circle once the
+    raw angle leaves [-pi, pi]). The result stays anchored on the prev
+    angle's unwrapped offset, exactly like sync_render's rangle.
 
     Entity matching:
       - player ships by INDEX (Session 6.1): ships don't turn over — a dead
@@ -121,17 +135,19 @@ def interp_positions(prev_s, curr_s, alpha):
 
     # Player ships: matched by index (see docstring). A ship missing from
     # prev_s[0] (shouldn't happen — ships don't turn over) pops in at its
-    # curr position, same rule as new enemies/asteroids.
-    prev_ships = {i: (p[0], p[1]) for i, p in enumerate(prev_s[0])}
+    # curr pose, same rule as new enemies/asteroids. The angle is lerp'd
+    # with lerp_angle (wrapped delta), not a plain lerp — see docstring.
+    prev_ships = {i: (p[0], p[1], p[4]) for i, p in enumerate(prev_s[0])}
     ships = []
     for i, c in enumerate(curr_s[0]):
-        cp = (c[0], c[1])
+        cp = (c[0], c[1], c[4])
         pp = prev_ships.get(i)
         if pp is None:
             ships.append(cp)
         else:
             ships.append((lerp(pp[0], cp[0], a),
-                          lerp(pp[1], cp[1], a)))
+                          lerp(pp[1], cp[1], a),
+                          lerp_angle(pp[2], cp[2], a)))
 
     prev_enemies = {_enemy_id(p[1]): _enemy_pos(p[1]) for p in prev_s[1]}
     enemies = []
@@ -164,8 +180,9 @@ class SnapshotBuffer:
     The authoritative peer stamps each `Game.snapshot()` with the sim time
     it was taken at and sends it on. The remote peer pushes them here, in
     arrival order, and renders `INTERP_DELAY` seconds in the PAST: it asks
-    `positions_at(sim_time - INTERP_DELAY)` for the interpolated (x, y) of
-    the ship, each enemy, and each asteroid.
+    `positions_at(sim_time - INTERP_DELAY)` for the interpolated pose
+    (x, y, angle) of each ship (Session 6.8) and the (x, y) of each enemy
+    and each asteroid.
 
     Why the delay: a snapshot taken at sim time T is only usable once it has
     ARRIVED, which is at least one round-trip later. Rendering at
@@ -206,10 +223,10 @@ class SnapshotBuffer:
         """Interpolated positions at render time `render_t`.
 
         Returns the same dict shape as `interp_positions`
-        ({'ships': [(x, y), ...], 'enemies': [...], 'asteroids': [...]})
-        or None
-        when there is not yet a window to interpolate between (fewer than
-        two snapshots, or render_t before the first snapshot).
+        ({'ships': [(x, y, angle), ...], 'enemies': [(x, y), ...],
+        'asteroids': [(x, y), ...]}) or None when there is not yet a
+        window to interpolate between (fewer than two snapshots, or
+        render_t before the first snapshot).
 
         The window is the two snapshots that BRACKET render_t: the newest
         snapshot at or before render_t is `prev`, the next one is `curr`,

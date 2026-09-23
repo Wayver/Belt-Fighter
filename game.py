@@ -1051,9 +1051,12 @@ class Game:
         for (x, y) in pos['enemies']:
             self._draw_remote_enemy(screen, x, y)
         # All player ships (Session 6.1): the buffer's 'ships' list, by index.
-        for (x, y) in pos['ships']:
-            sx, sy = self.cam.to_screen(pygame.Vector2(x, y))
-            pygame.draw.circle(screen, (200, 210, 225), (int(sx), int(sy)), 6)
+        # Session 6.8: each is drawn as its REAL hull at the interpolated
+        # (pos, angle) — the buffer lerps the angle with lerp_angle —
+        # instead of a dot.
+        for i, (x, y, ang) in enumerate(pos['ships']):
+            self.players[i].draw(screen, self.cam,
+                                 pygame.Vector2(x, y), ang)
 
         draw_hud(screen, self.font, self.enemies, self.ship)
         return pos
@@ -1081,7 +1084,8 @@ class Game:
         position. Remote entities (enemies, asteroids) still come from the
         interpolation buffer at sim_time - INTERP_DELAY, exactly as
         remote_view does. The buffer's 'ships' entry is drawn for every
-        player EXCEPT the local one (Session 6.6: the remote ship in 2P);
+        player EXCEPT the local one (Session 6.6: the remote ship in 2P;
+        Session 6.8: as its real hull at the interpolated (pos, angle));
         the local ship's buffer entry is NOT drawn — it IS the local ship,
         now predicted.
 
@@ -1119,14 +1123,19 @@ class Game:
             self._draw_remote_rock(screen, x, y)
         for (x, y) in pos['enemies']:
             self._draw_remote_enemy(screen, x, y)
-        # Remote ships (Session 6.6): every player EXCEPT the local one, from
-        # the buffer by index (Session 6.1: ships matched by index). The local
-        # ship is the ghost, drawn below — so skip it here.
-        for i, (x, y) in enumerate(pos['ships']):
+        # Remote ships (Session 6.6, hulls drawn in 6.8): every player
+        # EXCEPT the local one, from the buffer by index (Session 6.1:
+        # ships matched by index). The local ship is the ghost, drawn
+        # below — so skip it here. Each is drawn as its REAL hull at the
+        # interpolated (pos, angle) (the buffer lerps the angle with
+        # lerp_angle, Session 6.8) — the remote peer knows the remote
+        # hull from the join/welcome handshake, so self.players[i] IS
+        # the remote ship's hull/loadout.
+        for i, (x, y, ang) in enumerate(pos['ships']):
             if i == self.local_index:
                 continue
-            sx, sy = self.cam.to_screen(pygame.Vector2(x, y))
-            pygame.draw.circle(screen, (200, 210, 225), (int(sx), int(sy)), 6)
+            self.players[i].draw(screen, self.cam,
+                                 pygame.Vector2(x, y), ang)
 
         # The LOCAL ship, from the ghost (its own flame_mags render).
         self.ghost.ship.draw(screen, self.cam,

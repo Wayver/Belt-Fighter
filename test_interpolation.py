@@ -68,6 +68,17 @@ Five proofs:
      vacuous never-moved case. The max drift is REPORTED (not required to
      be non-zero — a zero-drift result is a legitimate pass, per the pinned
      decision).
+
+  f. SHIP ANGLE (Session 6.8) — the buffer now carries the ship's ANGLE as
+     well as its position, so the remote peer can draw the remote hull at
+     its interpolated orientation. The alpha battery (a) and the turnover
+     battery (c) already check the angle against the independent oracle
+     (wrapped-delta lerp, endpoint exactness). This part adds the
+     no-teleport bound for the ANGLE itself: a full 360-degree spin in one
+     render frame would read as a "teleport" of the hull's orientation, so
+     the buffer's per-frame angle change is bounded by the sim's OWN peak
+     per-frame angle change (+1e-3 rad). The scripted input turns in 0.5 s
+     bursts (Q/E cycles), so the ship does spin — the check is not vacuous.
 """
 import math
 import os
@@ -174,12 +185,13 @@ SYNCED_NAMES = ["ship pos/vel/angle", "enemy pos", "asteroid pos", "rng_state"]
 
 
 def snap_positions(s):
-    """The (x, y) positions a Game snapshot implies for each player ship,
-    each enemy, and each asteroid — the oracle interp_positions is checked
-    against. Mirrors the layout documented in netcode.py (Session 6.1:
-    index 0 is a tuple of per-player ship snapshots)."""
+    """The (x, y, angle) pose a Game snapshot implies for each player ship,
+    plus the (x, y) of each enemy and each asteroid — the oracle
+    interp_positions is checked against. Mirrors the layout documented in
+    netcode.py (Session 6.1: index 0 is a tuple of per-player ship
+    snapshots; Session 6.8: ships carry their raw angle, ship_s[4])."""
     return {
-        'ships': [(p[0], p[1]) for p in s[0]],
+        'ships': [(p[0], p[1], p[4]) for p in s[0]],
         'enemies': [(e_s[0][0], e_s[0][1]) for _tag, e_s in s[1]],
         'asteroids': [(a_s[1], a_s[2]) for a_s in s[5]],
     }
@@ -205,6 +217,12 @@ def id_oracle(prev_s, curr_s, alpha):
     entity lerped from its prev_s twin when one exists, else its curr
     position (a new entity pops in). Written independently of netcode.
 
+    Ships carry their pose (x, y, angle) (Session 6.8): the position is
+    lerped linearly and the angle is lerped by its WRAPPED delta — the
+    same rule Ship.sync_render and netcode.lerp_angle use, written
+    independently here (the sim's raw angle is unbounded, so a plain lerp
+    of the raw values would swing the wrong way around the circle).
+
     Endpoint EXACTNESS is part of the spec (see netcode.lerp's docstring
     and the 5a run-2 fix): at alpha=0/1 the render must sit exactly on the
     snapshot, not 1 ulp off. So the oracle returns the raw snapshot value
@@ -222,14 +240,29 @@ def id_oracle(prev_s, curr_s, alpha):
             return cp
         return (pp[0] + (cp[0] - pp[0]) * a, pp[1] + (cp[1] - pp[1]) * a)
 
+    def mix_pose(pp, cp):
+        # (x, y, angle): same endpoint rules as mix; the angle takes the
+        # wrapped delta da in [-pi, pi] and lerps pp[2] -> pp[2] + da*a.
+        if a == 0.0:
+            return cp if pp is None else pp
+        if a == 1.0:
+            return cp
+        if pp is None:
+            return cp
+        da = (cp[2] - pp[2] + math.pi) % (2 * math.pi) - math.pi
+        return (pp[0] + (cp[0] - pp[0]) * a,
+                pp[1] + (cp[1] - pp[1]) * a,
+                pp[2] + da * a)
+
     prev_e = {_eid(t[1]): (t[1][0][0], t[1][0][1]) for t in prev_s[1]}
     prev_r = {_akey(t): (t[1], t[2]) for t in prev_s[5]}
     # Player ships are matched by INDEX (Session 6.1) — ships don't turn
     # over, so slot i of curr_s[0] is the same ship as slot i of prev_s[0].
-    prev_ships = {i: (p[0], p[1]) for i, p in enumerate(prev_s[0])}
+    # Pose = (x, y, raw angle) (Session 6.8).
+    prev_ships = {i: (p[0], p[1], p[4]) for i, p in enumerate(prev_s[0])}
 
     return {
-        'ships': [mix(prev_ships.get(i), (c[0], c[1]))
+        'ships': [mix_pose(prev_ships.get(i), (c[0], c[1], c[4]))
                   for i, c in enumerate(curr_s[0])],
         'enemies': [mix(prev_e.get(_eid(t[1])), (t[1][0][0], t[1][0][1]))
                     for t in curr_s[1]],
@@ -460,7 +493,8 @@ def main():
             print(f"FAIL: no-teleport — positions_at returned None at "
                   f"render_t={INTERP_DELAY + i * STEP}")
             break
-        render_track.append(P['ships'][0])
+        # Position only (Session 6.8: the ships entry is (x, y, angle)).
+        render_track.append(P['ships'][0][:2])
     else:
         max_buf = _disp_track(render_track)
         if len(render_track) < 30:
@@ -560,6 +594,77 @@ def main():
                   f"{max_drift:.3f}px exceeds sim peak x interval "
                   f"{drift_bound:.3f}px: the reconcile is not bounding "
                   f"the prediction")
+
+    # --- (f) ship angle (Session 6.8): the buffer carries the ship's
+    # angle as well as its position. The alpha/turnover batteries above
+    # already check the ANGLE against the independent oracle (wrapped-
+    # delta lerp, endpoint exactness); this part adds the no-teleport
+    # bound for the angle itself: the buffer's per-frame angle change
+    # must never exceed the sim's OWN peak per-frame angle change
+    # (+1e-3 rad). A bug that lerps the raw angles without wrapping (or
+    # drops the angle and falls back to a constant) would spin the
+    # rendered hull wildly and fail here. The scripted input turns in
+    # 0.5 s bursts (Q/E cycles), so the ship does spin — a max sim turn
+    # of 0 would make the check vacuous, so assert a floor.
+    AIEnemy._next_id = 1
+    Asteroid._next_id = 1
+    f = Game(screen, font, big_font, light_tex, fog_surf, light_surf,
+             seed=SEED)
+    buf = SnapshotBuffer(max_snapshots=200)
+    ship_track = []
+    angle_track = []
+    snap_times = []
+    for t in range(RUN_TICKS):
+        if t % SNAPSHOT_INTERVAL == 0:
+            buf.push(t * STEP, f.snapshot())
+            snap_times.append(t * STEP)
+        ship_track.append((f.ship.pos.x, f.ship.pos.y))
+        angle_track.append(f.ship.angle)
+        if t < RUN_TICKS - 1:
+            f.update(STEP, script_input(t))
+
+    def _turn_track(track):
+        """Max per-frame (wrapped) angle change along an angle track."""
+        return max(abs((track[i + 1] - track[i] + math.pi)
+                       % (2 * math.pi) - math.pi)
+                   for i in range(len(track) - 1))
+
+    max_auth_turn = _turn_track(angle_track)
+    if max_auth_turn < 0.01:
+        ok = False
+        print(f"FAIL: ship angle — the ship barely turned (max per-frame "
+              f"turn {max_auth_turn:.4f} rad < 0.01); the angle "
+              f"no-teleport check would be vacuous. Pick a seed/input "
+              f"that turns.")
+    else:
+        n = round((snap_times[-1] - INTERP_DELAY) / STEP)
+        render_angles = []
+        for i in range(n + 1):
+            P = buf.positions_at(INTERP_DELAY + i * STEP)
+            if P is None:
+                ok = False
+                print(f"FAIL: ship angle — positions_at returned None at "
+                      f"render_t={INTERP_DELAY + i * STEP}")
+                break
+            render_angles.append(P['ships'][0][2])
+        else:
+            max_buf_turn = _turn_track(render_angles)
+            if len(render_angles) < 30:
+                ok = False
+                print(f"FAIL: ship angle — only {len(render_angles)} "
+                      f"render frames in the sweep; the check would be "
+                      f"vacuous")
+            elif max_buf_turn <= max_auth_turn + 1e-3:
+                print(f"PASS: ship angle no-teleport — "
+                      f"{len(render_angles)} render frames, max buffer "
+                      f"turn {max_buf_turn:.4f} rad <= sim peak "
+                      f"{max_auth_turn:.4f} rad (+1e-3)")
+            else:
+                ok = False
+                print(f"FAIL: ship angle — buffer turn "
+                      f"{max_buf_turn:.4f} rad exceeds the sim's own peak "
+                      f"{max_auth_turn:.4f} rad (+1e-3): the remote hull "
+                      f"orientation teleported")
 
     print(f"PASS: cadence knobs — SNAPSHOT_INTERVAL={SNAPSHOT_INTERVAL} "
           f"ticks, INTERP_DELAY={INTERP_DELAY}s")

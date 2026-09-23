@@ -39,6 +39,12 @@ What it proves (the 6.6 client wiring, end to end):
     authoritative sim's angle (within the interpolation window's own
     angular span) — this is what lets the client draw the remote hull at
     its interpolated orientation instead of a dot.
+  * the buffer carries FULL REMOTE RENDERING data (Session 7.2):
+    'enemies' entries are (tag, x, y, angle, vx, vy, id) with the angle
+    tracking the authoritative sim (the D4 fix — real enemy hulls, not
+    dots), and a 'bullets' key holds (x, y, vx, vy, kind, owner, boost)
+    entries for every projectile (the D3 fix — the client rendered no
+    bullets at all).
 
 The scripted input holds W (thrust forward) on BOTH peers: the client sends
 it every frame and the host applies it to player 1, so both the client's
@@ -57,7 +63,7 @@ import time
 
 import pygame
 
-from .config import WIDTH, HEIGHT, FPS, INTERP_DELAY
+from .config import WIDTH, HEIGHT, FPS, INTERP_DELAY, ROT_SPEED
 from .fog import make_light_texture
 from .game import Game
 from .hulls import PLAYER_HULLS, default_loadout
@@ -241,6 +247,117 @@ def main():
                       da < 0.05,
                       "client=%.3f host=%.3f (d=%.4f rad)"
                       % (entry[2], host.players[0].angle, da))
+
+        # Session 7.2: the buffer carries what the client needs to draw
+        # REAL remote enemies (tag, angle, vel, id — the D4 defect) and
+        # ALL projectiles (the D3 defect — the client rendered no bullets
+        # at all). The scripted input holds W only, so neither player
+        # fires; the host's AI enemies do, so 'enemy'-kind bullets are the
+        # ones that must appear (a non-vacuous check that the snapshot's
+        # projectile indices 2/3/4 actually flow through the buffer).
+        if P is not None:
+            check("buffer has a 'bullets' key (7.2)",
+                  'bullets' in P, "keys=%r" % (sorted(P.keys()),))
+            kinds = set()
+            shapes_ok = True
+            for b in P.get('bullets', ()):
+                if not (isinstance(b, tuple) and len(b) == 7):
+                    shapes_ok = False
+                    break
+                kinds.add(b[4])
+            check("buffer bullet entries are (x, y, vx, vy, kind, owner, boost)",
+                  shapes_ok, "n=%d" % len(P.get('bullets', ())))
+            check("buffer carries >=1 enemy bullet (7.2, D3)",
+                  'enemy' in kinds, "kinds=%r" % (sorted(kinds),))
+            e_shape_ok = True
+            tags = set()
+            for e in P.get('enemies', ()):
+                if not (isinstance(e, tuple) and len(e) == 7):
+                    e_shape_ok = False
+                    break
+                tags.add(e[0])
+            check("buffer enemy entries are (tag, x, y, angle, vx, vy, id) (7.2)",
+                  e_shape_ok, "n=%d" % len(P.get('enemies', ())))
+            check("buffer enemy tags are real hull tags (7.2, D4)",
+                  tags <= {'ai', 'mote'}, "tags=%r" % (sorted(tags),))
+            # The enemy ANGLE must track the authoritative sim's angle. Two
+            # deterministic checks (a raw "buffer angle vs host NOW" bound
+            # is flaky: the AI steers at the ship's ROT_SPEED = 3.6 rad/s, so
+            # the ~0.2 s between the render point and the host's current
+            # state is up to ~0.7 rad of legitimate lag):
+            #   (1) FRESHNESS — the NEWEST snapshot's enemy angle is
+            #       fresh against the host's FINAL angle. The host keeps
+            #       stepping after its last snapshot until the QUIT event
+            #       is processed (up to SNAPSHOT_INTERVAL-1 ticks plus a
+            #       frame's worth — more under thread contention), so the
+            #       bound is EXACT: the measured gap (host.sim_time -
+            #       newest stamp) times the AI's max turn rate
+            #       (ENEMY_ROT_SPEED). A dropped/garbage angle (O(1) rad
+            #       off) still fails.
+            #   (2) IN-SPAN — the buffer's INTERPOLATED angle lies on the
+            #       wrapped arc between its bracketing snapshots' angles
+            #       (positions_at clamps to the newest snapshot in steady
+            #       state, so the span is 0 there and the buffer angle
+            #       must equal it exactly). A dropped/garbage angle or a
+            #       raw (unwrapped) lerp would leave the arc.
+            def _wda(a, b):
+                return abs((a - b + math.pi) % (2 * math.pi) - math.pi)
+            snaps = client.snap_buf._snaps
+            render_t = client.sim_time - INTERP_DELAY
+            if len(snaps) >= 2:
+                tN, sN = snaps[-1]
+                if render_t >= tN:
+                    s_prev = s_curr = sN
+                else:
+                    s_prev = s_curr = snaps[0][1]
+                    for i in range(len(snaps) - 1):
+                        ti, si = snaps[i]
+                        tj, sj = snaps[i + 1]
+                        if ti <= render_t <= tj:
+                            s_prev, s_curr = si, sj
+                            break
+                # (1) freshness of the newest snapshot's angles
+                if host is not None:
+                    live = {e.ship.id: e for e in host.enemies}
+                    worst = None
+                    for _tag, es in sN[1]:
+                        e = live.get(es[2])
+                        if e is None:
+                            continue
+                        d = _wda(es[0][4], e.ship.angle)
+                        if worst is None or d > worst:
+                            worst = d
+                    # Exact bound: the host stepped (host.sim_time - tN)
+                    # after the newest snapshot; the AI steers by feeding
+                    # the ship a full turn input, so the ship rotates at
+                    # ROT_SPEED (3.6 rad/s — the AI's max turn rate), and
+                    # the angle can have moved at most that much. (Under
+                    # thread contention the host may run several ticks
+                    # past the last snapshot before the QUIT is processed,
+                    # so a fixed constant is flaky.)
+                    gap = max(0.0, host.sim_time - tN)
+                    bound = ROT_SPEED * gap + 1e-3
+                    check("newest snapshot enemy angle is fresh vs host (7.2)",
+                          worst is not None and worst < bound,
+                          "worst d=%.4f rad (bound %.4f, gap %.3f s)"
+                          % (worst if worst is not None else -1,
+                             bound, gap))
+                # (2) the buffer angle lies on the bracketing arc
+                prev_ang = {es[2]: es[0][4] for _tag, es in s_prev[1]}
+                curr_ang = {es[2]: es[0][4] for _tag, es in s_curr[1]}
+                in_span = True
+                checked = 0
+                for (_tag, _x, _y, ang, _vx, _vy, eid) in P.get('enemies', ()):
+                    if eid not in prev_ang or eid not in curr_ang:
+                        continue
+                    checked += 1
+                    span = _wda(prev_ang[eid], curr_ang[eid])
+                    if (_wda(ang, prev_ang[eid]) > span + 1e-6
+                            or _wda(ang, curr_ang[eid]) > span + 1e-6):
+                        in_span = False
+                check("buffer enemy angle is on the bracketing arc (7.2)",
+                      checked > 0 and in_span,
+                      "checked %d enemies" % checked)
 
     if host is not None:
         d = host.players[1].pos.distance_to(

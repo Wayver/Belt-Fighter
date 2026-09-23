@@ -36,6 +36,7 @@ from .bullets import Bullet, EnemyBullet
 from .particles import burst, shield_burst
 from .spawning import spawn_enemy, make_stars, update_field, TestTarget
 from .ai_enemy import AIEnemy, MoteEnemy
+from .hulls import ENEMY_HULL, MOTE_HULL, enemy_loadout, mote_loadout
 
 from .fog import draw_fog, LightSource
 
@@ -43,9 +44,66 @@ from .hud import draw_hud, draw_game_over
 from .camera import Camera
 from .netcode import SnapshotBuffer, PredictedShip
 from .config import (INTERP_DELAY, SNAPSHOT_INTERVAL, ROCK_FILL, ROCK_EDGE,
-                    ENEMY_FILL, ENEMY_EDGE)
+                    ENEMY_FILL, ENEMY_EDGE, ENEMY_FLAME)
 
 STEP = 1 / 60   # fixed simulation timestep
+
+
+class _RemoteEnemyProxy:
+    """Presentation stand-in for drawing a remote enemy's REAL hull and
+    computing its targeting lead point (Session 7.2).
+
+    The client never runs the sim, so it has no live AIEnemy objects — but
+    the enemy hulls are FIXED on both peers by construction (ENEMY_HULL /
+    MOTE_HULL + fixed loadouts), so the client can build a stand-in that
+    owns a real Ship (to reuse Ship.draw) and exposes just enough of the
+    AIEnemy surface for the remote render: `ship` (drawn at the buffer's
+    interpolated pos/angle), `hull` (fill/edge), `pos` (set from the
+    buffer each frame), and `lead_point` (the same intercept math the host
+    uses, so the client's reticle lines up with the host's).
+
+    It deliberately does NOT subclass AIEnemy: the AIEnemy constructor
+    draws a ship id from the SHARED class counter AIEnemy._next_id, and in
+    the loopback e2e the host and client run in separate threads of one
+    process — a stand-in build racing the host's enemy spawns would
+    perturb the host's enemy-id stream. A plain object with its own Ship
+    (Ship.__init__ takes an explicit ship_id, default 0) never touches the
+    counter. It is never stepped and never fed to the sim — pure
+    presentation.
+    """
+
+    def __init__(self, hull, loadout):
+        self.hull = hull
+        self.ship = Ship(hull=hull, loadout=loadout)
+        self._acc_smooth = pygame.Vector2(0, 0)
+
+    @property
+    def pos(self):
+        return self.ship.pos
+
+    def lead_point(self, shooter_pos, bullet_speed, use_accel=True):
+        """Intercept solution — the same math as AIEnemy.lead_point, using
+        this proxy's ship pos/vel and (zero) smoothed accel. The buffer
+        does not carry the enemy's smoothed accel, so a zero accel gives a
+        constant-velocity lead: the right order of accuracy for a reticle,
+        and honest about what the proxy knows."""
+        e0 = self.ship.pos
+        v = self.ship.vel
+        a = self._acc_smooth if use_accel else pygame.Vector2(0, 0)
+        d0 = (e0 - shooter_pos).length()
+        if d0 < 1:
+            return None
+        T = d0 / bullet_speed
+        for _ in range(6):
+            eT = e0 + v * T + 0.5 * a * (T * T)
+            T_new = (eT - shooter_pos).length() / bullet_speed
+            if T_new > TARGETING_MAX_LEAD:
+                return None
+            if abs(T_new - T) < 1e-3:
+                T = T_new
+                break
+            T = T_new
+        return e0 + v * T + 0.5 * a * (T * T)
 
 
 class Game:
@@ -106,6 +164,10 @@ class Game:
         self._snap_tick = 0        # sim ticks since the last snapshot stamp
         self.snap_buf = SnapshotBuffer()
         self.ghost = PredictedShip()   # local-ship prediction ghost (5b.4b)
+        # Session 7.2: per-tag enemy-hull stand-ins for the remote render
+        # (built lazily on first use — the client only, via
+        # _get_remote_enemies; the host never draws remote enemies).
+        self._remote_enemies = None
         # Remote player's latest input (Session 6.2a): the host stores the
         # client's ShipInput here (set_remote_input) and _step applies it to
         # player 1. Empty default = no thrust/fire; single-player never sets
@@ -717,11 +779,15 @@ class Game:
             c = tuple(int(ch * (1.0 - 0.6 * t)) for ch in TARGETING_COLOR)
             pygame.draw.circle(screen, c, (int(s.x), int(s.y)), r)
 
-    def _draw_lead(self, screen, e):
-        p = e.lead_point(self.ship.pos, BULLET_SPEED, TARGETING_USE_ACCEL)
-        if p is None or (p - self.ship.pos).length() > TARGETING_RANGE:
+    def _draw_lead(self, screen, e, ship):
+        # `ship` is the LOCAL player's ship: self.ship on the host, the
+        # prediction ghost's ship on a client (Session 7.2 — the reticle
+        # must lead from where the player IS, not from the stale
+        # players[0] the client never steps).
+        p = e.lead_point(ship.pos, BULLET_SPEED, TARGETING_USE_ACCEL)
+        if p is None or (p - ship.pos).length() > TARGETING_RANGE:
             return
-        if self._lead_aligned(e, p):
+        if self._lead_aligned(e, p, ship):
             # flash green: alternate between green and the base light blue
             c = (TARGETING_COLOR_GREEN if (pygame.time.get_ticks() // 100) % 2
                  else TARGETING_COLOR)
@@ -735,11 +801,12 @@ class Game:
         pygame.draw.line(screen, c, (x - R, y), (x - gap, y), 2)
         pygame.draw.line(screen, c, (x + R, y), (x + gap, y), 2)
 
-    def _lead_aligned(self, e, p):
+    def _lead_aligned(self, e, p, ship):
         """True when the player's nose points between the reticle and the
         enemy: the facing direction lies in the angular span (plus tolerance)
-        between the direction to the reticle and the direction to the enemy."""
-        ship = self.ship
+        between the direction to the reticle and the direction to the enemy.
+        `ship` is the local player's ship (host: self.ship; client: the
+        ghost's ship — Session 7.2)."""
         to_ret = p - ship.pos
         to_en = e.pos - ship.pos
         if to_ret.length() < 1 or to_en.length() < 1:
@@ -938,7 +1005,7 @@ class Game:
         for e in self.enemies:
             e.draw(screen, self.cam)
             if TARGETING_ASSIST and self.ship.targeting_on:
-                self._draw_lead(screen, e)
+                self._draw_lead(screen, e, self.ship)
         for b in self.bullets:
             s = self.cam.to_screen(b.pos)
             pygame.draw.circle(screen, BULLET_COLOR, (int(s.x), int(s.y)), 3)
@@ -1048,8 +1115,13 @@ class Game:
         # the center is interpolated, which is what the buffer provides.
         for (x, y) in pos['asteroids']:
             self._draw_remote_rock(screen, x, y)
-        for (x, y) in pos['enemies']:
-            self._draw_remote_enemy(screen, x, y)
+        # Remote enemies as their REAL hulls (Session 7.2, the D4 fix) —
+        # the buffer carries (tag, x, y, angle, vx, vy, id).
+        for (tag, x, y, ang, vx, vy, _eid) in pos['enemies']:
+            self._draw_remote_enemy_hull(screen, tag, x, y, ang)
+        # Remote projectiles (Session 7.2, the D3 fix).
+        for (x, y, vx, vy, kind, owner, boost) in pos['bullets']:
+            self._draw_remote_bullet(screen, x, y, vx, vy, kind, boost)
         # All player ships (Session 6.1): the buffer's 'ships' list, by index.
         # Session 6.8: each is drawn as its REAL hull at the interpolated
         # (pos, angle) — the buffer lerps the angle with lerp_angle —
@@ -1132,8 +1204,17 @@ class Game:
 
         for (x, y) in pos['asteroids']:
             self._draw_remote_rock(screen, x, y)
-        for (x, y) in pos['enemies']:
-            self._draw_remote_enemy(screen, x, y)
+        # Remote enemies as their REAL hulls (Session 7.2, the D4 fix):
+        # the buffer carries (tag, x, y, angle, vx, vy); the angle is
+        # lerp'd with lerp_angle (the same wrapped-delta rule as player
+        # ships, 6.8) and the hull is fixed on both peers by
+        # construction, so the stand-in per tag draws it faithfully.
+        for (tag, x, y, ang, vx, vy, _eid) in pos['enemies']:
+            self._draw_remote_enemy_hull(screen, tag, x, y, ang)
+        # Remote projectiles (Session 7.2, the D3 fix): every bullet and
+        # missile in the buffer, at its interpolated position.
+        for (x, y, vx, vy, kind, owner, boost) in pos['bullets']:
+            self._draw_remote_bullet(screen, x, y, vx, vy, kind, boost)
         # Remote ships (Session 6.6, hulls drawn in 6.8): every player
         # EXCEPT the local one, from the buffer by index (Session 6.1:
         # ships matched by index). The local ship is the ghost, drawn
@@ -1152,6 +1233,35 @@ class Game:
         self.ghost.ship.draw(screen, self.cam,
                              self.ghost.ship.pos, self.ghost.ship.angle)
 
+        # Targeting reticle (Session 7.2): the client has no enemy list
+        # to target (it never runs the sim), so build lightweight proxies
+        # from the buffer's enemy entries (pos + vel from the
+        # interpolated data) and run the SAME lead math the host uses.
+        # The reticle leads from the GHOST (where the player is), not
+        # from the stale players[0]. The proxies are also the fog's
+        # reticle-light sources (below), so build them once.
+        proxies = (self._targeting_proxies(pos)
+                   if TARGETING_ASSIST and self.ghost.ship.targeting_on
+                   else [])
+        for e in proxies:
+            self._draw_lead(screen, e, self.ghost.ship)
+
+        # Fog of war (Session 7.2 — predicted_view previously skipped it
+        # entirely, so fire did not glow through the dark like on the
+        # host). The light bubble follows the ghost (the local ship);
+        # the lights are the interpolated bullets/missiles plus a reticle
+        # light at each lead point (mirrors _build_lights' guard so the
+        # light and the reticle appear/disappear together).
+        lights = self._remote_fog_lights(pos, self.ghost.ship)
+        for e in proxies:
+            p = e.lead_point(self.ghost.ship.pos, BULLET_SPEED,
+                             TARGETING_USE_ACCEL)
+            if p is not None and (p - self.ghost.ship.pos).length() \
+                    <= TARGETING_RANGE:
+                lights.append(LightSource(p, 50, 0.6))
+        draw_fog(screen, self.ghost.ship, self.cam, self.light_tex,
+                 self.fog_surf, self.light_surf, lights)
+
         # HUD: the LOCAL (ghost) ship's power/shield/velocity, and the real
         # (interpolated) enemy count from the buffer. self.ship is players[0]
         # (the HOST's ship on a client) and self.enemies is the client's stale
@@ -1159,6 +1269,140 @@ class Game:
         # wrong here.
         draw_hud(screen, self.font, pos['enemies'], self.ghost.ship)
         return pos
+
+    # --- Session 7.2: full remote rendering helpers -------------------------
+    #
+    # The client renders REMOTE enemies as their REAL hulls (not 10 px
+    # dots) and ALL projectiles (bullets + missiles) from the
+    # interpolation buffer. The enemy hulls are FIXED on both peers by
+    # construction (ENEMY_HULL/MOTE_HULL + fixed loadouts — the plan's
+    # pinned decision), so the client can build a presentation stand-in
+    # per tag once and draw it at the buffer's interpolated (pos, angle).
+    # The stand-in is a real AIEnemy/MoteEnemy ONLY to reuse Ship.draw —
+    # it is never stepped, never fed to the sim, and its ship state is
+    # irrelevant (draw() takes explicit pos/angle).
+
+    def _get_remote_enemies(self):
+        """The per-tag presentation stand-ins, built lazily ONCE (the hull
+        + loadout are identical on both peers by construction, so no hull
+        data needs to cross the wire). Returns {'ai': _RemoteEnemyProxy,
+        'mote': _RemoteEnemyProxy} — 'test' targets are not drawn as
+        remote enemies (they are a single-player test-range construct,
+        never in a 2P snapshot)."""
+        if self._remote_enemies is None:
+            self._remote_enemies = self._build_remote_enemy_standins()
+        return self._remote_enemies
+
+    def _build_remote_enemy_standins(self):
+        """Build the per-tag stand-ins (see _get_remote_enemies).
+
+        Uses _RemoteEnemyProxy (a plain object owning a Ship), NOT
+        AIEnemy/MoteEnemy: the AIEnemy constructor draws a ship id from
+        the SHARED class counter AIEnemy._next_id, and in the loopback
+        e2e the host and client run in separate threads of one process —
+        a stand-in build racing the host's enemy spawns would perturb the
+        host's enemy-id stream. The proxy never touches the counter."""
+        return {
+            'ai': _RemoteEnemyProxy(ENEMY_HULL, enemy_loadout()),
+            'mote': _RemoteEnemyProxy(MOTE_HULL, mote_loadout()),
+        }
+
+    def _draw_remote_enemy_hull(self, screen, tag, x, y, ang):
+        """Draw a remote enemy as its REAL hull at the interpolated
+        (pos, angle) (Session 7.2 — replaces the 10 px dot, the D4
+        defect). The stand-in's Ship.draw takes explicit pos/angle, so
+        the stand-in's own (never-stepped) state is irrelevant."""
+        e = self._get_remote_enemies().get(tag)
+        if e is None:
+            # Unknown tag (e.g. 'test'): fall back to the coarse dot so
+            # an unexpected enemy type still renders something.
+            self._draw_remote_enemy(screen, x, y)
+            return
+        e.ship.draw(screen, self.cam, pygame.Vector2(x, y), ang,
+                    fill=e.hull.fill or ENEMY_FILL,
+                    edge=e.hull.edge or ENEMY_EDGE,
+                    flame_out=ENEMY_FLAME, flame_in=ENEMY_FLAME)
+
+    def _draw_remote_bullet(self, screen, x, y, vx, vy, kind, boost):
+        """Draw one remote projectile at its interpolated position
+        (Session 7.2 — the D3 defect: the client rendered no bullets at
+        all). Bullets are a stretched capsule along the (lerped)
+        velocity: length ~ speed * 0.016 (a 860 px/s bullet is ~14 px,
+        a 720 px/s enemy bullet ~11 px), so the streak reads as motion.
+        Missiles are drawn as on the host's draw(): body line + nose +
+        exhaust flicker from `boost` (the boost remaining, from the
+        CURRENT snapshot — it drives the flicker, not the physics)."""
+        s = self.cam.to_screen(pygame.Vector2(x, y))
+        speed = math.hypot(vx, vy)
+        if kind == 'missile':
+            fwd = pygame.Vector2(vx, vy)
+            if fwd.length_squared() < 1e-6:
+                fwd = pygame.Vector2(1, 0)
+            else:
+                fwd.normalize_ip()
+            tail = self.cam.to_screen(pygame.Vector2(x, y) - fwd * 14)
+            pygame.draw.line(screen, _dim_color(MISSILE_COLOR, 0.7),
+                             tail, s, 3)
+            pygame.draw.circle(screen, MISSILE_COLOR, (int(s.x), int(s.y)), 3)
+            if boost > 0:
+                flick = 6 * (0.5 + 0.5 * math.sin(speed * 40))
+                flame = self.cam.to_screen(pygame.Vector2(x, y)
+                                           - fwd * (14 + flick))
+                pygame.draw.line(screen, (255, 220, 120), tail, flame, 2)
+            return
+        color = BULLET_COLOR if kind == 'player' else ENEMY_BULLET_COLOR
+        if speed < 1e-6:
+            pygame.draw.circle(screen, color, (int(s.x), int(s.y)), 3)
+            return
+        fwd = pygame.Vector2(vx, vy) / speed
+        length = min(16.0, max(6.0, speed * 0.016))
+        tail = pygame.Vector2(s.x - fwd.x * length, s.y - fwd.y * length)
+        pygame.draw.line(screen, color, tail, (int(s.x), int(s.y)), 3)
+        pygame.draw.circle(screen, color, (int(s.x), int(s.y)), 2)
+
+    def _remote_fog_lights(self, pos, local_ship):
+        """LightSources for the client's fog of war (Session 7.2 —
+        predicted_view previously skipped draw_fog entirely, so fire did
+        not glow through the dark like on the host). Mirrors
+        `_build_lights` for the data the client actually has: the
+        interpolated bullets/missiles (the buffer's 'bullets' entries)
+        and the local (ghost) ship's position. The targeting-reticle
+        lights are added by the caller (they need the proxy's
+        lead_point, which the caller already computes for the reticle).
+        `local_ship` is the ghost's ship (the client's light bubble
+        follows the player, not the stale players[0])."""
+        lights = []
+        for (x, y, vx, vy, kind, owner, boost) in pos['bullets']:
+            if kind == 'player':
+                lights.append(LightSource(pygame.Vector2(x, y), 30, 0.5))
+            elif kind == 'enemy':
+                lights.append(LightSource(pygame.Vector2(x, y), 24, 0.4))
+            else:   # missile
+                lights.append(LightSource(pygame.Vector2(x, y), 30, 0.5))
+        return lights
+
+    def _targeting_proxies(self, pos):
+        """Lightweight targeting proxies from the buffer's enemy entries
+        (Session 7.2): enough of an AIEnemy for `lead_point` /
+        `_draw_lead` to work client-side. Each proxy is a real AIEnemy
+        (to reuse lead_point's math) whose ship pos/vel are set from the
+        interpolated (x, y, vx, vy) and whose _acc_smooth is zero (the
+        buffer does not carry the enemy's smoothed accel — a zero accel
+        gives a constant-velocity lead, which is the right order of
+        accuracy for a reticle and keeps the proxy honest about what it
+        knows). The proxies are rebuilt each frame from the buffer —
+        they are presentation, never stepped, never fed to the sim."""
+        proxies = []
+        standins = self._get_remote_enemies()
+        for (tag, x, y, ang, vx, vy, _eid) in pos['enemies']:
+            e = standins.get(tag)
+            if e is None:
+                continue
+            e.ship.pos = pygame.Vector2(x, y)
+            e.ship.vel = pygame.Vector2(vx, vy)
+            e._acc_smooth = pygame.Vector2(0, 0)
+            proxies.append(e)
+        return proxies
 
     def _draw_remote_rock(self, screen, x, y):
         """Draw a remote asteroid at an interpolated world position.

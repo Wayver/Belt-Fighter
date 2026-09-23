@@ -24,13 +24,29 @@ Player ships carry their ANGLE too (Session 6.8): the buffer returns
 remote peer can draw the remote hull at its interpolated orientation
 instead of a dot.
 
+Session 7.2 (full remote rendering): enemies carry their ANGLE, TAG,
+VELOCITY, and ID too — (tag, x, y, angle, vx, vy, id) — so the remote
+peer can draw each enemy as its REAL hull (the hull is fixed on both
+peers by construction: ENEMY_HULL/MOTE_HULL + fixed loadouts) at its
+interpolated orientation, build lightweight targeting proxies
+(lead_point needs pos + vel), and track a specific enemy across frames
+(by id — enemies churn, so there is no stable index like ship 0). And ALL projectiles are interpolated:
+snapshot indices 2 (player bullets), 3 (enemy bullets), 4 (missiles)
+come back under the 'bullets' key as (x, y, vx, vy, kind, owner,
+boost) entries, so the remote peer draws real bullets/missiles instead
+of nothing (the D3 defect). Projectiles are matched by PREDICTED
+POSITION, not index — see `_match_bullets` for why index matching
+(sliding lists) is wrong.
+
 Snapshot layout (see Game.snapshot in game.py):
     [0] players_s tuple of one Ship.snapshot() per player (Session 6.1):
                   ship_s = pos.x=[0], pos.y=[1], vel.x=[2], vel.y=[3],
                   angle=[4], ...
     [1] enemies_s tuple of (tag, e_s); e_s = AIEnemy.snapshot() =
                   (ship_s, hp, id, acc_x, acc_y) -> enemy pos = e_s[0][0], e_s[0][1]
-    [2] bullets_s, [3] enemy_bullets_s, [4] missiles_s   (not interpolated here)
+    [2] bullets_s, [3] enemy_bullets_s, [4] missiles_s
+                  b_s = (pos.x, pos.y, vel.x, vel.y, owner, life)
+                  m_s = (pos.x, pos.y, vel.x, vel.y, owner, life, boost, target_id)
     [5] asteroids_s  tuple of Asteroid.snapshot() =
                      (id, pos.x, pos.y, vel.x, vel.y, size, angle, spin, verts)
     [6] rng_state, [7] game_over, [8] protect_timer, [9] next_id,
@@ -70,6 +86,15 @@ def lerp_angle(a0, a1, t):
     fix), so the delta is wrapped to [-pi, pi] first; the result stays
     anchored on a0, so it inherits a0's unwrapped offset. Never lerp the
     raw angles directly."""
+    # Exact at the endpoints (same IEEE-754 rationale as lerp): a0 + da * 1.0
+    # is not always bit-identical to a1 (da rounds, then adding a0 rounds
+    # again), so the render would sit ~1 ulp off the snapshot at alpha=1 —
+    # a tiny pop every SNAPSHOT_INTERVAL (Session 7.2, caught by the
+    # turnover battery's endpoint-exactness check).
+    if t == 0.0:
+        return a0
+    if t == 1.0:
+        return a1
     da = (a1 - a0 + math.pi) % (2 * math.pi) - math.pi
     return a0 + da * t
 
@@ -204,18 +229,77 @@ def _asteroid_key(a_s):
     return a_s[0]
 
 
-def interp_positions(prev_s, curr_s, alpha):
-    """Interpolated poses for each player ship ((x, y, angle), Session 6.8)
-    and (x, y) positions for each enemy and each asteroid, between two
-    Game snapshots.
+def _match_bullets(prev_list, curr_list, dt):
+    """Match curr bullets to prev bullets by PREDICTED POSITION (Session
+    7.2). Returns a list, one entry per curr bullet: the prev twin's
+    (x, y) or None (a new bullet — pops in at its curr position, the
+    same membership rule as enemies/asteroids).
+
+    Why not match by INDEX within a kind (the 7.2 plan's original
+    assumption)? The sim's bullet lists are sliding windows: a fired
+    bullet appends, an expired one is culled from the FRONT
+    (`self.bullets = [b for b in self.bullets if b.life > 0]`), so every
+    later index slides down by one each time a bullet dies. A probe over
+    20 snapshot windows (6 ticks each, the test's script_input) found
+    ~11% of same-index pairs were NOT the same bullet — index matching
+    would lerp a bullet from a stranger's position and make it jump.
+
+    Bullets fly in straight lines (no steering — only missiles steer,
+    and they are matched with the same method), so a prev bullet's
+    position at the curr snapshot is exactly prev.pos + prev.vel * dt.
+    Each curr bullet is matched to the nearest prev bullet's predicted
+    position within MATCH_RADIUS; a prev bullet is used at most once
+    (two bullets can't occupy the same predicted spot). dt is the
+    snapshot window (t_curr - t_prev); at dt == 0 the prediction is the
+    prev position itself.
+
+    MATCH_RADIUS: a bullet moves BULLET_SPEED * dt per window (860 * 0.1
+    = 86 px at the 10 Hz cadence). The radius must exceed that (a real
+    twin is always within ~1 window of motion of its prediction) but be
+    small enough that two DIFFERENT bullets never both fall inside it of
+    each other's predictions. Bullets from the same gun fire from the
+    same muzzle ~10 px apart at 100 Hz, so they can be as close as
+    ~10 px; 30 px is well clear of that while a mis-match would require
+    two bullets' predicted positions to be within 30 px of the same curr
+    bullet — only possible for near-coincident fire, where swapping the
+    lerp pair is visually a no-op (same muzzle, same velocity).
+    """
+    MATCH_RADIUS = 30.0
+    # Predicted curr-time position of each prev bullet.
+    preds = [((p[0] + p[2] * dt, p[1] + p[3] * dt), i)
+             for i, p in enumerate(prev_list)]
+    used = set()
+    out = []
+    for c in curr_list:
+        best, best_d = None, MATCH_RADIUS
+        for (px, py), i in preds:
+            if i in used:
+                continue
+            d = math.hypot(c[0] - px, c[1] - py)
+            if d <= best_d:
+                best, best_d = i, d
+        if best is None:
+            out.append(None)          # new bullet: pops in at curr pos
+        else:
+            used.add(best)
+            out.append((prev_list[best][0], prev_list[best][1]))
+    return out
+
+
+def interp_positions(prev_s, curr_s, alpha, dt=None):
+    """Interpolated poses for each player ship ((x, y, angle), Session 6.8),
+    each enemy ((tag, x, y, angle, vx, vy, id), Session 7.2), each asteroid
+    ((x, y)), and each projectile ((x, y, vx, vy, kind, owner, boost),
+    Session 7.2), between two Game snapshots.
 
     prev_s / curr_s are the 11-tuples from Game.snapshot(); alpha in [0, 1]
     is clamped (never extrapolate into the future). Returns a plain dict —
     no pygame objects, no sim state touched:
 
         {'ships': [(x, y, angle), ...],
-         'enemies': [(x, y), ...],
-         'asteroids': [(x, y), ...]}
+         'enemies': [(tag, x, y, angle, vx, vy, id), ...],
+         'asteroids': [(x, y), ...],
+         'bullets': [(x, y, vx, vy, kind, owner, boost), ...]}
 
     Ships carry their angle (Session 6.8): ship_s[4] is the RAW unbounded
     angle (see Ship.snapshot), so it is lerp'd with `lerp_angle` — the
@@ -224,12 +308,41 @@ def interp_positions(prev_s, curr_s, alpha):
     raw angle leaves [-pi, pi]). The result stays anchored on the prev
     angle's unwrapped offset, exactly like sync_render's rangle.
 
+    Enemies carry their angle too (Session 7.2): e_s[0][4] is the enemy
+    ship's RAW angle, lerp'd with the SAME wrapped-delta rule (the plan's
+    "same wrapped-delta rule as player ships, 6.8"), so the remote peer
+    draws the real enemy hull at its interpolated orientation instead of a
+    10 px dot (the D4 defect). The TAG (the first element of the
+    (tag, e_s) pair — 'ai'/'mote'/'test') comes from the CURRENT
+    snapshot: membership already follows curr, and the tag is constant
+    for a given enemy id, so curr's tag is the right one. The VELOCITY
+    (e_s[0][2], e_s[0][3]) is taken from curr (it is presentation data
+    for the targeting proxy — lead_point needs pos + vel — and a 10 Hz
+    stale velocity is fine for a reticle). The ID (e_s[2]) is carried so
+    a caller can track a specific enemy across frames (enemies churn, so
+    there is no stable index like ship 0) — presentation only.
+
+    Projectiles (Session 7.2, the D3 defect — the client rendered no
+    bullets at all): snapshot indices 2 (player bullets), 3 (enemy
+    bullets), 4 (missiles) are all interpolated. Each entry is
+    (x, y, vx, vy, kind, owner, boost): position lerp'd between the two
+    snapshots (matched by predicted position — see `_match_bullets`),
+    velocity from curr (drives the stretched-capsule render length),
+    kind in {'player', 'enemy', 'missile'}, owner from curr (the bullet's
+    ship id — presentation only; the client never runs the sim), and
+    boost from curr (missile exhaust flicker; 0.0 for non-missiles).
+    A bullet fired mid-window pops in at its curr position (no earlier
+    position to lerp from); one that expires drops out (membership
+    follows curr — the same rule as enemies/asteroids).
+
     Entity matching:
       - player ships by INDEX (Session 6.1): ships don't turn over — a dead
         ship is game over, not a respawn — so slot i of curr_s[0] is the
         same ship as slot i of prev_s[0]. Output order is curr_s[0]'s order.
       - enemies by their ship id (e_s[2]);
-      - asteroids by their rock id (a_s[0]) — see _asteroid_key.
+      - asteroids by their rock id (a_s[0]) — see _asteroid_key;
+      - projectiles by predicted position within a kind — see
+        `_match_bullets` (index matching is wrong: the lists slide).
     Enemy/asteroid matching is by IDENTITY, not index (Session 5b-1):
     This survives entity turnover inside the window: a rock that splits,
     a sector that tops up or culls, an enemy that dies and respawns.
@@ -259,16 +372,31 @@ def interp_positions(prev_s, curr_s, alpha):
                           lerp(pp[1], cp[1], a),
                           lerp_angle(pp[2], cp[2], a)))
 
-    prev_enemies = {_enemy_id(p[1]): _enemy_pos(p[1]) for p in prev_s[1]}
+    # Enemies (Session 7.2): carry (tag, x, y, angle, vx, vy). The angle
+    # is lerp'd with lerp_angle (the same wrapped-delta rule as player
+    # ships, 6.8); the tag and velocity come from the CURRENT snapshot
+    # (membership follows curr; velocity is presentation data for the
+    # targeting proxy).
+    prev_enemies = {}
+    for _tag, p in prev_s[1]:
+        es = p[0]
+        prev_enemies[_enemy_id(p)] = (es[0], es[1], es[4])
     enemies = []
-    for _tag, c in curr_s[1]:
-        cp = _enemy_pos(c)
-        pp = prev_enemies.get(_enemy_id(c))
+    for tag, c in curr_s[1]:
+        ce = c[0]
+        cpos = (ce[0], ce[1])
+        eid = _enemy_id(c)
+        pp = prev_enemies.get(eid)
         if pp is None:
-            enemies.append(cp)
+            enemies.append((tag, cpos[0], cpos[1], ce[4], ce[2], ce[3],
+                            eid))
         else:
-            enemies.append((lerp(pp[0], cp[0], a),
-                            lerp(pp[1], cp[1], a)))
+            enemies.append((tag,
+                            lerp(pp[0], cpos[0], a),
+                            lerp(pp[1], cpos[1], a),
+                            lerp_angle(pp[2], ce[4], a),
+                            ce[2], ce[3],
+                            eid))
 
     prev_rocks = {_asteroid_key(p): (p[1], p[2]) for p in prev_s[5]}
     asteroids = []
@@ -281,7 +409,35 @@ def interp_positions(prev_s, curr_s, alpha):
             asteroids.append((lerp(pp[0], cp[0], a),
                               lerp(pp[1], cp[1], a)))
 
-    return {'ships': ships, 'enemies': enemies, 'asteroids': asteroids}
+    # Projectiles (Session 7.2): all three kinds, matched by predicted
+    # position within a kind (see _match_bullets). `dt` is the time
+    # BETWEEN the two snapshots — the span the prev bullets travel before
+    # the curr snapshot. `positions_at` passes the bracketing span it
+    # already computed (exact); a direct call (tests) falls back to the
+    # nominal snapshot cadence, which is the realistic window. The
+    # position lerp itself uses alpha (exact); dt only scales the
+    # predicted-position matching, and MATCH_RADIUS is generous enough
+    # that a slightly-off dt still matches correctly.
+    if dt is None:
+        dt = SNAPSHOT_INTERVAL * TICK
+    bullets = []
+    for kind, idx, boost_field in (("player", 2, None),
+                                   ("enemy", 3, None),
+                                   ("missile", 4, 6)):
+        prev_list = prev_s[idx]
+        curr_list = curr_s[idx]
+        matches = _match_bullets(prev_list, curr_list, dt)
+        for c, pp in zip(curr_list, matches):
+            if pp is None:
+                x, y = c[0], c[1]
+            else:
+                x = lerp(pp[0], c[0], a)
+                y = lerp(pp[1], c[1], a)
+            boost = c[boost_field] if boost_field is not None else 0.0
+            bullets.append((x, y, c[2], c[3], kind, c[4], boost))
+
+    return {'ships': ships, 'enemies': enemies, 'asteroids': asteroids,
+            'bullets': bullets}
 
 
 class SnapshotBuffer:
@@ -342,15 +498,20 @@ class SnapshotBuffer:
         """Interpolated positions at render time `render_t`.
 
         Returns the same dict shape as `interp_positions`
-        ({'ships': [(x, y, angle), ...], 'enemies': [(x, y), ...],
-        'asteroids': [(x, y), ...]}) or None when there is not yet a
-        window to interpolate between (fewer than two snapshots, or
-        render_t before the first snapshot).
+        ({'ships': [(x, y, angle), ...],
+        'enemies': [(tag, x, y, angle, vx, vy, id), ...],
+        'asteroids': [(x, y), ...],
+        'bullets': [(x, y, vx, vy, kind, owner, boost), ...]}) or None
+        when there is not yet a window to interpolate between (fewer than
+        two snapshots, or render_t before the first snapshot).
 
         The window is the two snapshots that BRACKET render_t: the newest
         snapshot at or before render_t is `prev`, the next one is `curr`,
         and alpha = (render_t - t_prev) / (t_curr - t_prev) in [0, 1].
-        render_t is clamped to the window — never extrapolate.
+        render_t is clamped to the window — never extrapolate. The
+        bracketing span (t_curr - t_prev) is passed to interp_positions as
+        `dt` so projectile predicted-position matching uses the REAL
+        window, not the nominal cadence.
         """
         n = len(self._snaps)
         if n < 2:
@@ -358,13 +519,16 @@ class SnapshotBuffer:
         t0, s0 = self._snaps[0]
         if render_t <= t0:
             # Before the first snapshot: sit exactly on it (alpha 0).
-            return interp_positions(s0, s0, 0.0)
+            # prev is curr, so the projectile window is 0 (a bullet's
+            # predicted position IS its curr position — exact match).
+            return interp_positions(s0, s0, 0.0, dt=0.0)
         tN, sN = self._snaps[-1]
         if render_t >= tN:
             # At/after the newest: sit exactly on it (alpha 1). The remote
             # render lags the sim by INTERP_DELAY, so this is the steady
-            # state between snapshots, not a look-ahead.
-            return interp_positions(sN, sN, 1.0)
+            # state between snapshots, not a look-ahead. prev is curr, so
+            # the projectile window is 0 (exact match, as above).
+            return interp_positions(sN, sN, 1.0, dt=0.0)
         # Find the bracketing pair: the newest snapshot at or before
         # render_t is prev; the one after it is curr.
         for i in range(n - 1):
@@ -373,7 +537,10 @@ class SnapshotBuffer:
             if ti <= render_t <= tj:
                 span = tj - ti
                 alpha = 0.0 if span <= 0.0 else (render_t - ti) / span
-                return interp_positions(si, sj, alpha)
+                # Pass the REAL bracketing span as the projectile window
+                # (Session 7.2): predicted-position matching needs the
+                # time the prev bullets travel before the curr snapshot.
+                return interp_positions(si, sj, alpha, dt=span)
         # Unreachable: render_t is strictly inside (t0, tN).
         return None
 

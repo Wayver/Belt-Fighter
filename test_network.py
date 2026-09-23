@@ -26,7 +26,10 @@ What it proves (the 6.6 client wiring, end to end):
   * the prediction ghost is rebuilt with the CLIENT's hull (the 6.6 fix —
     Game builds it with the default hull otherwise).
   * the client RECEIVES snapshots (the interpolation buffer fills a window)
-    and its render clock advances (the 6.6 render-clock fix).
+    and its render clock advances (the 6.6 render-clock fix) and TRACKS
+    THE HOST'S SIM CLOCK (Session 7.1: the client's sim_time is a
+    HostTimeEstimator — an affine fit of the snapshot stamps vs local
+    arrival times — not the display's wall clock).
   * the client's PREDICTION integrates its own input (the ghost ship moves).
   * the host APPLIED the client's input (the host's player 1 — the client's
     ship — moved), proving input flowed client -> host -> sim.
@@ -189,8 +192,20 @@ def main():
         check("ghost seeded (a snapshot arrived)", client.ghost.seeded)
         check("client received >=2 snapshots (buffer window)",
               len(client.snap_buf) >= 2, "n=%d" % len(client.snap_buf))
-        check("client sim_time advanced (render-clock fix)",
+        check("client sim_time advanced (render clock running)",
               client.sim_time > 0.5, "sim_time=%.3f" % client.sim_time)
+        # Session 7.1: the client's render clock is an ESTIMATE OF THE
+        # HOST'S SIM CLOCK (HostTimeEstimator), not the display's wall
+        # clock. It must track the host's sim_time closely — on loopback
+        # the two loops run under thread contention, so the host may
+        # simulate slower than real time, and the estimator's rate term
+        # must follow that (a wall-clock clock would drift away).
+        if host is not None:
+            d = abs(client.sim_time - host.sim_time)
+            check("client sim_time tracks the host's sim clock (7.1)",
+                  d < 0.25,
+                  "client=%.3f host=%.3f (d=%.3f s)"
+                  % (client.sim_time, host.sim_time, d))
         d = client.ghost.ship.pos.distance_to(
             pygame.Vector2(WIDTH / 2, HEIGHT / 2))
         check("client ghost ship moved (prediction integrates input)",

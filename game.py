@@ -1074,20 +1074,28 @@ class Game:
         self.ghost.seed(local_s) if not self.ghost.seeded \
             else self.ghost.reconcile(local_s)
 
-    def predicted_view(self, dt, keys):
+    def predicted_view(self, dt, keys, host_time=None):
         """Draw the frame with the LOCAL ship taken from the prediction
         ghost instead of the sim (client-side prediction, Session 5b.4b).
 
         Mirrors remote_view, except the local ship is the ghost: each frame
-        the ghost is stepped with the local player's input at the fixed
-        timestep, and the ghost's ship is drawn at its own (predicted)
-        position. Remote entities (enemies, asteroids) still come from the
-        interpolation buffer at sim_time - INTERP_DELAY, exactly as
-        remote_view does. The buffer's 'ships' entry is drawn for every
-        player EXCEPT the local one (Session 6.6: the remote ship in 2P;
-        Session 6.8: as its real hull at the interpolated (pos, angle));
-        the local ship's buffer entry is NOT drawn — it IS the local ship,
-        now predicted.
+        the ghost is advanced with the local player's input at the sim's
+        FIXED rate (Session 7.1: `ghost.advance(dt, inp)` — a fixed-step
+        accumulator, not one step per display frame), and the ghost's ship
+        is drawn at its own (predicted) position. Remote entities (enemies,
+        asteroids) still come from the interpolation buffer at
+        sim_time - INTERP_DELAY, exactly as remote_view does. The buffer's
+        'ships' entry is drawn for every player EXCEPT the local one
+        (Session 6.6: the remote ship in 2P; Session 6.8: as its real hull
+        at the interpolated (pos, angle)); the local ship's buffer entry is
+        NOT drawn — it IS the local ship, now predicted.
+
+        `host_time` (Session 7.1): the caller's estimate of the host's sim
+        clock (a HostTimeEstimator.now() value). When given, it becomes
+        self.sim_time — the client's render clock is the HOST's clock as
+        carried by the wire, not the display's wall clock (the 6.6
+        `sim_time += dt` was two independent clocks drifting). When None
+        (tests), the clock is left as-is.
 
         The HUD reads the ghost ship (the local player's power/shield/vel)
         and the buffer's enemy count — self.ship (players[0]) and
@@ -1103,8 +1111,11 @@ class Game:
             # from. The caller may show a waiting state.
             return None
 
+        if host_time is not None:
+            self.sim_time = host_time
+
         inp = ShipInput.from_keys(keys)
-        self.ghost.step(STEP, inp)
+        self.ghost.advance(dt, inp)
 
         screen = self.screen
         self.cam.update(dt, self.ghost.ship)

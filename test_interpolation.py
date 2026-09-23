@@ -79,6 +79,31 @@ Five proofs:
      the buffer's per-frame angle change is bounded by the sim's OWN peak
      per-frame angle change (+1e-3 rad). The scripted input turns in 0.5 s
      bursts (Q/E cycles), so the ship does spin — the check is not vacuous.
+
+  g. GHOST CLOCK (Session 7.1) — the prediction ghost must step at the
+     SIM's fixed rate, not the display's. The pre-7.1 client stepped the
+     ghost once per DISPLAY frame, so on a 144 Hz monitor it integrated
+     2.4x the sim's motion and every reconcile yanked it back (the
+     reported "spiking and snapbacking"). `PredictedShip.advance(dt, inp)`
+     converts real frame times into whole STEP steps via an accumulator.
+     This part drives advance() with a MIXED frame-dt sequence (8/16/33 ms
+     — a 120 Hz, a 60 Hz, and a 30 Hz monitor interleaved) and asserts:
+       1. the ghost stepped exactly floor(total/STEP) times — the count is
+          what a sim-rate ghost takes over the same real time, independent
+          of how the time was chunked into frames;
+       2. the ghost's trajectory matches a reference ghost stepped at
+          exactly the sim's rate over the same total time (max distance
+          ~1e-9 — same steps, same input, same physics);
+       3. a 0.5 s hiccup frame (above MAX_FRAME_DT) is clamped — the
+          ghost steps at most ~MAX_FRAME_DT/STEP times for it, no
+          catch-up spiral.
+     The HostTimeEstimator (the client's estimate of the host's sim clock)
+     is checked in the same part: with a steady 10 Hz sample stream it
+     converges to the true offset (within 5 ms), tracks a host that
+     simulates at 0.8x real time (within 20 ms after 2 s), and stays
+     anchored on the data for a STARVED host (0.1x real time, samples a
+     full second apart) — never more than one snapshot interval ahead of
+     the newest stamp.
 """
 import math
 import os
@@ -87,12 +112,14 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
 import pygame
 
-from .config import WIDTH, HEIGHT, SNAPSHOT_INTERVAL, INTERP_DELAY
+from .config import WIDTH, HEIGHT, SNAPSHOT_INTERVAL, INTERP_DELAY, \
+    MAX_FRAME_DT
 from .fog import make_light_texture
 from .game import Game, STEP
 from .ai_enemy import AIEnemy
 from .asteroid import Asteroid
-from .netcode import interp_positions, SnapshotBuffer
+from .netcode import (interp_positions, SnapshotBuffer, PredictedShip,
+                      HostTimeEstimator)
 from .intent import ShipInput
 
 WARMUP = 300   # ticks before the first pair of snapshots (sim is hot)
@@ -665,6 +692,116 @@ def main():
                       f"{max_buf_turn:.4f} rad exceeds the sim's own peak "
                       f"{max_auth_turn:.4f} rad (+1e-3): the remote hull "
                       f"orientation teleported")
+
+    # --- (g) ghost clock (Session 7.1): the prediction ghost must step at
+    # the SIM's fixed rate, not the display's. Drive advance() with a mixed
+    # frame-dt sequence (120/60/30 Hz monitors interleaved) and compare
+    # against a reference ghost stepped at exactly the sim's rate over the
+    # same total time. The pre-7.1 behavior (one step per display frame)
+    # would take 375 steps here instead of 222 and diverge from the
+    # reference — this is the D1 proof.
+    frame_dts = [0.008, 0.016, 0.033] * 125      # 375 frames, 3.7 s total
+    total = sum(frame_dts)
+    g1 = PredictedShip()
+    g2 = PredictedShip()
+    g1.seed(a.snapshot()[0][0])
+    g2.seed(a.snapshot()[0][0])
+    inp = ShipInput.from_keys(script_input(0))
+    n_steps = 0
+    for dt in frame_dts:
+        n_steps += g1.advance(dt, inp)
+    want_steps = int(total / STEP + 1e-9)        # floor: whole STEP steps
+    for _ in range(want_steps):
+        g2.step(STEP, inp)
+    ghost_dist = math.hypot(g1.ship.pos.x - g2.ship.pos.x,
+                            g1.ship.pos.y - g2.ship.pos.y)
+    if n_steps == want_steps and ghost_dist < 1e-6:
+        print(f"PASS: ghost clock — {len(frame_dts)} mixed frames "
+              f"({total:.2f}s) -> {n_steps} fixed steps "
+              f"(= floor(total/STEP)), ghost matches the sim-rate "
+              f"reference to {ghost_dist:.2e}px")
+    else:
+        ok = False
+        print(f"FAIL: ghost clock — {n_steps} steps, want {want_steps}; "
+              f"ghost-vs-reference distance {ghost_dist:.3e}px "
+              f"(want < 1e-6): the ghost is not stepping at the sim's "
+              f"fixed rate")
+
+    # Hiccup clamp: a 0.5 s frame (a full freeze) must not trigger a
+    # catch-up spiral — advance() clamps dt to MAX_FRAME_DT, so the ghost
+    # steps at most ~MAX_FRAME_DT/STEP times for it.
+    g3 = PredictedShip()
+    g3.seed(a.snapshot()[0][0])
+    before = (g3.ship.pos.x, g3.ship.pos.y)
+    n_hiccup = g3.advance(0.5, inp)
+    after = (g3.ship.pos.x, g3.ship.pos.y)
+    hiccup_disp = math.hypot(after[0] - before[0], after[1] - before[1])
+    max_hiccup_steps = round(MAX_FRAME_DT / STEP) + 1
+    if n_hiccup <= max_hiccup_steps and hiccup_disp <= max_auth * (
+            max_hiccup_steps + 1):
+        print(f"PASS: ghost clock hiccup — a 0.5 s frame clamps to "
+              f"{n_hiccup} steps (<= {max_hiccup_steps}), disp "
+              f"{hiccup_disp:.1f}px (no catch-up spiral)")
+    else:
+        ok = False
+        print(f"FAIL: ghost clock hiccup — a 0.5 s frame took {n_hiccup} "
+              f"steps (want <= {max_hiccup_steps}), disp {hiccup_disp:.1f}px: "
+              f"the accumulator did not clamp")
+
+    # HostTimeEstimator: the client's estimate of the host's sim clock.
+    # (a) Steady 10 Hz samples, zero latency: the estimate must converge to
+    # the true offset (here 1.0 s) — within 5 ms after 2 s of samples.
+    est = HostTimeEstimator()
+    for i in range(20):
+        est.record(i * 0.1, 1.0 + i * 0.1)
+    err_steady = abs(est.now(2.0) - 3.0)
+    if err_steady < 0.005:
+        print(f"PASS: host time estimator — steady 10 Hz samples, "
+              f"estimate error {err_steady * 1000:.2f} ms < 5 ms")
+    else:
+        ok = False
+        print(f"FAIL: host time estimator — steady samples, error "
+              f"{err_steady * 1000:.2f} ms (want < 5 ms)")
+
+    # (b) A host that simulates at 0.8x real time (a struggling loop): the
+    # estimate must FOLLOW the host's rate, not assume 1x — within 20 ms
+    # after 2 s of samples. A wall-clock clock (the 6.6 behavior) would be
+    # 400 ms off here.
+    est2 = HostTimeEstimator()
+    for i in range(20):
+        est2.record(i * 0.1, 0.8 * i * 0.1)
+    err_slow = abs(est2.now(2.0) - 1.6)
+    if err_slow < 0.02:
+        print(f"PASS: host time estimator — 0.8x-rate host, estimate "
+              f"error {err_slow * 1000:.2f} ms < 20 ms (rate followed)")
+    else:
+        ok = False
+        print(f"FAIL: host time estimator — 0.8x-rate host, error "
+              f"{err_slow * 1000:.2f} ms (want < 20 ms): the estimate "
+              f"assumes a 1x host")
+
+    # (c) A STARVED host (contended loop, 0.1x real time): samples arrive
+    # a full second apart, and the estimate must stay anchored on the DATA
+    # — never more than one snapshot interval ahead of the newest stamp.
+    # Without the cap, extrapolating at the clamped rate runs the estimate
+    # far ahead of the data and the render point clamp-stutters (the 7.1
+    # e2e regression: a contended host starved to 0.1x and the uncapped
+    # estimate ran 0.4-0.6 s ahead).
+    est3 = HostTimeEstimator()
+    for i in range(3):
+        est3.record(i * 1.0, 0.1 * i * 1.0)
+    est3_val = est3.now(3.5)
+    newest3 = 0.1 * 2.0
+    lead3 = est3_val - newest3
+    if lead3 <= 0.1 + 1e-9 and est3_val >= newest3:
+        print(f"PASS: host time estimator — starved 0.1x host, estimate "
+              f"leads the newest stamp by {lead3 * 1000:.0f} ms "
+              f"(<= one snapshot interval, anchored on the data)")
+    else:
+        ok = False
+        print(f"FAIL: host time estimator — starved host, estimate "
+              f"{est3_val:.3f} vs newest stamp {newest3:.3f} (lead "
+              f"{lead3 * 1000:.0f} ms): the estimate outran the data")
 
     print(f"PASS: cadence knobs — SNAPSHOT_INTERVAL={SNAPSHOT_INTERVAL} "
           f"ticks, INTERP_DELAY={INTERP_DELAY}s")

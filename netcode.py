@@ -38,11 +38,11 @@ Snapshot layout (see Game.snapshot in game.py):
 """
 import math
 
-from .config import INTERP_DELAY, SNAPSHOT_INTERVAL
+from .config import INTERP_DELAY, SNAPSHOT_INTERVAL, TICK, MAX_FRAME_DT
 from .ship import Ship
 
 __all__ = ["interp_positions", "lerp", "lerp_angle", "SnapshotBuffer",
-           "PredictedShip"]
+           "PredictedShip", "HostTimeEstimator"]
 
 
 def lerp(a, b, t):
@@ -72,6 +72,116 @@ def lerp_angle(a0, a1, t):
     raw angles directly."""
     da = (a1 - a0 + math.pi) % (2 * math.pi) - math.pi
     return a0 + da * t
+
+
+class HostTimeEstimator:
+    """The client's estimate of the AUTHORITATIVE peer's sim clock
+    (Session 7.1).
+
+    The client never runs the sim, so it has no sim clock of its own — but
+    the render point (`sim_time - INTERP_DELAY`) and the ghost's reconcile
+    bookkeeping both need one. Deriving it from the LOCAL wall clock
+    (the 6.6 `sim_time += dt` fix) is wrong in principle: the host's
+    sim_time is a fixed-step accumulator and the client's frame dt is the
+    display clock, so two independent clocks drift and the render point
+    wanders inside the interpolation window (stutter).
+
+    Instead: each snapshot is stamped with the host's sim time at send and
+    arrives at a known local time, so every arrival is a sample of the
+    mapping `host_sim_time ≈ A + rate * local_time`. This class fits that
+    AFFINE model with two EMAs (one sample per snapshot, 10 Hz):
+
+      - `rate` — the host's sim rate in local-time units, from consecutive
+        samples (Δhost/Δlocal). A healthy 60 FPS host is 1.0; a struggling
+        host (loop slower than the dt clamp) simulates slower than real
+        time, and the estimate must follow that or it drifts away from the
+        host's clock. Clamped to [RATE_MIN, RATE_MAX] as a sanity bound —
+        and this clamp is what bounds the whole estimate: with the true
+        rate inside the clamp, the rate error is at most 0.6, which keeps
+        the intercept error below ~0.06 s (offset EMA at 10 Hz samples).
+      - `A` — the intercept (absorbs the constant send latency + the host
+        loop's start offset). No per-sample clamp: a single late packet
+        moves A by at most ~one snapshot interval for one sample, and the
+        next sample corrects it — while a clamp would prevent A from
+        catching up whenever the rate estimate is off (the 7.1 e2e
+        regression: a contended host simulating at ~0.56x real time left
+        the clamped estimate 0.35 s behind).
+
+    `now(local_time)` = A + rate * local_time — the host's own clock as
+    carried by the wire, not the display's — CAPPED at the newest sample's
+    stamp + MAX_LEAD (one snapshot interval). The cap anchors the estimate
+    on the DATA, not the model: if the host starves (a contended loop
+    simulating at 0.1x real time), samples arrive a full second apart and
+    extrapolating at the clamped rate would run the estimate far ahead of
+    the data, making the render point clamp-stutter. Capped, the estimate
+    holds within one snapshot interval of the newest stamp, so the render
+    point (sim_time - INTERP_DELAY) sits at or behind the newest snapshot
+    and the remote render simply holds the last frame while the host
+    catches up. In steady state (1x host, 10 Hz samples) the cap never
+    binds — the estimate is at most ~0.01 s ahead of the newest sample.
+
+    `local_time` is any monotonically increasing seconds value the caller
+    has (pygame.time.get_ticks()/1000.0 in the game loop; plain t in tests).
+    """
+
+    RATE_ALPHA = 0.5
+    RATE_MIN, RATE_MAX = 0.4, 1.5
+    OFFSET_ALPHA = 0.2
+    MAX_LEAD = SNAPSHOT_INTERVAL * TICK   # one snapshot interval
+
+    def __init__(self):
+        self._a = None       # EMA intercept: host_time - rate * local_time
+        self._rate = 1.0     # EMA host sim rate (local-time units)
+        self._last = None    # (local_time, host_time) previous sample
+
+    @property
+    def ready(self):
+        """True once at least one snapshot has been recorded."""
+        return self._a is not None
+
+    @property
+    def offset(self):
+        """Current intercept estimate A (None before the first snapshot).
+        Exposed for the 7.8 debug overlay."""
+        return self._a
+
+    @property
+    def rate(self):
+        """Current host sim-rate estimate (1.0 = real-time). Exposed for
+        the 7.8 debug overlay."""
+        return self._rate
+
+    def record(self, local_time, host_sim_time):
+        """Record a snapshot that was taken at `host_sim_time` (its wire
+        stamp) and observed at `local_time`. Out-of-order stamps (should not
+        happen over TCP) are dropped, like SnapshotBuffer.push."""
+        if self._last is not None and host_sim_time <= self._last[1]:
+            return
+        if self._last is not None:
+            lt0, ht0 = self._last
+            if local_time > lt0:
+                r = (host_sim_time - ht0) / (local_time - lt0)
+                r = max(self.RATE_MIN, min(self.RATE_MAX, r))
+                self._rate += self.RATE_ALPHA * (r - self._rate)
+        a_sample = host_sim_time - self._rate * local_time
+        if self._a is None:
+            self._a = a_sample
+        else:
+            self._a += self.OFFSET_ALPHA * (a_sample - self._a)
+        self._last = (local_time, host_sim_time)
+
+    def now(self, local_time):
+        """Estimated host sim time at `local_time` (None before the first
+        snapshot). Capped at the newest sample's stamp + MAX_LEAD — see
+        the class docstring for why the estimate must stay anchored on the
+        data when the host starves."""
+        if self._a is None:
+            return None
+        est = self._a + self._rate * local_time
+        newest = self._last[1]
+        if est > newest + self.MAX_LEAD:
+            return newest + self.MAX_LEAD
+        return est
 
 
 def _enemy_pos(e_s):
@@ -210,6 +320,15 @@ class SnapshotBuffer:
     def __len__(self):
         return len(self._snaps)
 
+    def newest_time(self):
+        """The sim time of the newest snapshot in the buffer (None when
+        empty). Session 7.1: the client's render clock anchors on this —
+        the host's own clock as carried by the wire — instead of the
+        display's wall clock."""
+        if not self._snaps:
+            return None
+        return self._snaps[-1][0]
+
     def push(self, sim_time, snap):
         """Record a snapshot taken at `sim_time`. Out-of-order arrivals are
         dropped (the remote render only ever moves forward in sim time)."""
@@ -266,10 +385,18 @@ class PredictedShip:
     The remote peer renders its OWN ship from the interpolation buffer at
     `sim_time - INTERP_DELAY`, which feels ~100 ms laggy. The classic fix is
     to predict the local ship: step a private Ship with the player's OWN
-    input every frame, and snap it back to the authoritative ship snapshot
-    when one lands. This class is that ghost — a full `Ship` (not a minimal
-    kinematic stand-in) so reconciliation reuses the existing
+    input at the sim's fixed rate, and snap it back to the authoritative
+    ship snapshot when one lands. This class is that ghost — a full `Ship`
+    (not a minimal kinematic stand-in) so reconciliation reuses the existing
     `apply_snapshot` round-trip and the physics stay faithful.
+
+    Clock discipline (Session 7.1): the ghost must step at the SIM's fixed
+    rate, not the display's. The caller feeds it real frame times via
+    `advance(dt, inp)`; the internal accumulator converts that to whole
+    `STEP` steps. Stepping once per display frame (the pre-7.1 behavior)
+    made the ghost integrate `refresh_rate / 60` times the sim's motion —
+    on a 144 Hz monitor it raced 2.4x ahead and every reconcile yanked it
+    back (the reported "spiking and snapbacking").
 
     The ghost is a PRESENTATION object: it is stepped with the local input
     and reconciled to authority, but it never feeds the sim. The sim stays
@@ -296,6 +423,10 @@ class PredictedShip:
         # no reference to Game, so it can be stepped in isolation.
         self._ship = Ship(hull=hull, loadout=loadout)
         self._seeded = False
+        # Fixed-step accumulator (Session 7.1): converts real frame times
+        # into whole STEP steps so the ghost runs at the sim's rate on any
+        # display refresh rate.
+        self._acc = 0.0
 
     @property
     def ship(self):
@@ -323,7 +454,7 @@ class PredictedShip:
         self._seeded = True
 
     def step(self, dt, inp):
-        """Advance the ghost one fixed step with the LOCAL input.
+        """Advance the ghost ONE fixed step with the LOCAL input.
 
         `dt` is passed by the caller (the sim's STEP) because netcode.py
         must not import it from game.py (game.py imports netcode.py). The
@@ -331,6 +462,10 @@ class PredictedShip:
         ghost has no enemy list to target (see class docstring). The
         returned (shots, beams, missiles) are discarded: the ghost's
         weapons are presentation and its projectiles are not rendered.
+
+        The game loop does NOT call this directly — it calls `advance`,
+        which decides how many fixed steps a real frame warrants. Tests
+        call it directly to step the ghost at exactly the sim's rate.
         """
         s = self._ship
         s.tracked = 0
@@ -338,6 +473,31 @@ class PredictedShip:
         s.missile_target = None
         s.contacts = []
         s.update(dt, inp)
+
+    def advance(self, dt, inp):
+        """Advance the ghost by real time `dt` (Session 7.1).
+
+        Feeds `dt` into the fixed-step accumulator and steps the ghost
+        `floor(acc / STEP)` times at exactly `STEP` — the same
+        accumulator pattern the authoritative `Game.update` uses. The
+        ghost therefore integrates at the SIM's rate no matter the
+        display's refresh rate: a 144 Hz monitor yields ~2.4 steps per
+        16.7 ms of sim time on average, never 2.4 steps per display
+        frame. `dt` is clamped to MAX_FRAME_DT first (imported from
+        config, not game.py) so a hiccup can't trigger a catch-up spiral.
+
+        `inp` is the CURRENT local input; every step this call takes uses
+        it (the host applies the latest received input each tick — the
+        same rule). Returns the number of fixed steps taken (0 when the
+        frame is shorter than one STEP of accumulated time).
+        """
+        self._acc += min(dt, MAX_FRAME_DT)
+        n = 0
+        while self._acc >= TICK:
+            self.step(TICK, inp)
+            self._acc -= TICK
+            n += 1
+        return n
 
     def pos(self):
         """The ghost's current (x, y, angle) for rendering."""

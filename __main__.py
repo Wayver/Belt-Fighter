@@ -25,7 +25,7 @@ from .net import (Host, connect, do_handshake_host, do_handshake_client,
                   serialize_snapshot, deserialize_snapshot,
                   serialize_input, deserialize_input,
                   T_INPUT, T_SNAP)
-from .netcode import PredictedShip
+from .netcode import PredictedShip, HostTimeEstimator
 from .ship import Ship
 from .sound import SoundBank
 from .intent import ShipInput
@@ -239,22 +239,23 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
     # builds. Rebuild it with the client's fit (same seam the host uses for
     # its ship, but the ghost is a private presentation object).
     game.ghost = PredictedShip(hull=menu.hull, loadout=menu.loadout)
+    # The client's estimate of the host's sim clock (Session 7.1). The
+    # client never runs the sim, so it has no sim clock of its own — the
+    # estimator derives one from the snapshots: each is stamped with the
+    # host's sim time at send and observed at a known local time, so every
+    # arrival is a sample of (host_time - local_time). This replaces the
+    # 6.6 wall-clock `sim_time += dt`, which was two independent clocks
+    # (the host's fixed-step accumulator vs the display's frame dt) that
+    # drift and make the render point wander inside the interpolation
+    # window.
+    game.host_time = HostTimeEstimator()
     # Flip the socket to non-blocking for the game loop (the handshake used a
     # 0.05 s recv timeout; it must be cleared before the loop).
     conn.set_nonblocking()
 
     while True:
         dt = min(clock.tick(FPS) / 1000.0, 0.05)
-        # Advance the client's render clock in real time. The client never
-        # runs the sim (update() is host-only), so without this sim_time would
-        # stay 0 and predicted_view would render at sim_time - INTERP_DELAY =
-        # -0.1, i.e. frozen on the first snapshot. The host's sim_time advances
-        # at real-time rate (fixed-step accumulator), and both clocks start at
-        # 0, so advancing by the real frame dt keeps the render clock in sync
-        # with the authoritative time the snapshots are stamped with — the
-        # render point (sim_time - INTERP_DELAY) then sweeps smoothly through
-        # the interpolation window instead of stuttering at 10 Hz.
-        game.sim_time += dt
+        now = pygame.time.get_ticks() / 1000.0
         if not game.handle_events():
             break
         keys = pygame.key.get_pressed()
@@ -262,10 +263,13 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
         # LATEST received input each tick).
         conn.send({"type": T_INPUT, "inp": serialize_input(
             ShipInput.from_keys(keys))})
-        # Poll the host: push each snapshot into the interpolation buffer +
-        # the prediction ghost (seed on the first, reconcile on the rest).
+        # Poll the host: each snapshot feeds the host-time estimator (its
+        # wire stamp vs the local arrival time) and then the interpolation
+        # buffer + prediction ghost (seed on the first, reconcile on the
+        # rest).
         for m in conn.poll():
             if m.get("type") == T_SNAP:
+                game.host_time.record(now, m["sim_time"])
                 game.push_snapshot(m["sim_time"],
                                    deserialize_snapshot(m["snap"]))
         if conn.closed:
@@ -274,11 +278,20 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
                     ["DISCONNECTED", "the host left"])
             break
         conn.drain_send()
-        # Render: local ship from the prediction ghost, remote entities from
-        # the interpolation buffer. None until the buffer holds a window
-        # (two snapshots) — draw a waiting state meanwhile.
-        if game.predicted_view(dt, keys) is None:
+        # Render clock = the host's clock (Session 7.1): the newest
+        # snapshot's stamp extrapolated forward at 1x, corrected by the
+        # EMA offset. None until the first snapshot arrives — draw a
+        # waiting state meanwhile (predicted_view would do the same, but
+        # this keeps the waiting frame free of a ghost step).
+        ht = game.host_time.now(now)
+        if ht is None:
             _draw_waiting_client(screen, font, big_font)
+        else:
+            # Render: local ship from the prediction ghost (advanced at the
+            # sim's fixed rate inside predicted_view, Session 7.1), remote
+            # entities from the interpolation buffer at
+            # host_time - INTERP_DELAY.
+            game.predicted_view(dt, keys, host_time=ht)
         pygame.display.flip()
     conn.close()
 

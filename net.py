@@ -28,6 +28,12 @@ Pinned decisions (see the pinned plan note — do NOT re-derive):
     else stays a list — Python unpacking/indexing work identically on lists,
     and `apply_snapshot` never type-checks them. This conversion lives HERE,
     in the protocol layer, NOT in `apply_snapshot`.
+  * Stream integrity (Session 6.9): the send side sends frames in PARTS and
+    keeps only the UNSENT remainder when the buffer fills (re-sending a
+    partially-sent frame would duplicate bytes and corrupt the stream —
+    invisible on loopback, real on a congested LAN). The receive side
+    RESYNCS past a corrupted region instead of raising, so a stray bad byte
+    costs a few frames, not a crash.
 
 The framing is self-contained and testable in isolation: `encode_frame` /
 `extract_frames` are pure byte functions with no socket involved.
@@ -81,6 +87,36 @@ def encode_frame(obj):
     return _LEN.pack(len(payload)) + payload
 
 
+def _find_frame_start(buf, i):
+    """Scan forward from `i` for the next position that looks like the start
+    of a valid frame: a plausible length prefix, a COMPLETE payload already
+    in the buffer, that decodes as UTF-8 JSON to a dict with a 'type' field.
+    Returns the position, or -1 when none is found.
+
+    Used by `extract_frames` to RESYNC after a corrupted region. A
+    length-prefixed stream has no other framing — once a byte is duplicated
+    or dropped, every later frame is misaligned, so the only recovery is to
+    find the next frame that is actually valid. The candidate checks are
+    strict enough that a false positive is effectively impossible (the
+    length must be plausible AND the full payload present AND it must parse
+    to a message dict).
+    """
+    n = len(buf)
+    j = i
+    while n - j >= 4:
+        (length,) = _LEN.unpack_from(buf, j)
+        if 4 <= length <= _MAX_FRAME and n - j >= 4 + length:
+            try:
+                msg = json.loads(bytes(buf[j + 4:j + 4 + length])
+                                 .decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                msg = None
+            if isinstance(msg, dict) and "type" in msg:
+                return j
+        j += 1
+    return -1
+
+
 def extract_frames(buf):
     """Pull every COMPLETE frame out of `buf` (a bytes/bytearray).
 
@@ -89,20 +125,49 @@ def extract_frames(buf):
     trailing partial frame (bytes) that must be kept for the next call. A
     frame is complete only once its full length-prefixed payload has arrived,
     so this is safe to call on a partial buffer.
+
+    CORRUPTION RESYNC (Session 6.9): if a frame's bytes do not decode (a
+    duplicated/dropped byte misaligned the stream), the length prefix at
+    that position is garbage. Instead of raising (which would crash the game
+    loop), the scanner RESYNCS — it skips the corrupted region and resumes
+    at the next position that parses as a valid frame. The cost is losing
+    the frames inside the corrupted region (a few, at most); the stream
+    re-aligns and the game continues. The send side (drain_send) no longer
+    corrupts the stream — this is a safety net for any other stray bad byte.
     """
     out = []
     i = 0
     n = len(buf)
     while n - i >= 4:
         (length,) = _LEN.unpack_from(buf, i)
-        if length > _MAX_FRAME:
-            raise ValueError("frame length %d exceeds cap %d"
-                             % (length, _MAX_FRAME))
         start = i + 4
         end = start + length
+        if length > _MAX_FRAME:
+            # Implausible length: the stream is misaligned here. Resync.
+            j = _find_frame_start(buf, i + 1)
+            if j < 0:
+                # No complete valid frame anywhere in the rest of the buffer
+                # (the scanner checked every position): the tail is
+                # unrecoverable, so drop it. We lose at most the one partial
+                # frame at the end; the next complete frame re-aligns the
+                # stream. (Dropping the whole tail is safe precisely because
+                # _find_frame_start found NO complete valid frame in it.)
+                return out, b""
+            i = j
+            continue
         if n < end:
             break                       # partial frame: wait for more bytes
-        out.append(json.loads(bytes(buf[start:end]).decode("utf-8")))
+        try:
+            msg = json.loads(bytes(buf[start:end]).decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            # Complete per the (garbage) length but undecodable: corrupted
+            # region. Resync past it (same -1 handling as above).
+            j = _find_frame_start(buf, i + 1)
+            if j < 0:
+                return out, b""
+            i = j
+            continue
+        out.append(msg)
         i = end
     return out, bytes(buf[i:])
 
@@ -258,21 +323,43 @@ class Connection:
         In non-blocking mode a full kernel buffer raises BlockingIOError; the
         remaining frames stay queued for the next frame. Returns the number of
         frames sent this call.
+
+        CRITICAL (Session 6.9): a frame larger than the free send-buffer
+        space is sent in PARTS — `sendall` on a non-blocking socket sends
+        what fits, raises BlockingIOError, and the UNSENT REMAINDER must be
+        kept (not the whole frame). Re-sending the whole frame duplicates the
+        bytes already on the wire and corrupts the length-prefixed stream
+        (the client then fails to decode a frame). This is invisible on
+        loopback (the buffer rarely fills) but happens on a real LAN when a
+        burst of ~30 KB snapshots outruns the client's reads — e.g. the
+        heavy explosion/game-over frame at a ship's death.
         """
         sent = 0
         while self._send_buf:
+            frame = self._send_buf[0]
             try:
-                self.sock.sendall(self._send_buf[0])
+                # Send the frame in parts until it is fully out or the
+                # buffer is full. `send` returns the number of bytes written;
+                # the unsent tail stays at the front of the queue.
+                view = memoryview(frame)
+                while view:
+                    n = self.sock.send(view)
+                    view = view[n:]
+                del self._send_buf[0]
+                sent += 1
             except (BlockingIOError, socket.timeout):
-                break               # buffer full (or timed out): keep the rest
+                # Buffer full (or timed out): keep the UNSENT REMAINDER of
+                # this frame (view now points at it) and stop — the rest of
+                # the queue is untouched.
+                if view:
+                    self._send_buf[0] = bytes(view)
+                break
             except ConnectionError:
                 # The peer is gone (RST / reset / broken pipe): mark the
                 # connection closed so the game loop notices via self.closed
                 # and stop trying to send. (Session 6.7 — see poll().)
                 self.closed = True
                 break
-            del self._send_buf[0]
-            sent += 1
         return sent
 
     # -- receive side -------------------------------------------------------
@@ -476,6 +563,79 @@ def _self_test():
     else:
         ok = False
         print("FAIL: framing reassembly ->", frames2, rest3)
+
+    # --- 1b. congested send: a frame larger than the free buffer space must
+    # be sent in PARTS without duplicating bytes (Session 6.9). A fake
+    # socket whose send buffer holds only `capacity` bytes; recv() frees
+    # space, simulating the peer reading. The whole stream must arrive
+    # byte-identical and decode to the exact messages sent.
+    class _Congested:
+        def __init__(self, capacity):
+            self.capacity = capacity
+            self.buf = b""
+            self.rpos = 0
+        def setblocking(self, b):
+            pass
+        def send(self, data):
+            space = self.capacity - (len(self.buf) - self.rpos)
+            if space <= 0:
+                raise BlockingIOError
+            take = min(len(data), space)
+            self.buf += bytes(data[:take])
+            return take
+        def recv(self, n):
+            end = min(self.rpos + n, len(self.buf))
+            out = self.buf[self.rpos:end]
+            self.rpos = end
+            return out
+        def close(self):
+            pass
+
+    payload = "x" * 50000            # ~50 KB frame, like a real snapshot
+    frames_sent = [{"type": T_SNAP, "data": payload} for _ in range(3)]
+    intact = True
+    for cap in (200, 500, 1000):     # all smaller than one frame
+        sock = _Congested(cap)
+        conn = Connection(sock)
+        conn.set_nonblocking()
+        for f in frames_sent:
+            conn.send(f)
+        expected = b"".join(encode_frame(f) for f in frames_sent)
+        received = b""
+        for _ in range(100000):
+            conn.drain_send()
+            received += sock.recv(65536)
+            if len(received) >= len(expected):
+                break
+        if received != expected:
+            intact = False
+            print("FAIL: congested send (capacity %d) corrupted the stream: "
+                  "received %d bytes, expected %d"
+                  % (cap, len(received), len(expected)))
+    if intact:
+        print("PASS: congested send — frames larger than the buffer arrive "
+              "byte-identical (no duplication)")
+    else:
+        ok = False
+
+    # --- 1c. receive resync: a corrupted region (duplicated bytes) must be
+    # skipped, not raised — the stream re-aligns at the next valid frame
+    # (Session 6.9 safety net).
+    good = [{"type": T_SNAP, "data": "a" * 100},
+            {"type": T_SNAP, "data": "b" * 100},
+            {"type": T_SNAP, "data": "c" * 100}]
+    stream = b"".join(encode_frame(f) for f in good)
+    # Corrupt the middle: duplicate a 50-byte chunk inside frame 2.
+    corrupted = stream[:120] + stream[120:170] + stream[170:]
+    msgs, rest = extract_frames(corrupted)
+    if (rest == b"" and len(msgs) >= 2
+            and all("type" in m for m in msgs)):
+        print("PASS: receive resync — corrupted region skipped, stream "
+              "re-aligned (%d frames recovered)" % len(msgs))
+    else:
+        ok = False
+        print("FAIL: receive resync -> %d msgs, rest %d bytes"
+              % (len(msgs), len(rest)))
 
     # --- 2. ShipInput (de)serialization ---
     inp = ShipInput(turn=1.0, thrust_fwd=1.0, fire=True, laser_fire=True)

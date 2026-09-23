@@ -150,6 +150,27 @@ Five proofs:
           RECOVERS to BASE within 40 frames after the burst settles.
           The same pattern fed to a fresh tracker reproduces the delay
           trajectory bit-for-bit (determinism).
+
+  k. RENDER POINT (Session 7.5b) — the render point is re-anchored on
+     the DATA: render_t = newest ARRIVED snapshot stamp - adaptive
+     delay, chased at a bounded per-frame rate (netcode.RenderPoint).
+     This replaces the 7.1 host-time-estimate render clock for the
+     render point (the estimator still runs — its jitter sample feeds
+     the tracker). Two batteries:
+       1. STEADY STREAM — a steady 10 Hz snapshot stream (the sim's own
+          cadence): the render point is CONTINUOUS (per-frame advance
+          <= STEP * 1.5 — the plan's bound; the raw `newest - delay`
+          anchor would jump 0.1 s per arrival and fail it) and NEVER
+          EXCEEDS the newest snapshot (delay >= MIN > 0).
+       2. STALL + RECOVERY — the same stream with a 250 ms stall (the
+          host stamps stay steady; the local arrivals are what the wifi
+          ragged — the 7.5a pattern): the point stays continuous
+          through the stall and the burst, never outruns the newest
+          snapshot (the 7.1 failure mode — the estimate extrapolated
+          forward through the no-arrival gap and the render
+          clamp-stuttered), HOLDS the last window on the static anchor
+          during the no-arrival gap, and resumes tracking the host's
+          sim clock after the stream settles.
 """
 import math
 import os
@@ -165,7 +186,7 @@ from .game import Game, STEP
 from .ai_enemy import AIEnemy
 from .asteroid import Asteroid
 from .netcode import (interp_positions, SnapshotBuffer, PredictedShip,
-                      HostTimeEstimator, LatencyTracker)
+                      HostTimeEstimator, LatencyTracker, RenderPoint)
 from .intent import ShipInput
 from .bullets import Bullet
 
@@ -1390,6 +1411,171 @@ def main():
               f"recovered={recovered} "
               f"({delays[last_arrival_frame + 40]:.4f}s), deterministic="
               f"{delays == delays2}")
+
+    # --- (k) render point (Session 7.5b): the render point is re-anchored
+    # on the DATA — render_t = newest ARRIVED snapshot stamp - adaptive
+    # delay, chased at a bounded per-frame rate (netcode.RenderPoint).
+    # This replaces the 7.1 host-time-estimate render clock for the
+    # render point: a model of the host clock and the data disagree
+    # under jitter/loss, and the render must not wander by the
+    # disagreement. The estimator still runs (its jitter sample feeds
+    # the tracker), but the render reads the buffer, not the model.
+    #
+    # (k.1) STEADY STREAM — a steady 10 Hz snapshot stream (the sim's
+    # own cadence). The plan's two invariants:
+    #   1. CONTINUITY — the per-frame advance is <= STEP * 1.5. The raw
+    #      `newest - delay` anchor would jump by one snapshot interval
+    #      (0.1 s = 6 x STEP) at every arrival and fail this — the
+    #      chase is what makes the point continuous.
+    #   2. NO LOOK-AHEAD — the point never exceeds the newest snapshot
+    #      (delay >= INTERP_DELAY_MIN > 0).
+    # The feed mirrors the 7.5b wiring exactly: estimator.record on each
+    # arrival (tracker.update on the jitter sample when it records),
+    # tracker.tick + render_point.advance once per frame.
+    buf_k = SnapshotBuffer(max_snapshots=200)
+    est_k = HostTimeEstimator()
+    trk_k = LatencyTracker()
+    rp_k = RenderPoint(trk_k)
+    render_track = []
+    max_adv = 0.0
+    never_ahead = True
+    steady_ok = True
+    for i in range(600):                     # 10 s at 60 fps
+        t = i / 60.0
+        if i % 6 == 0:                       # 10 Hz arrivals, 0-latency
+            s = i * STEP
+            buf_k.push(s, a.snapshot())      # a's state is static here —
+                                             # the buffer's DATA is the
+                                             # stamps; the pose content
+                                             # is irrelevant to the
+                                             # render-point law
+            if est_k.record(t, s):
+                trk_k.update(est_k.last_jitter)
+        trk_k.tick(1.0 / 60.0)
+        rp = rp_k.advance(1.0 / 60.0, buf_k.newest_time())
+        if rp is None:
+            continue
+        render_track.append(rp)
+        newest = buf_k.newest_time()
+        if rp > newest + 1e-12:
+            never_ahead = False
+        if len(render_track) >= 2:
+            adv = render_track[-1] - render_track[-2]
+            max_adv = max(max_adv, adv)
+            if adv > STEP * 1.5 + 1e-12:
+                steady_ok = False
+    if (steady_ok and never_ahead and len(render_track) > 500):
+        print(f"PASS: render point steady — {len(render_track)} frames "
+              f"over a steady 10 Hz stream: max per-frame advance "
+              f"{max_adv * 1000:.2f} ms <= STEP x 1.5 "
+              f"({STEP * 1.5 * 1000:.2f} ms), point never exceeds the "
+              f"newest snapshot")
+    else:
+        ok = False
+        print(f"FAIL: render point steady — steady_ok={steady_ok} "
+              f"(max advance {max_adv * 1000:.2f} ms, want <= "
+              f"{STEP * 1.5 * 1000:.2f} ms), never_ahead={never_ahead}, "
+              f"frames={len(render_track)}")
+
+    # (k.2) STALL + RECOVERY — the 7.5a pattern (steady 100 ms, a 250 ms
+    # stall, a 10 ms burst of the queued packets, a long steady tail)
+    # played through the REAL buffer + estimator + tracker + render
+    # point, fed exactly as the 7.5b wiring feeds them. The host stamps
+    # stay at the steady 0.1 s cadence (its sim clock runs through the
+    # stall); the LOCAL arrival times are what the wifi ragged. The
+    # render point must:
+    #   1. stay CONTINUOUS through the stall and the burst (per-frame
+    #      advance <= STEP * 1.5 — a late packet must not teleport it);
+    #   2. HOLD during the stall — the stall is the NO-ARRIVAL gap
+    #      (local 2.9 -> 3.25: the stamped-3.0 packet is still in
+    #      flight), where the anchor (newest - delay) is STATIC. The
+    #      point must sit on it within one frame step: it holds the
+    #      last window instead of outrunning the data and
+    #      clamp-stuttering (the 7.1 failure mode — the estimate kept
+    #      extrapolating forward through the gap). The post-arrival
+    #      transient (3.25 -> 3.4) is NOT a hold window: the anchor
+    #      itself moves fast there (newest jumps 2.9 -> 3.3 while the
+    #      delay rises), and a bounded-rate chaser legitimately lags a
+    #      fast-moving anchor — continuity (1) is the invariant there;
+    #   3. RESUME after the stream settles — the point advances again
+    #      (the steady-state tracking rate, ~1x the host's sim rate).
+    arrivals_k = []
+    for i in range(20):                       # steady 100 ms, 1.0-2.9
+        s = 1.0 + i * 0.1
+        arrivals_k.append((s, s))
+    arrivals_k.append((3.25, 3.0))            # the late packet (250 ms)
+    for i in range(3):                        # the queued burst
+        s = 3.1 + i * 0.1
+        arrivals_k.append((3.26 + i * 0.01, s))
+    for i in range(40):                       # steady tail 3.4-7.3
+        s = 3.4 + i * 0.1
+        arrivals_k.append((s, s))
+
+    buf_k2 = SnapshotBuffer(max_snapshots=200)
+    est_k2 = HostTimeEstimator()
+    trk_k2 = LatencyTracker()
+    rp_k2 = RenderPoint(trk_k2)
+    track2 = []
+    continuous = True
+    outrun = False          # point past the newest snapshot (7.1 mode)
+    hold_worst = 0.0        # |rp - anchor| on the converged hold window
+    ai = 0
+    for i in range(490):                      # 8.17 s at 60 fps
+        t = i / 60.0
+        while ai < len(arrivals_k) and arrivals_k[ai][0] <= t + 1e-12:
+            lt, s = arrivals_k[ai]
+            buf_k2.push(s, a.snapshot())
+            if est_k2.record(lt, s):
+                trk_k2.update(est_k2.last_jitter)
+            ai += 1
+        trk_k2.tick(1.0 / 60.0)
+        rp = rp_k2.advance(1.0 / 60.0, buf_k2.newest_time())
+        if rp is None:
+            continue
+        track2.append((t, rp))
+        if len(track2) >= 2:
+            adv = track2[-1][1] - track2[-2][1]
+            if adv > STEP * 1.5 + 1e-12:
+                continuous = False
+        newest = buf_k2.newest_time()
+        if rp > newest + 1e-12:
+            outrun = True
+        # HOLD WINDOW: the no-arrival gap (local 2.9 -> 3.25: the
+        # stamped-3.0 packet is still in flight), after the point has
+        # had its 6 convergence frames (t >= 3.05). There the anchor
+        # (newest - delay) is STATIC (newest = 2.9, delay = 0.1 — no
+        # jitter samples arrive during the gap), so the point must sit
+        # on it: holding the last window instead of outrunning the data
+        # (the 7.1 failure mode — the estimate kept extrapolating
+        # forward through the gap and the render clamp-stuttered). The
+        # post-arrival transient (3.25 -> 3.4) is NOT a hold window:
+        # the anchor moves fast there (newest jumps 2.9 -> 3.3 while
+        # the delay rises), and a bounded-rate chaser legitimately lags
+        # a fast-moving anchor — continuity is the invariant there.
+        if 3.05 <= t < 3.25:
+            hold_worst = max(hold_worst,
+                             abs(rp - (newest - trk_k2.delay)))
+    # Resume: over [3.4, 5.0] (steady stream, well past the burst) the
+    # point must track the host's sim clock again — the steady-state
+    # rate is ~1x, so >= 1 s of advance over 1.6 s of frames (a frozen
+    # point would advance 0).
+    seg = [rp for (t, rp) in track2 if 3.4 <= t <= 5.0]
+    resumed = len(seg) > 50 and (seg[-1] - seg[0]) >= 1.0
+    if (continuous and not outrun and hold_worst < 1e-9 and resumed
+            and len(track2) > 400):
+        print(f"PASS: render point stall — 250 ms stall + 10 ms burst: "
+              f"point continuous (<= STEP x 1.5 per frame), never "
+              f"outruns the newest snapshot, holds the last window "
+              f"(worst {hold_worst:.1e} from the static anchor on the "
+              f"no-arrival gap), resumed after the burst (advanced "
+              f"{seg[-1] - seg[0]:.2f}s over [3.4, 5.0])")
+    else:
+        ok = False
+        print(f"FAIL: render point stall — continuous={continuous}, "
+              f"outrun={outrun}, hold worst {hold_worst:.3e} (want "
+              f"< 1e-9), resumed={resumed} (advance "
+              f"{seg[-1] - seg[0] if len(seg) > 1 else -1:.2f}s over "
+              f"[3.4, 5.0]), frames={len(track2)}")
 
     print(f"PASS: cadence knobs — SNAPSHOT_INTERVAL={SNAPSHOT_INTERVAL} "
           f"ticks, INTERP_DELAY={INTERP_DELAY}s, adaptive "

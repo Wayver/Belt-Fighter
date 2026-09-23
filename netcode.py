@@ -61,7 +61,8 @@ from .ship import Ship
 from .bullets import Bullet
 
 __all__ = ["interp_positions", "lerp", "lerp_angle", "SnapshotBuffer",
-           "PredictedShip", "HostTimeEstimator", "LatencyTracker"]
+           "PredictedShip", "HostTimeEstimator", "LatencyTracker",
+           "RenderPoint"]
 
 
 def lerp(a, b, t):
@@ -107,8 +108,8 @@ class HostTimeEstimator:
     (Session 7.1).
 
     The client never runs the sim, so it has no sim clock of its own — but
-    the render point (`sim_time - INTERP_DELAY`) and the ghost's reconcile
-    bookkeeping both need one. Deriving it from the LOCAL wall clock
+    the ghost's reconcile bookkeeping (and, before 7.5b, the render point)
+    need one. Deriving it from the LOCAL wall clock
     (the 6.6 `sim_time += dt` fix) is wrong in principle: the host's
     sim_time is a fixed-step accumulator and the client's frame dt is the
     display clock, so two independent clocks drift and the render point
@@ -150,6 +151,15 @@ class HostTimeEstimator:
 
     `local_time` is any monotonically increasing seconds value the caller
     has (pygame.time.get_ticks()/1000.0 in the game loop; plain t in tests).
+
+    Session 7.5b: this estimate is NO LONGER the client's render clock.
+    The render point is now anchored on the DATA — the newest ARRIVED
+    snapshot's stamp minus the adaptive delay (see `RenderPoint`) —
+    because a model of the host clock and the data disagree under
+    jitter/loss, and the render must not wander by the disagreement.
+    The estimator still runs for two reasons: its per-arrival jitter
+    sample (`last_jitter`) is the input the LatencyTracker consumes, and
+    `now()` remains available for diagnostics (the 7.8 overlay).
     """
 
     RATE_ALPHA = 0.5
@@ -247,9 +257,9 @@ class LatencyTracker:
     delay grows with the measured jitter, so a late packet lands inside
     the window instead of behind the render point.
 
-    The delay is a PURE FUNCTION OF THE ARRIVAL PATTERN — this class is
-    the 7.5a scope: it computes the value, nothing consumes it yet
-    (7.5b re-anchors the render point to it). The input is the
+    The delay is a PURE FUNCTION OF THE ARRIVAL PATTERN (7.5a scope:
+    compute the value; 7.5b re-anchored the render point to it — see
+    `RenderPoint`, which reads `.delay` every frame). The input is the
     HostTimeEstimator's per-arrival jitter sample
     (`HostTimeEstimator.last_jitter` — `|offset_sample - offset_ema|`,
     the 7.1 offset samples repurposed): a steady 10 Hz stream sits near
@@ -344,6 +354,103 @@ class LatencyTracker:
             self._delay = min(target, self._delay + self.MAX_STEP)
         elif target < self._delay:
             self._delay = max(target, self._delay - self.MAX_STEP)
+
+
+class RenderPoint:
+    """The client's render point in HOST SIM TIME (Session 7.5b).
+
+    7.1 rendered at `host_time_estimate - INTERP_DELAY`, where the
+    estimate extrapolates the newest snapshot's stamp forward at the
+    fitted host rate. That is a MODEL of the host clock: on a clean link
+    it sits ~0.01 s ahead of the newest ARRIVED snapshot, but under
+    jitter/loss the model and the data disagree — the estimate can lag
+    the newest stamp (a late packet pulls the offset EMA down) or lead
+    it (the MAX_LEAD cap holds it one interval ahead), and the render
+    point wanders by as much as the disagreement. The fix (this
+    session): anchor the render point on the DATA, not the model —
+
+        render_t = newest_arrived_snapshot_stamp - delay
+
+    a fixed distance behind the newest snapshot in the buffer. A late
+    packet then simply holds the point on the last window (a <=1-frame
+    stall) instead of the point outrunning the data and
+    clamp-stuttering, and the point can never exceed the newest
+    snapshot (delay >= INTERP_DELAY_MIN > 0).
+
+    This REPLACES the 7.1 host-time estimate for the render point — the
+    genuinely risky re-anchor of the core render path, isolated in this
+    session. The estimator is NOT deleted: it still runs, and its
+    per-arrival jitter sample (`last_jitter`) is what feeds the
+    LatencyTracker (7.5a). It is no longer a clock the render reads.
+
+    One subtlety: `newest - delay` on its own is a STAIRCASE. The newest
+    stamp is flat between arrivals and jumps by one snapshot interval
+    (0.1 s) when a packet lands, so the raw anchor would jump 0.1 s
+    forward every 100 ms — a 6x telegraph, not a render. The point
+    therefore CHASES the anchor: each frame it moves toward
+    `newest - delay` at at most MAX_STEP (1/60 s), the same
+    frame-bound discipline the LatencyTracker uses on the delay itself.
+    The net per-frame advance is then bounded by
+    MAX_STEP + MAX_STEP_DELAY (the chase step plus the delay's own
+    per-frame movement) — the render point is continuous on any refresh
+    rate, and a jitter spike or a late packet can never teleport it.
+    In steady state the chase is slack (the anchor creeps forward at
+    the host's sim rate, ~1x, and the point tracks it within ~one
+    frame's step); under a stall the anchor holds and the point
+    converges onto it and holds there.
+
+    `advance(dt, newest)` is called once per frame with the newest
+    snapshot stamp in the buffer (None before the first arrival — the
+    point is None until then, and the caller draws its waiting state).
+    `now()` returns the render point (host sim time) or None.
+    """
+
+    MAX_STEP = 1.0 / 60.0      # the point may move at most this far per frame
+    MAX_STEP_DELAY = LatencyTracker.MAX_STEP  # the delay's own per-frame move
+
+    def __init__(self, tracker=None):
+        self._tracker = tracker
+        self._t = None         # the render point (host sim time), or None
+
+    @property
+    def tracker(self):
+        """The LatencyTracker this point reads its delay from (the 7.8
+        debug overlay reads both). Settable so tests can swap trackers."""
+        return self._tracker
+
+    @tracker.setter
+    def tracker(self, trk):
+        self._tracker = trk
+
+    def advance(self, dt, newest):
+        """One frame of real time `dt`. `newest` is the newest snapshot
+        stamp in the buffer (host sim time) or None. Returns the render
+        point (or None while there is no anchor yet)."""
+        if newest is None:
+            return None
+        if self._t is None:
+            # First anchor: sit at the anchor (it is behind the newest
+            # snapshot by the delay, so inside the buffer's window).
+            self._t = newest - self._delay()
+            return self._t
+        target = newest - self._delay()
+        d = target - self._t
+        if d > 0.0:
+            self._t += min(d, self.MAX_STEP)
+        elif d < 0.0:
+            self._t -= min(-d, self.MAX_STEP)
+        return self._t
+
+    def now(self):
+        """The current render point (host sim time), or None before the
+        first snapshot arrived."""
+        return self._t
+
+    def _delay(self):
+        trk = self._tracker
+        if trk is None:
+            return INTERP_DELAY
+        return trk.delay
 
 
 def _enemy_pos(e_s):

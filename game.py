@@ -1155,19 +1155,27 @@ class Game:
         FIXED rate (Session 7.1: `ghost.advance(dt, inp)` — a fixed-step
         accumulator, not one step per display frame), and the ghost's ship
         is drawn at its own (predicted) position. Remote entities (enemies,
-        asteroids) still come from the interpolation buffer at
-        sim_time - INTERP_DELAY, exactly as remote_view does. The buffer's
-        'ships' entry is drawn for every player EXCEPT the local one
-        (Session 6.6: the remote ship in 2P; Session 6.8: as its real hull
-        at the interpolated (pos, angle)); the local ship's buffer entry is
-        NOT drawn — it IS the local ship, now predicted.
+        asteroids) come from the interpolation buffer at the RENDER POINT
+        (Session 7.5b: `self.render_point.now()` — the newest ARRIVED
+        snapshot's stamp minus the adaptive delay, chased at a bounded
+        per-frame rate; before 7.5b this was
+        `sim_time - INTERP_DELAY` with sim_time the 7.1 host-time
+        estimate). The buffer's 'ships' entry is drawn for every player
+        EXCEPT the local one (Session 6.6: the remote ship in 2P;
+        Session 6.8: as its real hull at the interpolated (pos, angle));
+        the local ship's buffer entry is NOT drawn — it IS the local
+        ship, now predicted.
 
-        `host_time` (Session 7.1): the caller's estimate of the host's sim
-        clock (a HostTimeEstimator.now() value). When given, it becomes
-        self.sim_time — the client's render clock is the HOST's clock as
-        carried by the wire, not the display's wall clock (the 6.6
-        `sim_time += dt` was two independent clocks drifting). When None
-        (tests), the clock is left as-is.
+        `host_time` (Session 7.1, superseded for the render point in
+        7.5b): the caller's estimate of the host's sim clock. When
+        given, it still becomes self.sim_time — the client's sim_time is
+        the HOST's clock as carried by the wire, not the display's wall
+        clock (the 6.6 `sim_time += dt` was two independent clocks
+        drifting) — but the REMOTE render no longer reads it: the render
+        point is anchored on the buffer's newest snapshot (see
+        netcode.RenderPoint), because a model of the host clock and the
+        data disagree under jitter/loss. When None (tests), the clock is
+        left as-is.
 
         The HUD reads the ghost ship (the local player's power/shield/vel)
         and the buffer's enemy count — self.ship (players[0]) and
@@ -1197,9 +1205,20 @@ class Game:
             sy = (y - self.cam.pos.y * 0.2) % HEIGHT
             pygame.draw.circle(screen, STAR_COLOR, (sx, sy), r)
 
-        pos = self.snap_buf.positions_at(self.sim_time - INTERP_DELAY)
+        # Session 7.5b: the render point is anchored on the buffer's
+        # newest ARRIVED snapshot (newest stamp - adaptive delay, chased
+        # at a bounded per-frame rate — netcode.RenderPoint), not on the
+        # 7.1 host-time estimate. None until the first snapshot arrives.
+        rp = self.render_point.now()
+        if rp is None:
+            # No snapshot has arrived yet: nothing to render from.
+            return None
+        pos = self.snap_buf.positions_at(rp)
         if pos is None:
-            # Not enough snapshots yet to interpolate the remote entities.
+            # The render point exists (first snapshot arrived) but the
+            # buffer holds no window yet (fewer than two snapshots, or
+            # the point is before the first snapshot): not enough data
+            # to interpolate the remote entities.
             return None
 
         for (x, y) in pos['asteroids']:

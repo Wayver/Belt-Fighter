@@ -25,7 +25,8 @@ from .net import (Host, connect, do_handshake_host, do_handshake_client,
                   serialize_snapshot, deserialize_snapshot,
                   serialize_input, deserialize_input,
                   T_INPUT, T_SNAP)
-from .netcode import PredictedShip, HostTimeEstimator
+from .netcode import (PredictedShip, HostTimeEstimator, LatencyTracker,
+                      RenderPoint)
 from .ship import Ship
 from .sound import SoundBank
 from .intent import ShipInput
@@ -243,12 +244,24 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
     # client never runs the sim, so it has no sim clock of its own — the
     # estimator derives one from the snapshots: each is stamped with the
     # host's sim time at send and observed at a known local time, so every
-    # arrival is a sample of (host_time - local_time). This replaces the
-    # 6.6 wall-clock `sim_time += dt`, which was two independent clocks
-    # (the host's fixed-step accumulator vs the display's frame dt) that
-    # drift and make the render point wander inside the interpolation
-    # window.
+    # arrival is a sample of (host_time - local_time). This replaced the
+    # 6.6 wall-clock `sim_time += dt` (two independent clocks drifting).
+    # Session 7.5b: the estimate is no longer the RENDER clock — the
+    # render point is anchored on the buffer's newest ARRIVED snapshot
+    # (below). The estimator still runs because its per-arrival jitter
+    # sample is what the adaptive delay consumes.
     game.host_time = HostTimeEstimator()
+    # The adaptive interpolation delay (Session 7.5a): a pure function of
+    # the arrival pattern — delay = clamp(BASE + k * EMA(jitter), MIN,
+    # MAX), moved at most 1/60 s per frame. Fed by the estimator's
+    # per-arrival jitter sample, ticked once per frame.
+    game.latency = LatencyTracker()
+    # The render point (Session 7.5b): newest ARRIVED snapshot stamp
+    # minus the adaptive delay, chased at a bounded per-frame rate so a
+    # late packet holds the point on the last window instead of the
+    # point outrunning the data and clamp-stuttering. This replaces the
+    # 7.1 host-time-estimate render clock for the render point.
+    game.render_point = RenderPoint(game.latency)
     # Flip the socket to non-blocking for the game loop (the handshake used a
     # 0.05 s recv timeout; it must be cleared before the loop).
     conn.set_nonblocking()
@@ -264,12 +277,14 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
         conn.send({"type": T_INPUT, "inp": serialize_input(
             ShipInput.from_keys(keys))})
         # Poll the host: each snapshot feeds the host-time estimator (its
-        # wire stamp vs the local arrival time) and then the interpolation
-        # buffer + prediction ghost (seed on the first, reconcile on the
-        # rest).
+        # wire stamp vs the local arrival time — the estimator's
+        # per-arrival jitter sample is the adaptive delay's input,
+        # Session 7.5a) and then the interpolation buffer + prediction
+        # ghost (seed on the first, reconcile on the rest).
         for m in conn.poll():
             if m.get("type") == T_SNAP:
-                game.host_time.record(now, m["sim_time"])
+                if game.host_time.record(now, m["sim_time"]):
+                    game.latency.update(game.host_time.last_jitter)
                 game.push_snapshot(m["sim_time"],
                                    deserialize_snapshot(m["snap"]))
         if conn.closed:
@@ -278,20 +293,27 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
                     ["DISCONNECTED", "the host left"])
             break
         conn.drain_send()
-        # Render clock = the host's clock (Session 7.1): the newest
-        # snapshot's stamp extrapolated forward at 1x, corrected by the
-        # EMA offset. None until the first snapshot arrives — draw a
-        # waiting state meanwhile (predicted_view would do the same, but
-        # this keeps the waiting frame free of a ghost step).
-        ht = game.host_time.now(now)
-        if ht is None:
+        # Render point (Session 7.5b): the newest ARRIVED snapshot's
+        # stamp minus the adaptive delay, chased at a bounded per-frame
+        # rate — the buffer is the anchor, not the 7.1 host-time
+        # estimate (a model of the host clock that disagrees with the
+        # data under jitter/loss). The tracker's per-frame smoothing
+        # step runs here too (one frame moves the delay at most 1/60 s).
+        # None until the first snapshot arrives — draw a waiting state
+        # meanwhile (predicted_view would do the same, but this keeps
+        # the waiting frame free of a ghost step).
+        game.latency.tick(dt)
+        rp = game.render_point.advance(dt, game.snap_buf.newest_time())
+        if rp is None:
             _draw_waiting_client(screen, font, big_font)
         else:
-            # Render: local ship from the prediction ghost (advanced at the
-            # sim's fixed rate inside predicted_view, Session 7.1), remote
-            # entities from the interpolation buffer at
-            # host_time - INTERP_DELAY.
-            game.predicted_view(dt, keys, host_time=ht)
+            # Render: local ship from the prediction ghost (advanced at
+            # the sim's fixed rate inside predicted_view, Session 7.1),
+            # remote entities from the interpolation buffer at the
+            # render point. host_time keeps self.sim_time = the host's
+            # clock as carried by the wire (7.1), for the ghost's
+            # reconcile bookkeeping and diagnostics.
+            game.predicted_view(dt, keys, host_time=game.host_time.now(now))
         pygame.display.flip()
     conn.close()
 

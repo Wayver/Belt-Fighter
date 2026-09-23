@@ -144,6 +144,16 @@ SNAPSHOT_INTERVAL = 6    # sim ticks between snapshots (6 -> 10 Hz at 60 Hz sim)
 INTERP_DELAY = 0.1       # seconds the remote render lags the sim
 NET_PORT = 7777          # default host listen port (2P host/client, Session 6.5)
 
+# --- adaptive interpolation delay (Session 7.5a) ---
+# The remote render's delay is INTERP_DELAY at rest and grows with the
+# measured snapshot-arrival jitter: delay = clamp(INTERP_DELAY + ADAPT_K *
+# EMA(jitter), INTERP_DELAY_MIN, INTERP_DELAY_MAX), smoothed to move at
+# most 1/60 s per frame (netcode.LatencyTracker). 7.5a computes the value
+# only; 7.5b re-anchors the render point to it.
+INTERP_DELAY_MIN = 0.1   # the delay never shrinks below the base
+INTERP_DELAY_MAX = 0.35  # hard cap on the render lag
+ADAPT_K = 2.0            # jitter gain: delay = BASE + ADAPT_K * EMA(jitter)
+
 
 # tartet assist
 TARGETING_ASSIST  = True

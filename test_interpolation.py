@@ -129,6 +129,27 @@ Five proofs:
      anchored on the data for a STARVED host (0.1x real time, samples a
      full second apart) — never more than one snapshot interval ahead of
      the newest stamp.
+
+  j. ADAPTIVE DELAY COMPUTE (Session 7.5a) — the adaptive interpolation
+     delay (netcode.LatencyTracker) is a PURE FUNCTION OF THE ARRIVAL
+     PATTERN: delay = clamp(INTERP_DELAY + ADAPT_K * EMA(jitter),
+     INTERP_DELAY_MIN, INTERP_DELAY_MAX), where the jitter samples are
+     the HostTimeEstimator's per-arrival offset deviations
+     (estimator.last_jitter). 7.5a computes the value only — the render
+     path is untouched (7.5b re-anchors the render point to it). Two
+     batteries:
+       1. TRACKER LAW — driving the tracker with a constant jitter
+          sample: the delay rises monotonically toward the clamped
+          target (BASE + k*jitter, capped at MAX), moving at most 1/60 s
+          per frame (the render point it will drive can never jump);
+          with zero jitter it falls monotonically back to BASE.
+       2. SYNTHETIC ARRIVAL PATTERN — the estimator + tracker are fed a
+          steady 100 ms stream, a 250 ms gap (one late snapshot), and a
+          50 ms burst: the delay stays in [MIN, MAX] and non-decreasing
+          while steady, RESPONDS to the gap (rises well above BASE), and
+          RECOVERS to BASE within 40 frames after the burst settles.
+          The same pattern fed to a fresh tracker reproduces the delay
+          trajectory bit-for-bit (determinism).
 """
 import math
 import os
@@ -138,13 +159,13 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 import pygame
 
 from .config import WIDTH, HEIGHT, SNAPSHOT_INTERVAL, INTERP_DELAY, \
-    MAX_FRAME_DT, MAX_BULLETS
+    INTERP_DELAY_MIN, INTERP_DELAY_MAX, ADAPT_K, MAX_FRAME_DT, MAX_BULLETS
 from .fog import make_light_texture
 from .game import Game, STEP
 from .ai_enemy import AIEnemy
 from .asteroid import Asteroid
 from .netcode import (interp_positions, SnapshotBuffer, PredictedShip,
-                      HostTimeEstimator)
+                      HostTimeEstimator, LatencyTracker)
 from .intent import ShipInput
 from .bullets import Bullet
 
@@ -1212,8 +1233,167 @@ def main():
             print(f"FAIL: local bullet cull — no bullet expired over "
                   f"{RUN_TICKS} ticks (the cull path never ran)")
 
+    # --- (j) adaptive delay compute (Session 7.5a): the adaptive
+    # interpolation delay is a PURE FUNCTION OF THE ARRIVAL PATTERN —
+    # delay = clamp(INTERP_DELAY + ADAPT_K * EMA(jitter), MIN, MAX),
+    # jitter = the estimator's per-arrival offset deviation. 7.5a
+    # computes the value only; the render path is untouched (7.5b
+    # re-anchors the render point to it).
+    #
+    # (j.1) TRACKER LAW — a constant jitter sample: the delay rises
+    # monotonically toward the clamped target (BASE + k*jitter, capped
+    # at MAX), moving at most 1/60 s per frame; zero jitter pulls it
+    # monotonically back to BASE.
+    jt = LatencyTracker()
+    if jt.delay != INTERP_DELAY:
+        ok = False
+        print(f"FAIL: adaptive delay law — fresh tracker delay "
+              f"{jt.delay}, want BASE {INTERP_DELAY}")
+    max_step_rise = 0.0
+    prev_d = jt.delay
+    for _ in range(300):
+        jt.update(0.1)          # constant 100 ms jitter sample
+        jt.tick(1.0 / 60.0)
+        max_step_rise = max(max_step_rise, abs(jt.delay - prev_d))
+        prev_d = jt.delay
+    target_hi = min(INTERP_DELAY_MAX, INTERP_DELAY + ADAPT_K * 0.1)
+    # 300 frames at 1/60 s per frame = 5 s of travel — far more than the
+    # ~0.1 s the target is above BASE, so the delay must have landed on
+    # the clamped target.
+    rise_ok = (abs(jt.delay - target_hi) < 1e-9
+               and max_step_rise <= 1.0 / 60.0 + 1e-12)
+    if rise_ok:
+        print(f"PASS: adaptive delay law — constant 100 ms jitter -> "
+              f"delay {jt.delay:.4f}s == clamp(BASE + k*jitter, MIN, MAX) "
+              f"= {target_hi:.4f}s, max per-frame move "
+              f"{max_step_rise * 1000:.2f} ms <= 1/60 s")
+    else:
+        ok = False
+        print(f"FAIL: adaptive delay law — delay {jt.delay:.4f}s, want "
+              f"{target_hi:.4f}s; max per-frame move "
+              f"{max_step_rise * 1000:.3f} ms (want <= 1/60 s)")
+    max_step_fall = 0.0
+    prev_d = jt.delay
+    for _ in range(300):
+        jt.update(0.0)          # jitter back to zero
+        jt.tick(1.0 / 60.0)
+        max_step_fall = max(max_step_fall, abs(jt.delay - prev_d))
+        prev_d = jt.delay
+    fall_ok = (abs(jt.delay - INTERP_DELAY) < 1e-9
+               and max_step_fall <= 1.0 / 60.0 + 1e-12)
+    if fall_ok:
+        print(f"PASS: adaptive delay recovery — zero jitter -> delay "
+              f"back to BASE {jt.delay:.4f}s, max per-frame move "
+              f"{max_step_fall * 1000:.2f} ms <= 1/60 s")
+    else:
+        ok = False
+        print(f"FAIL: adaptive delay recovery — delay {jt.delay:.4f}s, "
+              f"want BASE {INTERP_DELAY:.4f}s; max per-frame move "
+              f"{max_step_fall * 1000:.3f} ms")
+
+    # (j.2) SYNTHETIC ARRIVAL PATTERN — steady 100 ms, a 250 ms gap
+    # (one late snapshot), a 10 ms burst of the packets queued during
+    # the stall. The estimator + tracker are fed the pattern exactly as
+    # the 7.5b wiring will feed them (estimator.record on each arrival,
+    # tracker.update on the jitter sample, tracker.tick every frame).
+    # The delay must stay in [MIN, MAX], be non-decreasing while the
+    # stream is steady, RESPOND to the gap (rise well above BASE), and
+    # RECOVER to BASE after the stream settles.
+    class _T:
+        """A (local_time, host_stamp) arrival pair."""
+        __slots__ = ("lt", "ht")
+
+        def __init__(self, lt, ht):
+            self.lt, self.ht = lt, ht
+
+    # The HOST stamps at its own steady 0.1 s cadence (its sim clock
+    # keeps running through a wifi stall); the LOCAL arrival times are
+    # what the wifi ragged. Both must be strictly increasing (the
+    # estimator drops out-of-order stamps, and the frame loop processes
+    # arrivals in list order). Steady: local == stamp (a constant 0
+    # offset). A 250 ms stall delays the stamped-3.0 packet to local
+    # 3.25, and the packets queued during the stall (stamps 3.1-3.3)
+    # burst out 10 ms apart.
+    arrivals = []
+    for i in range(20):                       # steady 100 ms, 1.0-2.9
+        s = 1.0 + i * 0.1
+        arrivals.append(_T(s, s))
+    gap_start = 3.25
+    arrivals.append(_T(3.25, 3.0))            # the late packet (250 ms)
+    for i in range(3):                        # the queued burst
+        s = 3.1 + i * 0.1
+        arrivals.append(_T(3.26 + i * 0.01, s))
+    # 40 steady arrivals (3.4-7.3): long enough that the estimator's
+    # offset + rate re-converge to the new steady state (the 7.1 EMAs
+    # settle in ~1.5 s after the burst) and the delay returns to BASE —
+    # the recovery check below is against BASE + 15 ms, 40 frames after
+    # the last arrival.
+    for i in range(40):
+        s = 3.4 + i * 0.1
+        arrivals.append(_T(s, s))
+
+    def _run_pattern():
+        est = HostTimeEstimator()
+        trk = LatencyTracker()
+        delays = []
+        ai = 0
+        # Integer frame arithmetic (no accumulated float drift in t):
+        # frame i is at local time i/60. Run to 490 frames (8.17 s) —
+        # past the last arrival (7.3 s) + the 40-frame recovery window.
+        for i in range(490):
+            t = i / 60.0
+            while ai < len(arrivals) and arrivals[ai].lt <= t + 1e-12:
+                a = arrivals[ai]
+                if est.record(a.lt, a.ht):
+                    trk.update(est.last_jitter)
+                ai += 1
+            trk.tick(1.0 / 60.0)
+            delays.append(trk.delay)
+        return delays
+
+    delays = _run_pattern()
+    delays2 = _run_pattern()          # determinism: fresh tracker, same
+                                      # pattern -> identical trajectory
+    in_bounds = all(INTERP_DELAY_MIN - 1e-12 <= d <= INTERP_DELAY_MAX + 1e-12
+                    for d in delays)
+    # Non-decreasing while steady: every frame up to the gap (the first
+    # 120 frames = 2.0 s at 60 fps) may only grow (jitter is ~0, so the
+    # delay holds at BASE — growth here would be a bug).
+    steady_prefix = delays[:120]
+    monotone_steady = all(b >= a - 1e-12 for a, b in
+                          zip(steady_prefix, steady_prefix[1:]))
+    # Response: the gap's jitter sample spikes the EMA; the delay must
+    # rise well above BASE (>= BASE + 0.02 s) at some point after the
+    # gap and before the recovery window.
+    gap_frame = round(gap_start * 60)
+    response = max(delays[gap_frame:gap_frame + 60])
+    responded = response >= INTERP_DELAY + 0.02
+    # Recovery: 40 frames (0.67 s) after the last arrival the delay must
+    # be back at BASE (the jitter EMA has decayed and the estimator's
+    # offset has re-converged to the steady-state value).
+    last_arrival_frame = round(arrivals[-1].lt * 60)
+    recovered = delays[last_arrival_frame + 40] <= INTERP_DELAY + 0.015
+    if (in_bounds and monotone_steady and responded and recovered
+            and delays == delays2):
+        print(f"PASS: adaptive delay pattern — steady 100 ms + 250 ms gap "
+              f"+ 10 ms burst: delay in [{INTERP_DELAY_MIN}, "
+              f"{INTERP_DELAY_MAX}] every frame, steady prefix "
+              f"non-decreasing, gap response peak {response:.4f}s "
+              f"(>= BASE + 0.02), recovered to "
+              f"{delays[last_arrival_frame + 40]:.4f}s (<= BASE + 0.015) "
+              f"40 frames after the burst; trajectory deterministic")
+    else:
+        ok = False
+        print(f"FAIL: adaptive delay pattern — in_bounds={in_bounds}, "
+              f"steady non-decreasing={monotone_steady}, gap response "
+              f"peak {response:.4f}s (want >= {INTERP_DELAY + 0.02}), "
+              f"recovered={recovered} "
+              f"({delays[last_arrival_frame + 40]:.4f}s), deterministic="
+              f"{delays == delays2}")
+
     print(f"PASS: cadence knobs — SNAPSHOT_INTERVAL={SNAPSHOT_INTERVAL} "
-          f"ticks, INTERP_DELAY={INTERP_DELAY}s")
+          f"ticks, INTERP_DELAY={INTERP_DELAY}s, adaptive "
+          f"[{INTERP_DELAY_MIN}, {INTERP_DELAY_MAX}] k={ADAPT_K}")
 
     pygame.quit()
     raise SystemExit(0 if ok else 1)

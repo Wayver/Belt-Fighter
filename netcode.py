@@ -54,13 +54,14 @@ Snapshot layout (see Game.snapshot in game.py):
 """
 import math
 
-from .config import (INTERP_DELAY, SNAPSHOT_INTERVAL, TICK, MAX_FRAME_DT,
+from .config import (INTERP_DELAY, INTERP_DELAY_MIN, INTERP_DELAY_MAX,
+                    ADAPT_K, SNAPSHOT_INTERVAL, TICK, MAX_FRAME_DT,
                     MAX_BULLETS)
 from .ship import Ship
 from .bullets import Bullet
 
 __all__ = ["interp_positions", "lerp", "lerp_angle", "SnapshotBuffer",
-           "PredictedShip", "HostTimeEstimator"]
+           "PredictedShip", "HostTimeEstimator", "LatencyTracker"]
 
 
 def lerp(a, b, t):
@@ -160,6 +161,7 @@ class HostTimeEstimator:
         self._a = None       # EMA intercept: host_time - rate * local_time
         self._rate = 1.0     # EMA host sim rate (local-time units)
         self._last = None    # (local_time, host_time) previous sample
+        self._last_jitter = None  # Session 7.5a: per-arrival jitter sample
 
     @property
     def ready(self):
@@ -178,12 +180,28 @@ class HostTimeEstimator:
         the 7.8 debug overlay."""
         return self._rate
 
+    @property
+    def last_jitter(self):
+        """The per-arrival jitter sample of the LAST recorded snapshot
+        (Session 7.5a), or None until one exists:
+        `|offset_sample - offset_ema_before|` — how far this arrival's
+        offset sample (host_time - rate * local_time) was from the
+        intercept EMA it fed. The 7.1 offset samples, repurposed: a
+        steady arrival pattern sits near 0, a late/early packet spikes.
+        Exposed so LatencyTracker can consume it (and for the 7.8 debug
+        overlay)."""
+        return self._last_jitter
+
     def record(self, local_time, host_sim_time):
         """Record a snapshot that was taken at `host_sim_time` (its wire
         stamp) and observed at `local_time`. Out-of-order stamps (should not
-        happen over TCP) are dropped, like SnapshotBuffer.push."""
+        happen over TCP) are dropped, like SnapshotBuffer.push.
+
+        Returns True if the sample was recorded, False if it was dropped
+        (Session 7.5a: the caller feeds the jitter sample to the
+        LatencyTracker only on a recorded arrival)."""
         if self._last is not None and host_sim_time <= self._last[1]:
-            return
+            return False
         if self._last is not None:
             lt0, ht0 = self._last
             if local_time > lt0:
@@ -193,9 +211,15 @@ class HostTimeEstimator:
         a_sample = host_sim_time - self._rate * local_time
         if self._a is None:
             self._a = a_sample
+            self._last_jitter = 0.0
         else:
+            # Session 7.5a: the jitter sample is measured against the
+            # intercept EMA BEFORE this sample updates it — the deviation
+            # of this arrival from the pattern the EMA represents.
+            self._last_jitter = abs(a_sample - self._a)
             self._a += self.OFFSET_ALPHA * (a_sample - self._a)
         self._last = (local_time, host_sim_time)
+        return True
 
     def now(self, local_time):
         """Estimated host sim time at `local_time` (None before the first
@@ -209,6 +233,117 @@ class HostTimeEstimator:
         if est > newest + self.MAX_LEAD:
             return newest + self.MAX_LEAD
         return est
+
+
+class LatencyTracker:
+    """The adaptive interpolation delay (Session 7.5a).
+
+    A fixed INTERP_DELAY (0.1 s) is the right lag for a clean connection,
+    but on a jittery wifi link a snapshot that arrives late strands the
+    render point ahead of the data: the buffer clamps to the newest
+    snapshot and the remote render stutters (the 7.1 MAX_LEAD cap turns
+    the outrun into a hold, but a hold is still a stall). The fix is to
+    render FURTHER in the past when the arrival pattern is ragged: the
+    delay grows with the measured jitter, so a late packet lands inside
+    the window instead of behind the render point.
+
+    The delay is a PURE FUNCTION OF THE ARRIVAL PATTERN — this class is
+    the 7.5a scope: it computes the value, nothing consumes it yet
+    (7.5b re-anchors the render point to it). The input is the
+    HostTimeEstimator's per-arrival jitter sample
+    (`HostTimeEstimator.last_jitter` — `|offset_sample - offset_ema|`,
+    the 7.1 offset samples repurposed): a steady 10 Hz stream sits near
+    0, a late/early packet spikes.
+
+    The law (config knobs, see config.py):
+
+        delay = clamp(INTERP_DELAY + ADAPT_K * EMA(jitter),
+                      INTERP_DELAY_MIN, INTERP_DELAY_MAX)
+
+    with EMA alpha = 0.2 (the same time constant as the estimator's
+    offset EMA — a 10 Hz sample stream settles in ~0.1 s). Two
+    disciplines on top of the clamp:
+
+      - the delay only ever moves by at most MAX_STEP = 1/60 s per
+        frame, so the render point (7.5b: newest_snap - delay) can never
+        jump — a jitter spike raises the delay over ~20 frames instead of
+        teleporting the render ~100 ms into the past;
+      - the delay never shrinks below INTERP_DELAY_MIN (= INTERP_DELAY,
+        the base) — adaptation only adds lag, it never goes under the
+        clean-connection value.
+
+    Wiring (the 7.5b seam, documented here in 7.5a): the client calls
+    `estimator.record(now, stamp)` on each snapshot arrival and, when it
+    returns True, `tracker.update(estimator.last_jitter)`; every frame it
+    calls `tracker.tick(dt)` (the per-frame smoothing step) and reads
+    `tracker.delay`.
+    """
+
+    ALPHA = 0.2          # jitter EMA (same time constant as the 7.1 offset EMA)
+    MAX_STEP = 1.0 / 60.0  # the delay may move at most this far per frame
+
+    def __init__(self, base=INTERP_DELAY, k=ADAPT_K,
+                 delay_min=INTERP_DELAY_MIN, delay_max=INTERP_DELAY_MAX):
+        self._base = base
+        self._k = k
+        self._min = delay_min
+        self._max = delay_max
+        self._jitter_ema = 0.0
+        self._delay = base
+        self._samples = 0
+
+    @property
+    def delay(self):
+        """The current adaptive delay in seconds. Always within
+        [INTERP_DELAY_MIN, INTERP_DELAY_MAX]; INTERP_DELAY before the
+        first sample."""
+        return self._delay
+
+    @property
+    def jitter_ema(self):
+        """The current EMA of the per-arrival jitter samples (None before
+        the first sample). Exposed for the 7.8 debug overlay."""
+        if self._samples == 0:
+            return None
+        return self._jitter_ema
+
+    @property
+    def samples(self):
+        """Number of jitter samples consumed (diagnostics)."""
+        return self._samples
+
+    def update(self, jitter_sample):
+        """Consume one per-arrival jitter sample (a non-negative seconds
+        value from HostTimeEstimator.last_jitter). Only called on a
+        RECORDED snapshot arrival (estimator.record returned True) — a
+        dropped out-of-order stamp carries no new information."""
+        if self._samples == 0:
+            self._jitter_ema = jitter_sample
+        else:
+            self._jitter_ema += self.ALPHA * (jitter_sample - self._jitter_ema)
+        self._samples += 1
+        self._target()
+
+    def tick(self, dt):
+        """Per-frame smoothing step: move the delay toward its target by
+        at most MAX_STEP (1/60 s), so the render point it drives (7.5b)
+        can never jump. `dt` is the real frame time; the step is
+        frame-BOUND (one frame may move at most MAX_STEP regardless of
+        dt), which is what keeps the render point continuous on any
+        display refresh rate."""
+        self._step_toward(self._target())
+
+    def _target(self):
+        """The unsmoothed delay the EMA wants: BASE + k * EMA(jitter),
+        clamped to [MIN, MAX]."""
+        d = self._base + self._k * self._jitter_ema
+        return max(self._min, min(self._max, d))
+
+    def _step_toward(self, target):
+        if target > self._delay:
+            self._delay = min(target, self._delay + self.MAX_STEP)
+        elif target < self._delay:
+            self._delay = max(target, self._delay - self.MAX_STEP)
 
 
 def _enemy_pos(e_s):

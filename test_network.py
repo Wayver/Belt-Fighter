@@ -65,9 +65,10 @@ import pygame
 
 from .config import WIDTH, HEIGHT, FPS, INTERP_DELAY, ROT_SPEED
 from .fog import make_light_texture
-from .game import Game
+from .game import Game, STEP
 from .hulls import PLAYER_HULLS, default_loadout
 from .sound import SoundBank
+from .intent import ShipInput
 from . import __main__ as M
 
 
@@ -220,6 +221,21 @@ def main():
         # now that the ghost is seeded and the buffer holds a window.
         check("predicted_view renders a frame (non-None)",
               client.predicted_view(0.016, _KEYS) is not None)
+
+        # Session 7.3: the ghost keeps its OWN gun shots, so the player sees
+        # their fire immediately instead of waiting ~100 ms for the host's
+        # next snapshot. Fire SPACE through predicted_view (each call
+        # advances the ghost by 0.016 s of real time -> whole STEP steps)
+        # and check the ghost's local_bullets list fills. The host's
+        # player-1 ship (the client's ship) has only been thrusting (W),
+        # so its gun cooldown is still 0 and the ghost fires on the first
+        # held-fire step.
+        _FIRE_KEYS = _Keys({pygame.K_w: 1, pygame.K_SPACE: 1})
+        for _ in range(3):
+            client.predicted_view(0.016, _FIRE_KEYS)
+        check("client ghost fires local bullets (7.3)",
+              len(client.ghost.local_bullets) >= 1,
+              "n=%d" % len(client.ghost.local_bullets))
 
         # Session 6.8: the buffer carries the remote ship's ANGLE as well as
         # its position, so the client can draw the remote hull at its

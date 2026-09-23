@@ -54,8 +54,10 @@ Snapshot layout (see Game.snapshot in game.py):
 """
 import math
 
-from .config import INTERP_DELAY, SNAPSHOT_INTERVAL, TICK, MAX_FRAME_DT
+from .config import (INTERP_DELAY, SNAPSHOT_INTERVAL, TICK, MAX_FRAME_DT,
+                    MAX_BULLETS)
 from .ship import Ship
+from .bullets import Bullet
 
 __all__ = ["interp_positions", "lerp", "lerp_angle", "SnapshotBuffer",
            "PredictedShip", "HostTimeEstimator"]
@@ -569,6 +571,18 @@ class PredictedShip:
     and reconciled to authority, but it never feeds the sim. The sim stays
     authoritative on one peer; this only feeds the render.
 
+    Local bullets (Session 7.3): the ghost also keeps its OWN gun shots as
+    presentation `Bullet`s (`self.local_bullets`), so the player sees their
+    own fire immediately instead of waiting ~100 ms for the host's next
+    snapshot. They are stepped at the sim's rate (via `advance`) and culled
+    on expiry. They are NOT reconciled to the authoritative list: the 2P
+    snapshot carries no stable player id (both ships are ship_id 0), so the
+    local player's authoritative bullets cannot be isolated by owner — and
+    the ghost's own bullets ARE the local player's by construction (same
+    input + weapon state the host applies). They are presentation only:
+    they never collide, never feed the sim, and the remote peer's own
+    bullets still come from the interpolation buffer (Session 7.2).
+
     Known limitation (v1): reconciliation is a FULL SNAP — the ghost jumps
     to the authoritative position when a snapshot lands. Dead-reckoning
     rewind (replaying a local input buffer from the last reconciled state)
@@ -584,7 +598,7 @@ class PredictedShip:
     by the test, not eliminated.
     """
 
-    def __init__(self, hull=None, loadout=None):
+    def __init__(self, hull=None, loadout=None, local_index=0):
         # A self-contained Ship: __init__ builds components/thrusters/
         # weapons/shield/sensors/collision from the hull+loadout and holds
         # no reference to Game, so it can be stepped in isolation.
@@ -594,6 +608,17 @@ class PredictedShip:
         # into whole STEP steps so the ghost runs at the sim's rate on any
         # display refresh rate.
         self._acc = 0.0
+        # Session 7.3: the ghost's OWN gun shots, as presentation Bullets.
+        # The client never runs the sim, so without this the player's own
+        # shots appear only when the host's next snapshot arrives (~100 ms
+        # later) — "I fired and nothing happened for a tenth of a second".
+        # `local_index` is the local player's index (0 = host, 1 = client);
+        # it is carried for diagnostics and so a future session can match
+        # the authoritative local-owner bullets (the 2P snapshot carries no
+        # stable player id — both ships are ship_id 0 — so 7.3 keeps the
+        # ghost's own bullets as the local player's by construction).
+        self.local_index = local_index
+        self.local_bullets = []
 
     @property
     def ship(self):
@@ -626,9 +651,16 @@ class PredictedShip:
         `dt` is passed by the caller (the sim's STEP) because netcode.py
         must not import it from game.py (game.py imports netcode.py). The
         Game-fed per-tick fields are reset to idle before the step — the
-        ghost has no enemy list to target (see class docstring). The
-        returned (shots, beams, missiles) are discarded: the ghost's
-        weapons are presentation and its projectiles are not rendered.
+        ghost has no enemy list to target (see class docstring).
+
+        Session 7.3: the SHOTS the ghost's gun fires this step are kept as
+        presentation `Bullet`s in `self.local_bullets` (capped at
+        MAX_BULLETS, mirroring the host's world cap) so the player sees
+        their own shots immediately instead of waiting ~100 ms for the
+        host's next snapshot. Beams and missiles are still discarded
+        (out of 7.3 scope — deferred). Call `step_local_bullets` after
+        `step` to advance + cull the list (the game loop does this via
+        `advance`).
 
         The game loop does NOT call this directly — it calls `advance`,
         which decides how many fixed steps a real frame warrants. Tests
@@ -639,7 +671,26 @@ class PredictedShip:
         s.laser_target = None
         s.missile_target = None
         s.contacts = []
-        s.update(dt, inp)
+        shots, _beams, _missiles = s.update(dt, inp)
+        # Keep the ghost's own gun shots (Session 7.3). The host's world
+        # cap is MAX_BULLETS total; the ghost's list holds only the local
+        # player's shots, so capping it at MAX_BULLETS is a faithful
+        # (slightly generous) stand-in — the gun's own cooldown is the
+        # real limiter.
+        for shot in shots:
+            if len(self.local_bullets) < MAX_BULLETS:
+                self.local_bullets.append(
+                    Bullet(shot.pos, shot.vel, owner=shot.owner))
+
+    def step_local_bullets(self, dt):
+        """Advance the ghost's local bullets by `dt` and cull the dead
+        (Session 7.3). Mirrors the host's `for b in self.bullets:
+        b.update(dt)` + `self.bullets = [b for b in ... if b.life > 0]`.
+        Called by `advance` after each ghost step; tests may call it
+        directly. `dt` is the sim's STEP (passed in, not imported)."""
+        for b in self.local_bullets:
+            b.update(dt)
+        self.local_bullets = [b for b in self.local_bullets if b.life > 0]
 
     def advance(self, dt, inp):
         """Advance the ghost by real time `dt` (Session 7.1).
@@ -662,6 +713,7 @@ class PredictedShip:
         n = 0
         while self._acc >= TICK:
             self.step(TICK, inp)
+            self.step_local_bullets(TICK)   # Session 7.3: advance + cull
             self._acc -= TICK
             n += 1
         return n

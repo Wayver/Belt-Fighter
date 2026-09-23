@@ -163,7 +163,7 @@ class Game:
         self.sim_time = 0.0
         self._snap_tick = 0        # sim ticks since the last snapshot stamp
         self.snap_buf = SnapshotBuffer()
-        self.ghost = PredictedShip()   # local-ship prediction ghost (5b.4b)
+        self.ghost = PredictedShip(local_index=local_index)   # local-ship prediction ghost (5b.4b); local_index (7.3) carried for the ghost's own-bullet bookkeeping
         # Session 7.2: per-tag enemy-hull stand-ins for the remote render
         # (built lazily on first use — the client only, via
         # _get_remote_enemies; the host never draws remote enemies).
@@ -1233,6 +1233,17 @@ class Game:
         self.ghost.ship.draw(screen, self.cam,
                              self.ghost.ship.pos, self.ghost.ship.angle)
 
+        # The player's OWN gun shots (Session 7.3): the ghost's predicted
+        # bullets, drawn immediately at their predicted positions so the
+        # player sees their fire the instant they pull the trigger — not
+        # ~100 ms later when the host's next snapshot arrives. Drawn the
+        # same way the host draws the local player's bullets (a
+        # BULLET_COLOR dot at the bullet's position). Presentation only:
+        # no collision, no sim feedback. (Missiles/beams are deferred.)
+        for b in self.ghost.local_bullets:
+            s = self.cam.to_screen(b.pos)
+            pygame.draw.circle(screen, BULLET_COLOR, (int(s.x), int(s.y)), 3)
+
         # Targeting reticle (Session 7.2): the client has no enemy list
         # to target (it never runs the sim), so build lightweight proxies
         # from the buffer's enemy entries (pos + vel from the
@@ -1253,6 +1264,10 @@ class Game:
         # light at each lead point (mirrors _build_lights' guard so the
         # light and the reticle appear/disappear together).
         lights = self._remote_fog_lights(pos, self.ghost.ship)
+        # The player's OWN gun shots glow too (Session 7.3) — mirrors the
+        # host's _build_lights, which adds a LightSource per player bullet.
+        for b in self.ghost.local_bullets:
+            lights.append(LightSource(b.pos, 30, 0.5))
         for e in proxies:
             p = e.lead_point(self.ghost.ship.pos, BULLET_SPEED,
                              TARGETING_USE_ACCEL)

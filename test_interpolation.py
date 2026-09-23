@@ -138,7 +138,7 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 import pygame
 
 from .config import WIDTH, HEIGHT, SNAPSHOT_INTERVAL, INTERP_DELAY, \
-    MAX_FRAME_DT
+    MAX_FRAME_DT, MAX_BULLETS
 from .fog import make_light_texture
 from .game import Game, STEP
 from .ai_enemy import AIEnemy
@@ -146,6 +146,7 @@ from .asteroid import Asteroid
 from .netcode import (interp_positions, SnapshotBuffer, PredictedShip,
                       HostTimeEstimator)
 from .intent import ShipInput
+from .bullets import Bullet
 
 WARMUP = 300   # ticks before the first pair of snapshots (sim is hot)
 K = 6          # ticks between snap_prev and snap_curr = one snapshot
@@ -1116,6 +1117,100 @@ def main():
               f"{n_dropout} drop-out absent (20 windows)")
     else:
         ok = False
+
+    # --- (i) local bullet prediction (Session 7.3): the ghost keeps its OWN
+    # gun shots as presentation Bullets so the player sees their fire
+    # immediately instead of waiting ~100 ms for the host's next snapshot.
+    # The ghost is stepped with the SAME scripted input the sim uses
+    # (script_input holds SPACE in 30-tick bursts), and its local bullets
+    # are advanced + culled each step. Three checks:
+    #   1. FIRE TIMING — the ghost produces a local bullet within 1 step
+    #      of the first tick its fire input is held (the gun's cooldown
+    #      starts at 0, so the first held-fire tick fires).
+    #   2. CAP — the list never exceeds MAX_BULLETS (the host's world cap).
+    #   3. STRAIGHT LINE — a tracked bullet moves at exactly its speed per
+    #      step (bullets don't steer), so its per-step displacement equals
+    #      speed * STEP (within float tolerance).
+    #   4. CULL — over the run at least one bullet expires (life < run),
+    #      proving the cull path runs (a bullet that never dies would mean
+    #      the list only ever grows).
+    AIEnemy._next_id = 1
+    Asteroid._next_id = 1
+    g = PredictedShip()
+    first_fire = None
+    first_bullet = None
+    max_list = 0
+    culls = 0
+    max_step_err = 0.0
+    for t in range(RUN_TICKS):
+        keys = script_input(t)
+        inp = ShipInput.from_keys(keys)
+        fire = inp.fire
+        if fire and first_fire is None:
+            first_fire = t
+        n_before = len(g.local_bullets)
+        g.step(STEP, inp)
+        # Snapshot each bullet's position (and speed) BEFORE the bullet
+        # step, so the straight-line check measures the displacement the
+        # ghost's step_local_bullets actually applied (not a tautology on
+        # Bullet.update's own prev_pos).
+        prev_pos = {id(b): (b.pos.x, b.pos.y,
+                            math.hypot(b.vel.x, b.vel.y))
+                    for b in g.local_bullets}
+        g.step_local_bullets(STEP)
+        n_after = len(g.local_bullets)
+        max_list = max(max_list, n_after)
+        if n_after > n_before and first_bullet is None:
+            first_bullet = t
+        # Straight line: every surviving bullet moved exactly speed*STEP
+        # (bullets don't steer — only their position changes per step).
+        for b in g.local_bullets:
+            pp = prev_pos.get(id(b))
+            if pp is not None:
+                moved = math.hypot(b.pos.x - pp[0], b.pos.y - pp[1])
+                max_step_err = max(max_step_err,
+                                   abs(moved - pp[2] * STEP))
+        # Count a cull when the list shrank (a bullet expired).
+        if n_after < n_before:
+            culls += 1
+    if first_fire is None:
+        ok = False
+        print("FAIL: local bullets — the scripted input never fired; "
+              "the test would be vacuous")
+    else:
+        # 1. fire timing: a bullet within 1 step of the first held-fire tick
+        if first_bullet is not None and first_bullet <= first_fire + 1:
+            print(f"PASS: local bullet fire timing — first bullet at tick "
+                  f"{first_bullet} (first fire {first_fire}, within 1 step)")
+        else:
+            ok = False
+            print(f"FAIL: local bullet fire timing — first bullet at tick "
+                  f"{first_bullet}, first fire {first_fire} (want <= "
+                  f"{first_fire + 1})")
+        # 2. cap
+        if max_list <= MAX_BULLETS:
+            print(f"PASS: local bullet cap — max list {max_list} <= "
+                  f"MAX_BULLETS {MAX_BULLETS}")
+        else:
+            ok = False
+            print(f"FAIL: local bullet cap — max list {max_list} > "
+                  f"MAX_BULLETS {MAX_BULLETS}")
+        # 3. straight line: per-step displacement == speed * STEP
+        if max_step_err < 1e-6:
+            print(f"PASS: local bullet straight line — max per-step "
+                  f"displacement error {max_step_err:.2e} < 1e-6")
+        else:
+            ok = False
+            print(f"FAIL: local bullet straight line — max per-step "
+                  f"displacement error {max_step_err:.2e} >= 1e-6")
+        # 4. cull ran
+        if culls > 0:
+            print(f"PASS: local bullet cull — {culls} bullet(s) expired "
+                  f"over {RUN_TICKS} ticks")
+        else:
+            ok = False
+            print(f"FAIL: local bullet cull — no bullet expired over "
+                  f"{RUN_TICKS} ticks (the cull path never ran)")
 
     print(f"PASS: cadence knobs — SNAPSHOT_INTERVAL={SNAPSHOT_INTERVAL} "
           f"ticks, INTERP_DELAY={INTERP_DELAY}s")

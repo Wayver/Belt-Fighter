@@ -117,40 +117,64 @@ class HostTimeEstimator:
 
     Instead: each snapshot is stamped with the host's sim time at send and
     arrives at a known local time, so every arrival is a sample of the
-    mapping `host_sim_time ≈ A + rate * local_time`. This class fits that
-    AFFINE model with two EMAs (one sample per snapshot, 10 Hz):
+    mapping from local time to host sim time. This class fits that mapping
+    as a line in POINT-SLOPE form, anchored on the NEWEST sample
+    (Session 7.9):
 
-      - `rate` — the host's sim rate in local-time units, from consecutive
-        samples (Δhost/Δlocal). A healthy 60 FPS host is 1.0; a struggling
-        host (loop slower than the dt clamp) simulates slower than real
-        time, and the estimate must follow that or it drifts away from the
-        host's clock. Clamped to [RATE_MIN, RATE_MAX] as a sanity bound —
-        and this clamp is what bounds the whole estimate: with the true
-        rate inside the clamp, the rate error is at most 0.6, which keeps
-        the intercept error below ~0.06 s (offset EMA at 10 Hz samples).
-      - `A` — the intercept (absorbs the constant send latency + the host
-        loop's start offset). No per-sample clamp: a single late packet
-        moves A by at most ~one snapshot interval for one sample, and the
-        next sample corrects it — while a clamp would prevent A from
-        catching up whenever the rate estimate is off (the 7.1 e2e
-        regression: a contended host simulating at ~0.56x real time left
-        the clamped estimate 0.35 s behind).
+        host_time ≈ h_anchor + rate * (local_time - t_anchor)
 
-    `now(local_time)` = A + rate * local_time — the host's own clock as
-    carried by the wire, not the display's — CAPPED at the newest sample's
-    stamp + MAX_LEAD (one snapshot interval). The cap anchors the estimate
-    on the DATA, not the model: if the host starves (a contended loop
-    simulating at 0.1x real time), samples arrive a full second apart and
-    extrapolating at the clamped rate would run the estimate far ahead of
-    the data, making the render point clamp-stutter. Capped, the estimate
-    holds within one snapshot interval of the newest stamp, so the render
-    point (sim_time - INTERP_DELAY) sits at or behind the newest snapshot
-    and the remote render simply holds the last frame while the host
-    catches up. In steady state (1x host, 10 Hz samples) the cap never
-    binds — the estimate is at most ~0.01 s ahead of the newest sample.
+    where (t_anchor, h_anchor) is the newest recorded sample's
+    (local_time, stamp) and `rate` is an EMA of the host's sim rate in
+    local-time units (one sample per snapshot, 10 Hz). In steady state this
+    is the same line as the 7.1 affine fit `A + rate * local_time` — but
+    the offset is now a small DELTA (the time since the newest sample, at
+    most a few snapshot intervals), not an absolute intercept.
+
+    Why point-slope, not the 7.1 absolute intercept `A + rate * local_time`?
+    The 7.1 form computed `A = host_time - rate * local_time` — a difference
+    of two LARGE numbers (local_time is pygame ticks since init, which grows
+    unboundedly: 86 s in the 7.8 log). Any small error in `rate` is then
+    amplified by that large local_time (a 0.01 rate error at local_time 86 s
+    is a 0.86 s offset error), so the estimate's error GREW over the session
+    (the 7.8 log: |est - newest| went 0.45 s -> 1.0 s on the 4090, 0.69 s ->
+    1.24 s on the Mac). Re-anchoring to the newest sample makes the offset a
+    small delta, so the estimate stays well-conditioned for the WHOLE session
+    — the leverage is bounded by the time since the newest sample, not by the
+    session length.
+
+    `rate` — the host's sim rate in local-time units, from consecutive
+    samples (Δhost/Δlocal). A healthy 60 FPS host is 1.0; a struggling host
+    (loop slower than the dt clamp) simulates slower than real time, and the
+    estimate must follow that or it drifts away from the host's clock.
+    Clamped to [RATE_MIN, RATE_MAX] as a sanity bound. (The rate EMA is
+    unchanged from 7.1 — only the offset representation was re-anchored.)
+
+    `now(local_time)` = h_anchor + rate * (local_time - t_anchor) — the
+    host's own clock as carried by the wire, not the display's — CAPPED at
+    the newest sample's stamp + MAX_LEAD (one snapshot interval). The cap
+    anchors the estimate on the DATA, not the model: if the host starves (a
+    contended loop simulating at 0.1x real time), samples arrive a full
+    second apart and extrapolating at the clamped rate would run the estimate
+    far ahead of the data, making the render point clamp-stutter. Capped, the
+    estimate holds within one snapshot interval of the newest stamp, so the
+    render point (sim_time - INTERP_DELAY) sits at or behind the newest
+    snapshot and the remote render simply holds the last frame while the host
+    catches up. In steady state (1x host, 10 Hz samples) the cap never binds
+    — the estimate is at most ~0.01 s ahead of the newest sample.
+
+    The per-arrival jitter sample (`last_jitter`) is the PREDICTION RESIDUAL
+    (Session 7.9): how far this arrival's stamp is from where the PREVIOUS
+    model (the previous anchor + rate) predicted it would be. A steady
+    arrival sits near 0; a late/early packet spikes. This is the
+    well-conditioned replacement for the 7.1 offset sample
+    (`host_time - rate * local_time`), which had the same leverage problem as
+    the intercept. It is the input the LatencyTracker consumes (7.5a).
 
     `local_time` is any monotonically increasing seconds value the caller
     has (pygame.time.get_ticks()/1000.0 in the game loop; plain t in tests).
+    It may be large (it grows for the whole session) — the point-slope form
+    only ever computes the SMALL difference (local_time - t_anchor), so a
+    large local_time is harmless.
 
     Session 7.5b: this estimate is NO LONGER the client's render clock.
     The render point is now anchored on the DATA — the newest ARRIVED
@@ -164,25 +188,36 @@ class HostTimeEstimator:
 
     RATE_ALPHA = 0.5
     RATE_MIN, RATE_MAX = 0.4, 1.5
-    OFFSET_ALPHA = 0.2
+    # Session 7.9: no OFFSET_ALPHA — the offset is no longer an EMA of
+    # `host_time - rate * local_time` (that form's leverage made the error
+    # grow over the session). The offset is the point-slope anchor itself
+    # (the newest sample), which is exact by construction.
     MAX_LEAD = SNAPSHOT_INTERVAL * TICK   # one snapshot interval
 
     def __init__(self):
-        self._a = None       # EMA intercept: host_time - rate * local_time
+        # Session 7.9: point-slope anchor (the newest recorded sample), not
+        # an absolute intercept — see the class docstring for why the
+        # absolute-intercept form's leverage made the estimate's error grow
+        # over the session.
+        self._anchor = None  # (local_time, host_time) of the newest sample
         self._rate = 1.0     # EMA host sim rate (local-time units)
-        self._last = None    # (local_time, host_time) previous sample
         self._last_jitter = None  # Session 7.5a: per-arrival jitter sample
 
     @property
     def ready(self):
         """True once at least one snapshot has been recorded."""
-        return self._a is not None
+        return self._anchor is not None
 
     @property
     def offset(self):
-        """Current intercept estimate A (None before the first snapshot).
-        Exposed for the 7.8 debug overlay."""
-        return self._a
+        """The current anchor's HOST stamp (None before the first
+        snapshot). Session 7.9: this is the point-slope anchor's host_time
+        (h_anchor), NOT the 7.1 absolute intercept A — the estimate is now
+        `offset + rate * (local_time - anchor_local_time)`. Exposed for the
+        7.8 debug overlay."""
+        if self._anchor is None:
+            return None
+        return self._anchor[1]
 
     @property
     def rate(self):
@@ -193,11 +228,16 @@ class HostTimeEstimator:
     @property
     def last_jitter(self):
         """The per-arrival jitter sample of the LAST recorded snapshot
-        (Session 7.5a), or None until one exists:
-        `|offset_sample - offset_ema_before|` — how far this arrival's
-        offset sample (host_time - rate * local_time) was from the
-        intercept EMA it fed. The 7.1 offset samples, repurposed: a
-        steady arrival pattern sits near 0, a late/early packet spikes.
+        (Session 7.5a), or None until one exists.
+
+        Session 7.9: this is the PREDICTION RESIDUAL — how far this
+        arrival's stamp is from where the PREVIOUS model (the previous
+        anchor + rate) predicted it would be:
+        `|host_sim_time - (h_anchor_prev + rate * (local_time - t_anchor_prev))|`.
+        A steady arrival sits near 0; a late/early packet spikes. This is
+        the well-conditioned replacement for the 7.1 offset sample
+        (`host_time - rate * local_time`), which had the same leverage
+        problem as the intercept (it was a difference of two large numbers).
         Exposed so LatencyTracker can consume it (and for the 7.8 debug
         overlay)."""
         return self._last_jitter
@@ -209,37 +249,64 @@ class HostTimeEstimator:
 
         Returns True if the sample was recorded, False if it was dropped
         (Session 7.5a: the caller feeds the jitter sample to the
-        LatencyTracker only on a recorded arrival)."""
-        if self._last is not None and host_sim_time <= self._last[1]:
+        LatencyTracker only on a recorded arrival).
+
+        Session 7.9 (point-slope re-anchor): the model is
+        `host = h_anchor + rate * (local_time - t_anchor)`, anchored on the
+        NEWEST sample. On each recorded arrival:
+          1. the jitter sample is the PREDICTION RESIDUAL — how far this
+             arrival's stamp is from where the PREVIOUS anchor + PREVIOUS
+             rate predicted it (a small, well-conditioned number, unlike the
+             7.1 offset sample);
+          2. the RATE EMA is updated from the Δhost/Δlocal of the two newest
+             samples (unchanged from 7.1);
+          3. the anchor is MOVED to this newest sample (t_anchor, h_anchor)
+             = (local_time, host_sim_time).
+        Because the anchor is always the newest sample, `now()` extrapolates
+        forward from real data at the fitted rate — and the offset it adds is
+        a small delta (time since the newest sample), so the estimate stays
+        well-conditioned for the whole session (no leverage growth)."""
+        if self._anchor is not None and host_sim_time <= self._anchor[1]:
             return False
-        if self._last is not None:
-            lt0, ht0 = self._last
+        if self._anchor is not None:
+            lt0, ht0 = self._anchor
+            # Session 7.9: the jitter sample is the PREDICTION RESIDUAL —
+            # how far this arrival's stamp is from where the PREVIOUS model
+            # (previous anchor + PREVIOUS rate) predicted it. Computed with
+            # the rate BEFORE this sample updates it (the standard
+            # innovation: measurement minus the prior model's prediction),
+            # so a late packet spikes the full amount instead of being
+            # partially absorbed into the rate EMA. A steady arrival sits
+            # near 0; a late/early packet spikes. Well-conditioned (a small
+            # delta), unlike the 7.1 offset sample.
+            predicted = ht0 + self._rate * (local_time - lt0)
+            self._last_jitter = abs(host_sim_time - predicted)
             if local_time > lt0:
                 r = (host_sim_time - ht0) / (local_time - lt0)
                 r = max(self.RATE_MIN, min(self.RATE_MAX, r))
                 self._rate += self.RATE_ALPHA * (r - self._rate)
-        a_sample = host_sim_time - self._rate * local_time
-        if self._a is None:
-            self._a = a_sample
-            self._last_jitter = 0.0
         else:
-            # Session 7.5a: the jitter sample is measured against the
-            # intercept EMA BEFORE this sample updates it — the deviation
-            # of this arrival from the pattern the EMA represents.
-            self._last_jitter = abs(a_sample - self._a)
-            self._a += self.OFFSET_ALPHA * (a_sample - self._a)
-        self._last = (local_time, host_sim_time)
+            self._last_jitter = 0.0
+        # Move the anchor to this newest sample (point-slope re-anchor).
+        self._anchor = (local_time, host_sim_time)
         return True
 
     def now(self, local_time):
         """Estimated host sim time at `local_time` (None before the first
         snapshot). Capped at the newest sample's stamp + MAX_LEAD — see
         the class docstring for why the estimate must stay anchored on the
-        data when the host starves."""
-        if self._a is None:
+        data when the host starves.
+
+        Session 7.9: point-slope form — extrapolate FORWARD from the newest
+        sample (the anchor) at the fitted rate:
+        `h_anchor + rate * (local_time - t_anchor)`. The offset is a small
+        delta (time since the newest sample), so the estimate stays
+        well-conditioned for the whole session (no leverage growth)."""
+        if self._anchor is None:
             return None
-        est = self._a + self._rate * local_time
-        newest = self._last[1]
+        t_anchor, h_anchor = self._anchor
+        est = h_anchor + self._rate * (local_time - t_anchor)
+        newest = h_anchor          # the anchor IS the newest sample
         if est > newest + self.MAX_LEAD:
             return newest + self.MAX_LEAD
         return est

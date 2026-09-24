@@ -10,8 +10,10 @@ Three modes (chosen on the menu's mode screen, Session 6.4):
            local ship, interpolate the remote entities), send input every
            frame, push each snapshot, render via predicted_view.
 """
+import os
 import socket
 import sys
+import time
 
 import pygame
 
@@ -188,6 +190,89 @@ def _draw_joining(screen, font, big_font, ip, port):
                        HEIGHT // 2 + 20))
 
 
+def _input_str(inp):
+    """A compact string of the held input for the net debug log (7.8):
+    e.g. 'W', 'W+Q', 'W+Q+SPACE'. Empty string = no input."""
+    parts = []
+    if inp.turn < 0:
+        parts.append("Q")
+    if inp.turn > 0:
+        parts.append("E")
+    if inp.thrust_fwd:
+        parts.append("W")
+    if inp.thrust_rev:
+        parts.append("S")
+    if inp.thrust_left:
+        parts.append("A")
+    if inp.thrust_right:
+        parts.append("D")
+    if inp.fire:
+        parts.append("SPACE")
+    if inp.laser_fire:
+        parts.append("R")
+    if inp.missile_fire:
+        parts.append("2")
+    if inp.stop:
+        parts.append("B")
+    return "+".join(parts)
+
+
+def _draw_net_debug(screen, font, game, inp):
+    """Session 7.8: the net debug overlay (client only, F3-toggled). Small
+    text top-right (the HUD occupies the top-left). Shows the live
+    feel-layer state: adaptive delay, latency jitter, buffer depth, newest
+    snapshot age, render point, host-time estimate, and the LAST snap size
+    (the ghost's displacement across the most recent reconcile — the key
+    number: ~0 = dead-reckoning is exact, large = prediction diverged)."""
+    rp = game.render_point.now()
+    newest = game.snap_buf.newest_time()
+    est = game.host_time.now(pygame.time.get_ticks() / 1000.0)
+    jit = game.latency.jitter_ema   # None until the first sample
+    lines = [
+        "NET DEBUG (F3 off)",
+        "delay   %.3f s" % game.latency.delay,
+        "jitter  %s" % ("%.3f s" % jit if jit is not None else "-"),
+        "buf     %d snaps" % len(game.snap_buf),
+        "newest  %s" % ("%.3f s" % newest if newest is not None else "-"),
+        "render  %s" % ("%.3f s" % rp if rp is not None else "-"),
+        "host est%s" % (" %.3f s" % est if est is not None else " -"),
+        "SNAP    %.2f px" % game.last_snap_px,
+        "input   %s" % (_input_str(inp) or "-"),
+    ]
+    y = 8
+    for ln in lines:
+        s = font.render(ln, True, (120, 220, 120))
+        screen.blit(s, (WIDTH - s.get_width() - 8, y))
+        y += s.get_height() + 2
+
+
+def _log_net_debug(game, inp):
+    """Session 7.8: append one CSV line per reconcile (10 Hz) to
+    net_debug.csv (client only, F3-toggled). The overlay shows the LATEST
+    snap size; the log captures the DISTRIBUTION over the session + the
+    input that was active, so the snap-size vs input-change correlation
+    (in-flight input vs clock error) can be analyzed offline."""
+    f = game._dbg_log_f
+    if f is None:
+        f = open(game._dbg_log_path, "w", newline="")
+        f.write("t,snap_px,input,delay,jitter_ema,buf_depth,newest_stamp,"
+                "render_t,host_time_est\n")
+        game._dbg_log_f = f
+    rp = game.render_point.now()
+    newest = game.snap_buf.newest_time()
+    est = game.host_time.now(pygame.time.get_ticks() / 1000.0)
+    jit = game.latency.jitter_ema   # None until the first sample
+    f.write("%.3f,%.3f,%s,%.4f,%s,%d,%s,%s,%s\n" % (
+        time.time(), game.last_snap_px, _input_str(inp),
+        game.latency.delay,
+        ("%.4f" % jit) if jit is not None else "",
+        len(game.snap_buf),
+        ("%.4f" % newest) if newest is not None else "",
+        ("%.4f" % rp) if rp is not None else "",
+        ("%.4f" % est) if est is not None else ""))
+    f.flush()
+
+
 def run_client(screen, font, big_font, clock, sfx, menu, seed,
                light_tex, fog_surf, light_surf):
     """Join a 2P game (Session 6.6).
@@ -262,6 +347,16 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
     # point outrunning the data and clamp-stuttering. This replaces the
     # 7.1 host-time-estimate render clock for the render point.
     game.render_point = RenderPoint(game.latency)
+    # Session 7.8: net debug overlay + CSV log (client only). F3 toggles
+    # game.debug_net (via handle_events); while on, the loop draws the
+    # overlay and appends one CSV line per reconcile to net_debug.csv.
+    # `last_logged` tracks the last snap_count written so each reconcile is
+    # logged exactly once (reconciles are 10 Hz, far slower than the 60 Hz
+    # frame rate).
+    game._dbg_last_logged = 0
+    game._dbg_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                      "net_debug.csv")
+    game._dbg_log_f = None
     # Flip the socket to non-blocking for the game loop (the handshake used a
     # 0.05 s recv timeout; it must be cleared before the loop).
     conn.set_nonblocking()
@@ -334,7 +429,19 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
             # clock as carried by the wire (7.1), for the ghost's
             # reconcile bookkeeping and diagnostics.
             game.predicted_view(dt, keys, host_time=game.host_time.now(now))
+        # Session 7.8: net debug overlay + CSV log (F3-toggled, client only).
+        # The overlay shows the live feel-layer state; the log appends one
+        # line per reconcile (10 Hz) so the snap-size distribution + its
+        # correlation with input changes can be analyzed offline.
+        if game.debug_net:
+            _draw_net_debug(screen, font, game, inp)
+            if game.snap_count > game._dbg_last_logged:
+                _log_net_debug(game, inp)
+                game._dbg_last_logged = game.snap_count
         pygame.display.flip()
+    if game._dbg_log_f is not None:
+        game._dbg_log_f.close()
+        game._dbg_log_f = None
     conn.close()
 
 

@@ -173,6 +173,16 @@ class Game:
         # player 1. Empty default = no thrust/fire; single-player never sets
         # it (only player 0 exists), so the sim is untouched.
         self.remote_input = ShipInput()
+        # --- Session 7.8: net debug overlay + CSV log state (client only) ---
+        # debug_net is toggled by F3 (handle_events); the client loop reads
+        # it to draw the overlay + write the log. last_snap_px / snap_count
+        # are set by push_snapshot on each reconcile (the ghost's
+        # displacement across the rewind) — the overlay + log read them.
+        # Inert on the host (it never calls push_snapshot / draws the
+        # overlay).
+        self.debug_net = False
+        self.last_snap_px = 0.0
+        self.snap_count = 0
         self.reset()
 
     @property
@@ -427,6 +437,8 @@ class Game:
                     self.ship.fire_scan()
                 elif event.key == pygame.K_f and (self.test_mode or self.game_over):
                     self.reset()
+                elif event.key == pygame.K_F3:
+                    self.debug_net = not self.debug_net   # 7.8 net debug overlay + log
         return True
 
     def update(self, dt, keys):
@@ -1156,8 +1168,17 @@ class Game:
         if not self.ghost.seeded:
             self.ghost.seed(local_s)
         else:
+            # Session 7.8: measure the ghost's displacement ACROSS the
+            # reconcile (the "snap size") for the net debug overlay + log.
+            # With dead-reckoning rewind + identical input this is ~0; a
+            # large value = the prediction diverged from authority (in-
+            # flight input / clock error).
+            _bx, _by = self.ghost.ship.pos.x, self.ghost.ship.pos.y
             self.ghost.reconcile_rewind(
                 local_s, sim_time, sim_time if now is None else now)
+            self.last_snap_px = math.hypot(
+                self.ghost.ship.pos.x - _bx, self.ghost.ship.pos.y - _by)
+            self.snap_count += 1
 
     def predicted_view(self, dt, keys, host_time=None):
         """Draw the frame with the LOCAL ship taken from the prediction

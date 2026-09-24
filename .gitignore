@@ -8,3 +8,6 @@ venv/
 .venv/
 env/
 
+# Net debug log (Session 7.8, F3-toggled, client only)
+net_debug.csv
+

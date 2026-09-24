@@ -388,16 +388,28 @@ class RenderPoint:
     (0.1 s) when a packet lands, so the raw anchor would jump 0.1 s
     forward every 100 ms — a 6x telegraph, not a render. The point
     therefore CHASES the anchor: each frame it moves toward
-    `newest - delay` at at most MAX_STEP (1/60 s), the same
-    frame-bound discipline the LatencyTracker uses on the delay itself.
-    The net per-frame advance is then bounded by
-    MAX_STEP + MAX_STEP_DELAY (the chase step plus the delay's own
-    per-frame movement) — the render point is continuous on any refresh
-    rate, and a jitter spike or a late packet can never teleport it.
-    In steady state the chase is slack (the anchor creeps forward at
-    the host's sim rate, ~1x, and the point tracks it within ~one
-    frame's step); under a stall the anchor holds and the point
-    converges onto it and holds there.
+    `newest - delay` at at most `dt` (the frame's REAL time), so the
+    point advances at 1x real time — the same rate the anchor creeps
+    forward at (the host's sim rate, ~1x).
+
+    Capping by `dt` (NOT a fixed 1/60 s) is what keeps the point from
+    drifting BEHIND the data on a client running below 60 FPS. A fixed
+    1/60 cap advances the point by only 1/60 s per frame, but a 47 FPS
+    frame lasts 1/47 s of real time, so the point falls behind by
+    (1/47 - 1/60) every frame and the remote render looks at ever-older
+    snapshots (the 7.8 log's 4.3 s drift on the Mac, ~4.6 s of stale
+    data). Capped by `dt`, the point advances 1/47 s per frame at
+    47 FPS — exactly 1x real time — and never drifts. The cap still
+    smooths the staircase (a 0.1 s anchor jump is covered over ~6 frames
+    at 60 FPS, ~5 at 47) and still bounds a hiccup (the caller clamps
+    `dt` to MAX_FRAME_DT, so one frame moves the point at most that far).
+    The net per-frame advance is bounded by `dt` + MAX_STEP_DELAY (the
+    chase step plus the delay's own per-frame movement) — the render
+    point is continuous on any refresh rate, and a jitter spike or a late
+    packet can never teleport it. In steady state the chase is slack
+    (the anchor creeps forward at the host's sim rate, ~1x, and the point
+    tracks it within ~one frame's step); under a stall the anchor holds
+    and the point converges onto it and holds there.
 
     `advance(dt, newest)` is called once per frame with the newest
     snapshot stamp in the buffer (None before the first arrival — the
@@ -405,7 +417,11 @@ class RenderPoint:
     `now()` returns the render point (host sim time) or None.
     """
 
-    MAX_STEP = 1.0 / 60.0      # the point may move at most this far per frame
+    # Session 7.9: the chase cap is the frame's REAL time (`dt`), not a
+    # fixed 1/60 s — see the class docstring. A fixed 1/60 cap made the
+    # point advance at (frame_rate/60) x real time, so any client below
+    # 60 FPS drifted behind the data (the 7.8 log: 4.3 s on the Mac).
+    # `dt` is clamped by the caller to MAX_FRAME_DT, which bounds a hiccup.
     MAX_STEP_DELAY = LatencyTracker.MAX_STEP  # the delay's own per-frame move
 
     def __init__(self, tracker=None):
@@ -425,7 +441,14 @@ class RenderPoint:
     def advance(self, dt, newest):
         """One frame of real time `dt`. `newest` is the newest snapshot
         stamp in the buffer (host sim time) or None. Returns the render
-        point (or None while there is no anchor yet)."""
+        point (or None while there is no anchor yet).
+
+        The chase is capped by `dt` (the frame's REAL time), NOT a fixed
+        1/60 s (Session 7.9): the point advances at 1x real time on any
+        refresh rate, so it never drifts behind the data on a client
+        running below 60 FPS. `dt` is clamped by the caller to
+        MAX_FRAME_DT, which bounds a hiccup (one frame moves the point at
+        most that far). See the class docstring for the full rationale."""
         if newest is None:
             return None
         if self._t is None:
@@ -435,10 +458,12 @@ class RenderPoint:
             return self._t
         target = newest - self._delay()
         d = target - self._t
+        # Cap by the frame's real time (dt), not a fixed 1/60 s: the point
+        # advances at 1x real time on any refresh rate (see docstring).
         if d > 0.0:
-            self._t += min(d, self.MAX_STEP)
+            self._t += min(d, dt)
         elif d < 0.0:
-            self._t -= min(-d, self.MAX_STEP)
+            self._t -= min(-d, dt)
         return self._t
 
     def now(self):

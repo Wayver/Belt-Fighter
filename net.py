@@ -444,6 +444,7 @@ class Host:
             return None, None
         finally:
             self.sock.settimeout(None)
+        _disable_nagle(conn_sock)
         return Connection(conn_sock), addr
 
     def close(self):
@@ -453,12 +454,39 @@ class Host:
             pass
 
 
+def _disable_nagle(sock):
+    """Disable Nagle's algorithm on `sock` (set TCP_NODELAY).
+
+    Nagle (on by default) coalesces small writes until any un-ACKed data is
+    acknowledged. Combined with the peer's DELAYED ACK (kernel default ~40 ms),
+    a stream of small messages (our ~60 Hz input) stalls: the sender holds a
+    small packet waiting for an ACK the receiver is delaying, so the input
+    arrives in ~40 ms bursts instead of smoothly. The host applies the LATEST
+    received input each tick, so between bursts it acts on input up to ~40 ms
+    stale while the client's prediction ghost uses the CURRENT local input —
+    they diverge and the reconcile snaps the ghost back (the 7.8 log's
+    ~19 px mean snap_px is exactly a 40 ms stall at MAX_SPEED 520 px/s).
+
+    For a real-time game we want small messages out IMMEDIATELY, not
+    coalesced, so TCP_NODELAY is set on BOTH peers' sockets (the host's
+    accepted socket and the client's connecting socket). The 10 Hz snapshots
+    are large enough that Nagle would not hold them, but the small 60 Hz
+    input messages are exactly the case Nagle + delayed-ACK breaks.
+    """
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        # Non-TCP or an exotic platform: best-effort, ignore.
+        pass
+
+
 def connect(ip, port, timeout=10.0):
     """The client's connect: return a `Connection` to the host at ip:port.
 
     Blocking (connection-setup phase). Raises socket.error on refusal.
     """
     s = socket.create_connection((ip, port), timeout=timeout)
+    _disable_nagle(s)
     return Connection(s)
 
 

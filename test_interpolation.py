@@ -180,7 +180,8 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 import pygame
 
 from .config import WIDTH, HEIGHT, SNAPSHOT_INTERVAL, INTERP_DELAY, \
-    INTERP_DELAY_MIN, INTERP_DELAY_MAX, ADAPT_K, MAX_FRAME_DT, MAX_BULLETS
+    INTERP_DELAY_MIN, INTERP_DELAY_MAX, ADAPT_K, MAX_FRAME_DT, MAX_BULLETS, \
+    MAX_SPEED
 from .fog import make_light_texture
 from .game import Game, STEP
 from .ai_enemy import AIEnemy
@@ -222,6 +223,76 @@ def script_input(t):
            pygame.K_r: 1 if (t % 45) < 5 else 0,
            pygame.K_2: 1 if (t % 60) < 3 else 0,
            pygame.K_b: 1 if (t % 90) < 5 else 0})
+
+
+def script_ttf(t):
+    """Turn/thrust/fire-only input (Session 7.6). Same shape as
+    script_input but WITHOUT stop/laser/missile/sensor — those paths are
+    where the ghost's idle Game-fed fields (tracked/laser_target/
+    missile_target/contacts) would diverge from the host's real values,
+    breaking the bit-exact replay. With only turn/thrust/fire the ghost's
+    motion is self-contained, so the rewind replay can be exact."""
+    return Keys(
+        {pygame.K_q: 1 if (t // 30) % 3 == 0 else 0,
+           pygame.K_e: 1 if (t // 30) % 3 == 2 else 0,
+           pygame.K_w: 1 if (t // 60) % 2 == 0 else 0,
+           pygame.K_a: 1 if (t // 15) % 2 == 0 else 0,
+           pygame.K_d: 1 if (t // 15) % 2 == 1 else 0,
+           pygame.K_SPACE: 1 if (t // 30) % 2 == 0 else 0})
+
+
+def _run_rewind_case(res, delay_s):
+    """Run the (l) dead-reckoning rewind case once.
+
+    A real host Game is stepped with script_ttf(t); a client-side ghost is
+    fed the SAME input (stamped `delay_s` in the past) and rewind-reconciled
+    after every SNAPSHOT_INTERVAL ticks. Returns (max ghost-vs-host error,
+    number of rewinds).
+
+    Pinned facts (Session 7.6 — do NOT re-derive):
+      * The input stamp is the tick's START (g.sim_time read BEFORE
+        g.update), not its end — reconcile_rewind selects the newest
+        buffered input with host_time <= tick_START.
+      * The host ship is ISOLATED: enemies + asteroids cleared and
+        update_field no-op'd (it respawns asteroids every tick), so the
+        only thing moving the ship is the input the ghost also has.
+      * The ghost is stepped in lockstep with the host (one advance(STEP)
+        per host tick), so the pre-reconcile prediction agrees with the
+        host and the post-reconcile residual is pure replay error.
+      * `snaps` is keyed by TICK INDEX (int), not the accumulated float
+        sim_time — the rewind looks up the snapshot SNAP ticks ago by its
+        stamp (snap_tick*STEP), and the accumulated float differs from the
+        exact multiple by rounding, so a float key would miss.
+    """
+    import ship5.game as _gm
+    orig = _gm.update_field
+    _gm.update_field = lambda *a, **k: None      # no asteroid respawn
+    try:
+        g = Game(*res, seed=SEED, players=2, local_index=0)
+        g.enemies.clear(); g.asteroids.clear()   # isolate the host ship
+        ghost = PredictedShip(local_index=0)
+        snap0 = g.snapshot()
+        ghost.seed(snap0[0][0])
+        snaps, max_err, n = {0: snap0}, 0.0, 0   # key by tick index; seed tick 0
+        for t in range(RUN_TICKS):
+            stamp = g.sim_time                    # tick START (before update)
+            keys = script_ttf(t); inp = ShipInput.from_keys(keys)
+            g.update(STEP, keys)                  # step the authoritative host
+            ghost.advance(STEP, inp)              # step the ghost (lockstep)
+            ghost.record_input(stamp - delay_s, inp)
+            snaps[t + 1] = g.snapshot()           # snapshot after t+1 updates
+            if (t + 1) % SNAPSHOT_INTERVAL == 0:
+                snap_tick = t + 1 - SNAPSHOT_INTERVAL   # snapshot SNAP ticks ago
+                snap_time = snap_tick * STEP            # its stamp
+                now = g.sim_time                        # host's current clock
+                ghost.reconcile_rewind(snaps[snap_tick][0][0], snap_time, now)
+                n += 1
+                max_err = max(max_err, math.hypot(
+                    ghost.ship.pos.x - g.ship.pos.x,
+                    ghost.ship.pos.y - g.ship.pos.y))
+        return max_err, n
+    finally:
+        _gm.update_field = orig
 
 
 def snapshot(g):
@@ -1576,6 +1647,43 @@ def main():
               f"< 1e-9), resumed={resumed} (advance "
               f"{seg[-1] - seg[0] if len(seg) > 1 else -1:.2f}s over "
               f"[3.4, 5.0]), frames={len(track2)}")
+
+    # --- (l) dead-reckoning rewind (Session 7.6): the ghost's reconcile is a
+    # REWIND (apply the authoritative snapshot, then replay the buffered local
+    # inputs the host applied since it). Two cases:
+    #   (l.1) ZERO-LOSS — the ghost is fed the SAME input the host used,
+    #         stamped at the tick's START, and the host ship is ISOLATED
+    #         (no enemies/asteroids, update_field no-op'd). After each rewind
+    #         the ghost must match the authoritative ship to ~1e-6 px (the
+    #         replay's input selection reproduces the host's tick loop
+    #         exactly).
+    #   (l.2) 50 ms DELAY — the same but the input is stamped 50 ms in the
+    #         past (the replay uses inputs up to 50 ms stale). The residual is
+    #         bounded by MAX_SPEED*STEP*3 (3 ticks of motion at top speed),
+    #         not exact.
+    res = (screen, font, big_font, light_tex, fog_surf, light_surf)
+    e0, n0 = _run_rewind_case(res, 0.0)
+    if e0 < 1e-6:
+        print(f"PASS: rewind zero-loss — ghost matches host to {e0:.1e}px "
+              f"(< 1e-6) after each of {n0} rewinds (replay input-selection "
+              f"reproduces the host tick loop)")
+    else:
+        ok = False
+        print(f"FAIL: rewind zero-loss — max ghost-vs-host {e0:.3e}px after "
+              f"{n0} rewinds (want < 1e-6): check the input stamp (tick "
+              f"START, not end) and host-ship isolation (enemies/asteroids "
+              f"cleared, update_field no-op'd)")
+    e50, n50 = _run_rewind_case(res, 0.05)
+    bound = MAX_SPEED * STEP * 3
+    if e50 <= bound:
+        print(f"PASS: rewind 50ms-delay — max ghost-vs-host {e50:.1f}px <= "
+              f"MAX_SPEED*STEP*3 = {bound:.1f}px over {n50} rewinds "
+              f"(dead-reckoning bound; replay uses inputs up to 50 ms "
+              f"stale)")
+    else:
+        ok = False
+        print(f"FAIL: rewind 50ms-delay — max ghost-vs-host {e50:.1f}px "
+              f"exceeds bound {bound:.1f}px over {n50} rewinds")
 
     print(f"PASS: cadence knobs — SNAPSHOT_INTERVAL={SNAPSHOT_INTERVAL} "
           f"ticks, INTERP_DELAY={INTERP_DELAY}s, adaptive "

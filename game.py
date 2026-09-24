@@ -1133,18 +1133,31 @@ class Game:
         draw_hud(screen, self.font, self.enemies, self.ship)
         return pos
 
-    def push_snapshot(self, sim_time, snap):
+    def push_snapshot(self, sim_time, snap, now=None):
         """The single seam where a received authoritative snapshot enters
         the remote peer: record it in the interpolation buffer, then feed
         the local ship's prediction ghost — seed on the first snapshot,
-        reconcile (full-snap) on every one after. snap[0] is the tuple of
-        per-player ship snapshots (Session 6.1); the ghost is the LOCAL
-        player's ship, so it takes snap[0][self.local_index]. The network
-        layer (and the 5b.4c test) call this."""
+        reconcile on every one after. snap[0] is the tuple of per-player
+        ship snapshots (Session 6.1); the ghost is the LOCAL player's
+        ship, so it takes snap[0][self.local_index]. The network layer
+        (and the 5b.4c test) call this.
+
+        Session 7.6 (dead-reckoning rewind): when `now` (the client's
+        current estimate of the host's sim clock) is given, the reconcile
+        is a REWIND — the ghost is set to the authoritative snapshot and
+        the local inputs the host applied since the snapshot are replayed
+        (the prediction is rebuilt, not snapped; pinned #4). When `now` is
+        None (tests, or the v1 fallback), it defaults to `sim_time`, so
+        the replay span is 0 and this is a pure full snap — the v1
+        behavior the 5b.4c drift test (test_interpolation part e) still
+        exercises."""
         self.snap_buf.push(sim_time, snap)
         local_s = snap[0][self.local_index]
-        self.ghost.seed(local_s) if not self.ghost.seeded \
-            else self.ghost.reconcile(local_s)
+        if not self.ghost.seeded:
+            self.ghost.seed(local_s)
+        else:
+            self.ghost.reconcile_rewind(
+                local_s, sim_time, sim_time if now is None else now)
 
     def predicted_view(self, dt, keys, host_time=None):
         """Draw the frame with the LOCAL ship taken from the prediction

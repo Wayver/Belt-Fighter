@@ -840,6 +840,14 @@ class PredictedShip:
     by the test, not eliminated.
     """
 
+    # Session 7.6: how much host time of local input to keep for rewind
+    # replay. 2 s is far more than the worst-case snapshot age (the
+    # adaptive delay caps the render lag at INTERP_DELAY_MAX = 0.35 s, and
+    # a snapshot is at most one interval old), so the buffer never runs out
+    # of the inputs a rewind needs — while staying small (a 2 s buffer at
+    # 60 Hz input sampling is ~120 entries).
+    INPUT_BUFFER_MAX = 2.0
+
     def __init__(self, hull=None, loadout=None, local_index=0):
         # A self-contained Ship: __init__ builds components/thrusters/
         # weapons/shield/sensors/collision from the hull+loadout and holds
@@ -850,6 +858,13 @@ class PredictedShip:
         # into whole STEP steps so the ghost runs at the sim's rate on any
         # display refresh rate.
         self._acc = 0.0
+        # Session 7.6: the local input buffer — (host_time, ShipInput) pairs,
+        # oldest first, bounded to INPUT_BUFFER_MAX seconds of host time.
+        # `host_time` is the client's estimate of the host's sim clock at the
+        # moment the input was sampled (the 7.1 HostTimeEstimator), so a
+        # snapshot arriving at sim time T can replay the inputs the host
+        # actually applied between T and now (see `reconcile_rewind`).
+        self._input_buffer = []
         # Session 7.3: the ghost's OWN gun shots, as presentation Bullets.
         # The client never runs the sim, so without this the player's own
         # shots appear only when the host's next snapshot arrives (~100 ms
@@ -883,9 +898,87 @@ class PredictedShip:
 
         Full snap for v1 (see class docstring for the dead-reckoning
         limitation). Idempotent with `seed` — a caller may use either for
-        the first snapshot."""
+        the first snapshot. Session 7.6: the game loop uses
+        `reconcile_rewind` instead (dead-reckoning); this stays for tests
+        and as the v1 fallback."""
         self._ship.apply_snapshot(ship_s)
         self._seeded = True
+
+    def record_input(self, host_time, inp):
+        """Record the local input sampled at host time `host_time`
+        (Session 7.6). `host_time` is the client's estimate of the host's
+        sim clock at the moment the input was sampled (the 7.1
+        HostTimeEstimator) — NOT the local wall clock — so that when a
+        snapshot arrives at sim time T, `reconcile_rewind` can replay the
+        inputs the host actually applied between T and now: the host
+        applies the LATEST received input each tick (pinned #5), so the
+        replay must select inputs by their host-time stamp, and the stamp
+        must be in the host's clock for that selection to line up.
+
+        The buffer is bounded to INPUT_BUFFER_MAX seconds of host time
+        (oldest entries dropped). `inp` is stored by reference; the caller
+        passes a fresh ShipInput each frame (ShipInput.from_keys builds a
+        new one), so no copy is needed."""
+        self._input_buffer.append((host_time, inp))
+        # Drop entries older than INPUT_BUFFER_MAX seconds of host time.
+        cutoff = host_time - self.INPUT_BUFFER_MAX
+        while self._input_buffer and self._input_buffer[0][0] < cutoff:
+            self._input_buffer.pop(0)
+
+    def reconcile_rewind(self, ship_s, snap_time, now):
+        """Dead-reckoning reconcile (Session 7.6) — replaces the v1 full
+        snap. Apply the authoritative ship snapshot taken at sim time
+        `snap_time`, then REPLAY the local inputs the host applied between
+        `snap_time` and `now`, so the ghost ends up at exactly
+        `authority @ snap_time + local inputs since snap_time` — the
+        100 ms of prediction is REBUILT, not snapped (pinned #4).
+
+        The replay mirrors the host's own tick loop: for each sim tick T
+        from snap_time to now (step STEP), the host applies the LATEST
+        received input (pinned #5), so the replay steps the ghost with the
+        newest buffered input whose host_time <= T. That input-selection
+        is what makes the replay reproduce the host's motion — the
+        test_interpolation (l) battery proves it to ~1e-9 with the same
+        input the host used.
+
+        The 7.3 local bullet list is rebuilt the same way: `step` re-fires
+        from the ghost's re-seeded weapon state (apply_snapshot restores
+        cooldown/charge/lock), so the ghost's own shots resume from the
+        authoritative fire cadence instead of the predicted one.
+
+        `now` is the client's current estimate of the host's sim clock
+        (the same value the caller uses to stamp inputs). The replay runs
+        at most (now - snap_time)/STEP steps — one snapshot interval
+        (~6 steps) in steady state. The fixed-step accumulator is reset
+        so the next `advance` starts clean from the replayed state.
+        """
+        self._ship.apply_snapshot(ship_s)
+        self._seeded = True
+        self._acc = 0.0
+        buf = self._input_buffer
+        if not buf:
+            return
+        # Walk the sim ticks from snap_time to now. `i` is the tick index
+        # (0 = snap_time itself, the snapshot's own tick — already applied
+        # by the snapshot, so the first replayed tick is snap_time + STEP).
+        # Index of the newest buffered input with host_time <= tick time.
+        # The buffer is ordered by host_time (input is sampled in order),
+        # so this is a monotone pointer.
+        j = -1
+        # The number of whole STEP steps between snap_time and now. The
+        # snapshot reflects the state AFTER the tick that ended at
+        # snap_time, so the first replayed tick is the one that STARTS at
+        # snap_time (the host applies the input stamped at a tick's start
+        # during that tick — the client records the input at the same
+        # host-time the host samples it).
+        n = int((now - snap_time) / TICK + 1e-9)
+        for i in range(n):
+            t = snap_time + i * TICK
+            while j + 1 < len(buf) and buf[j + 1][0] <= t + 1e-9:
+                j += 1
+            inp = buf[j][1] if j >= 0 else buf[0][1]
+            self.step(TICK, inp)
+            self.step_local_bullets(TICK)
 
     def step(self, dt, inp):
         """Advance the ghost ONE fixed step with the LOCAL input.

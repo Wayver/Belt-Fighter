@@ -272,21 +272,41 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
         if not game.handle_events():
             break
         keys = pygame.key.get_pressed()
+        # Sample the local input ONCE per frame (the intent edge) and use
+        # that same object to send, to buffer, and (below) to render — so
+        # the three can never disagree about what the player did this
+        # frame.
+        inp = ShipInput.from_keys(keys)
         # Send the local input every frame (pinned #5: the host applies the
         # LATEST received input each tick).
-        conn.send({"type": T_INPUT, "inp": serialize_input(
-            ShipInput.from_keys(keys))})
+        conn.send({"type": T_INPUT, "inp": serialize_input(inp)})
+        # Session 7.6: record the input in the ghost's rewind buffer,
+        # stamped with the client's estimate of the host's sim clock at
+        # this moment (the 7.1 HostTimeEstimator — the same clock the
+        # snapshot stamps are in). When a snapshot arrives,
+        # reconcile_rewind replays the inputs the host applied since it,
+        # selecting them by this stamp (the host applies the LATEST
+        # received input each tick — pinned #5 — so the replay must use
+        # the same selection). Before the first snapshot the estimate is
+        # None and there is nothing to rewind against, so skip the record.
+        est_now = game.host_time.now(now)
+        if est_now is not None:
+            game.ghost.record_input(est_now, inp)
         # Poll the host: each snapshot feeds the host-time estimator (its
         # wire stamp vs the local arrival time — the estimator's
         # per-arrival jitter sample is the adaptive delay's input,
         # Session 7.5a) and then the interpolation buffer + prediction
-        # ghost (seed on the first, reconcile on the rest).
+        # ghost (seed on the first, dead-reckoning rewind on the rest —
+        # Session 7.6). `now` is the client's current estimate of the
+        # host's sim clock: the rewind replays from the snapshot's stamp
+        # up to it.
         for m in conn.poll():
             if m.get("type") == T_SNAP:
                 if game.host_time.record(now, m["sim_time"]):
                     game.latency.update(game.host_time.last_jitter)
                 game.push_snapshot(m["sim_time"],
-                                   deserialize_snapshot(m["snap"]))
+                                   deserialize_snapshot(m["snap"]),
+                                   now=game.host_time.now(now))
         if conn.closed:
             conn.close()
             _notice(screen, font, big_font, clock,

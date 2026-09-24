@@ -256,20 +256,33 @@ def _log_net_debug(game, inp):
     if f is None:
         f = open(game._dbg_log_path, "w", newline="")
         f.write("t,snap_px,input,delay,jitter_ema,buf_depth,newest_stamp,"
-                "render_t,host_time_est\n")
+                "render_t,host_time_est,fps,dt_max,hic,n\n")
         game._dbg_log_f = f
     rp = game.render_point.now()
     newest = game.snap_buf.newest_time()
     est = game.host_time.now(pygame.time.get_ticks() / 1000.0)
     jit = game.latency.jitter_ema   # None until the first sample
-    f.write("%.3f,%.3f,%s,%.4f,%s,%d,%s,%s,%s\n" % (
+    # Session 7.10 (Chunk 1): frame-rate stats over the frames since the
+    # last line, then reset the accumulators. fps = 1/mean(raw_dt);
+    # dt_max = longest raw frame; hic = frames past the 50 ms clamp;
+    # n = frames in the window.
+    n = game._dbg_frames
+    fps = (1.0 / (game._dbg_dt_sum / n)) if n > 0 else 0.0
+    dt_max = game._dbg_dt_max
+    hic = game._dbg_hiccups
+    game._dbg_frames = 0
+    game._dbg_dt_sum = 0.0
+    game._dbg_dt_max = 0.0
+    game._dbg_hiccups = 0
+    f.write("%.3f,%.3f,%s,%.4f,%s,%d,%s,%s,%s,%.1f,%.4f,%d,%d\n" % (
         time.time(), game.last_snap_px, _input_str(inp),
         game.latency.delay,
         ("%.4f" % jit) if jit is not None else "",
         len(game.snap_buf),
         ("%.4f" % newest) if newest is not None else "",
         ("%.4f" % rp) if rp is not None else "",
-        ("%.4f" % est) if est is not None else ""))
+        ("%.4f" % est) if est is not None else "",
+        fps, dt_max, hic, n))
     f.flush()
 
 
@@ -357,12 +370,41 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
     game._dbg_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                       "net_debug.csv")
     game._dbg_log_f = None
+    # Session 7.10 (Chunk 1): per-frame frame-rate telemetry. The 7.8 CSV is
+    # written once per reconcile (10 Hz), so it can't see individual frames —
+    # the render-point drift could be a low frame rate OR occasional hiccup
+    # frames (dt clamped to 50 ms), and the 10 Hz log can't tell them apart.
+    # We accumulate the RAW (pre-clamp) frame time every frame and emit the
+    # rolling stats on each reconcile line:
+    #   fps      = 1 / mean(raw_dt) over the frames since the last line
+    #   dt_max   = the longest raw frame in that window (a hiccup)
+    #   hic      = count of frames whose raw dt exceeded the 50 ms clamp
+    #              (those frames advanced the render point < 1x real time)
+    #   n        = number of frames in the window
+    # raw_dt is the UNCLAMPED clock.tick() time; dt (clamped) is what the
+    # sim/render consume.
+    game._dbg_frames = 0
+    game._dbg_dt_sum = 0.0
+    game._dbg_dt_max = 0.0
+    game._dbg_hiccups = 0
     # Flip the socket to non-blocking for the game loop (the handshake used a
     # 0.05 s recv timeout; it must be cleared before the loop).
     conn.set_nonblocking()
 
     while True:
-        dt = min(clock.tick(FPS) / 1000.0, 0.05)
+        # Session 7.10 (Chunk 1): capture the RAW frame time before the
+        # clamp — the clamp hides hiccups from the sim, but the render
+        # point only advances by the clamped dt, so a raw frame longer than
+        # 50 ms is exactly the frame that lets the point fall behind.
+        raw_dt = clock.tick(FPS) / 1000.0
+        dt = min(raw_dt, 0.05)
+        if game.debug_net:
+            game._dbg_frames += 1
+            game._dbg_dt_sum += raw_dt
+            if raw_dt > game._dbg_dt_max:
+                game._dbg_dt_max = raw_dt
+            if raw_dt > 0.05:
+                game._dbg_hiccups += 1
         now = pygame.time.get_ticks() / 1000.0
         if not game.handle_events():
             break

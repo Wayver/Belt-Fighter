@@ -490,6 +490,16 @@ class RenderPoint:
     # 60 FPS drifted behind the data (the 7.8 log: 4.3 s on the Mac).
     # `dt` is clamped by the caller to MAX_FRAME_DT, which bounds a hiccup.
     MAX_STEP_DELAY = LatencyTracker.MAX_STEP  # the delay's own per-frame move
+    # Session 7.10: catch-up fraction. When the point is BEHIND the target by
+    # more than ~10 frames (d > 10*dt), it advances by CATCHUP * d per frame
+    # (10% of the gap) instead of just dt (1x real time), so a large initial
+    # gap (the buffer filling at the start, or a burst of snapshots) closes
+    # instead of persisting. For small gaps (d < 10*dt) the cap is dt (1x
+    # real time), preserving the staircase smoothing. The steady-state gap
+    # (where the catch-up rate equals the target's 1x advance) is 10*dt
+    # (~0.17 s at 60 FPS) — the point settles just behind the target, not
+    # 1.0 s behind it (the 7.9 behavior, where the gap never closed).
+    CATCHUP = 0.1
 
     def __init__(self, tracker=None):
         self._tracker = tracker
@@ -515,7 +525,26 @@ class RenderPoint:
         refresh rate, so it never drifts behind the data on a client
         running below 60 FPS. `dt` is clamped by the caller to
         MAX_FRAME_DT, which bounds a hiccup (one frame moves the point at
-        most that far). See the class docstring for the full rationale."""
+        most that far).
+
+        Session 7.10 (catch-up): a pure 1x cap has a flaw — it closes a
+        LARGE gap at only 1x real time, and if the target also advances at
+        ~1x (the host's sim rate), the gap NEVER closes. The 7.10 log
+        showed exactly this: the buffer filled with ~1 s of snapshots at
+        the start, the point was born 1.0 s behind its target, and it
+        stayed there for the whole session (d = 0.96 -> 1.08 s, stable),
+        rendering 700 ms of stale data (the buffer's oldest snapshot —
+        the point was clamped to the buffer's back edge). The fix: when
+        the point is behind by more than ~10 frames (d > 10*dt), advance
+        by CATCHUP * d per frame (10% of the gap) instead of dt, so the
+        gap closes exponentially (halving every ~7 frames at 60 FPS) and
+        settles at the steady-state gap of 10*dt (~0.17 s at 60 FPS —
+        just behind the target, inside the buffer's window). For small
+        gaps (d < 10*dt) the cap is dt (1x real time), so the staircase
+        smoothing is unchanged and the point never teleports. The step is
+        always bounded by d (min(d, ...)), so the point can never
+        overshoot the target. See the CATCHUP class attr for the
+        rationale."""
         if newest is None:
             return None
         if self._t is None:
@@ -525,11 +554,22 @@ class RenderPoint:
             return self._t
         target = newest - self._delay()
         d = target - self._t
-        # Cap by the frame's real time (dt), not a fixed 1/60 s: the point
-        # advances at 1x real time on any refresh rate (see docstring).
         if d > 0.0:
-            self._t += min(d, dt)
+            # Session 7.10: catch-up. When the point is behind the target by
+            # more than ~10 frames (d > 10*dt), advance by CATCHUP * d per
+            # frame (10% of the gap) instead of just dt (1x real time), so a
+            # large initial gap (the buffer filling at the start, or a burst
+            # of snapshots) closes instead of persisting. For small gaps
+            # (d < 10*dt) the cap is dt (1x real time), preserving the
+            # staircase smoothing. The steady-state gap (where the catch-up
+            # rate equals the target's 1x advance) is 10*dt (~0.17 s at
+            # 60 FPS) — the point settles just behind the target, not 1.0 s
+            # behind it (the 7.9 behavior, where the gap never closed).
+            step = min(d, max(dt, self.CATCHUP * d))
+            self._t += step
         elif d < 0.0:
+            # Ahead of the target (the delay shrank): retreat at 1x real
+            # time (no catch-up needed — the point is already ahead).
             self._t -= min(-d, dt)
         return self._t
 

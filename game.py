@@ -419,6 +419,156 @@ class Game:
         # Camera is not synced — re-derive it from the restored ship.
         self.cam.pos = self.ship.pos.copy()
 
+    # --- Session 9.x M1: the render-model (the enabler) ---------------------
+    #
+    # A PLAIN-DATA structure the sim publishes and the render thread consumes.
+    # It is the existing 11-tuple snapshot() (the SYNCED state) PLUS the
+    # presentation-only fields draw() reads, so the render path can stop
+    # reading live mutable sim state (the 9.x goal: decouple the sim from the
+    # frame loop).
+    #
+    # Why plain data: the sim thread (later, M3) will build this and publish
+    # it by an atomic reference swap (the exact NetWorker _latest_snapshot
+    # pattern). Because every value is a tuple/list of numbers/strings (no
+    # pygame objects, no live references), a reference swap is atomic under
+    # the GIL and there is NO shared mutable state -> no race, no lock.
+    #
+    # This method is a PURE BUILDER: it reads the same fields draw() reads and
+    # packs them into plain data. It MUST NOT mutate any sim state (the parity
+    # test asserts that). The wire snapshot (serialize_snapshot) is UNCHANGED —
+    # the rich model is local-only (D1 = (a) rich local render-model).
+    #
+    # M1 is additive: draw() is untouched (it still reads self.*). M2 refactors
+    # draw() to consume this model; M3 moves the sim to its own thread.
+
+    def render_model(self):
+        """Capture the whole sim as ONE plain-data render-model: no pygame
+        objects, no live references — safe to publish by reference swap.
+
+        Carries every field draw() reads (the parity test in
+        test_render_model.py asserts this exhaustively). Layout:
+
+          snapshot      the existing 11-tuple snapshot() (SYNCED state)
+          sim_time      the sim clock (seconds) at this step
+          step_alpha    self.acc / STEP — the fixed-step accumulator fraction
+                        (the render thread's interpolation alpha; M3 moves
+                        this to the render thread's own clock)
+          camera        (pos, vel, dampening) — the cam.update() target
+                        (the local ship's pos/vel + its dampening flag)
+          stars         [(x, y, r), ...] — the parallax background
+          asteroids     [(pos, angle, verts), ...]
+          enemies       [(tag, pos, angle, vel, acc_smooth, collision_radius,
+                         local_poly), ...]
+          bullets       [(pos, vel), ...]
+          enemy_bullets [(pos, vel), ...]
+          missiles      [(pos, vel, boost, life), ...]
+          beams         [(local_start, target_id, d, vis_end, age, ttl), ...]
+                        target_id is the enemy's ship id (or None for a rock
+                        beam) — draw() resolves it back to the enemy so the
+                        `target in self.enemies` membership test becomes a
+                        plain lookup (no live-list membership at render time)
+          particles     [(pos, vel, color, life, max_life), ...]
+          players       [per-ship dict, ...] — see _ship_render_pack
+          game_over     bool
+          protect_timer float
+        """
+        ship = self.ship
+        return {
+            # --- SYNCED (the existing snapshot) ---
+            "snapshot": self.snapshot(),
+            "sim_time": self.sim_time,
+            "step_alpha": self.acc / STEP,
+            # --- camera: the cam.update(dt, ship) target ---
+            "camera": ((ship.pos.x, ship.pos.y),
+                       (ship.vel.x, ship.vel.y),
+                       ship.dampening),
+            # --- background ---
+            "stars": list(self.stars),
+            # --- world entities (draw() iterates these) ---
+            "asteroids": [((a.pos.x, a.pos.y), a.angle,
+                           tuple((v.x, v.y) for v in a.verts))
+                          for a in self.asteroids],
+            "enemies": [((self._enemy_tag(e),
+                          (e.pos.x, e.pos.y),
+                          e.ship.angle,
+                          (e.ship.vel.x, e.ship.vel.y),
+                          (e._acc_smooth.x, e._acc_smooth.y),
+                          e.collision_radius,
+                          tuple(e.ship.collision.local_poly)))
+                        for e in self.enemies],
+            "bullets": [((b.pos.x, b.pos.y), (b.vel.x, b.vel.y))
+                        for b in self.bullets],
+            "enemy_bullets": [((b.pos.x, b.pos.y), (b.vel.x, b.vel.y))
+                              for b in self.enemy_bullets],
+            "missiles": [((m.pos.x, m.pos.y), (m.vel.x, m.vel.y),
+                          m.boost, m.life) for m in self.missiles],
+            # --- beams: target_id replaces the live enemy reference ---
+            "beams": [((beam[0],
+                        beam[1].ship.id if beam[1] is not None else None,
+                        (beam[2].x, beam[2].y),
+                        (beam[3].x, beam[3].y),
+                        beam[4], beam[5]))
+                      for beam in self.beams],
+            # --- particles ---
+            "particles": [((p.pos.x, p.pos.y), (p.vel.x, p.vel.y),
+                           tuple(p.color), p.life, p.max_life)
+                          for p in self.particles],
+            # --- per-ship presentation (the rich local model, D1a) ---
+            "players": [self._ship_render_pack(p) for p in self.players],
+            # --- flags ---
+            "game_over": self.game_over,
+            "protect_timer": self.protect_timer,
+        }
+
+    @staticmethod
+    def _ship_render_pack(p):
+        """Pack ONE player ship's render fields into a plain-data dict.
+
+        Carries exactly what draw() + _build_lights + _draw_sensor_contacts +
+        draw_hud read for the local ship, plus the prev/curr pose the render
+        thread interpolates between (M3: the render thread owns the
+        interpolation, so it needs prev+curr, not just the interpolated
+        rpos/rangle). The synced ship state (power/shield/scan/weapon
+        charge) is ALSO carried here so the HUD + presentation can read it
+        from the model without touching the live ship — it is the same data
+        snapshot() carries, re-exposed for the render path.
+        """
+        return {
+            # identity / pose (the render thread interpolates prev -> curr)
+            "id": p.id,
+            "pos": (p.pos.x, p.pos.y),
+            "vel": (p.vel.x, p.vel.y),
+            "angle": p.angle,
+            "prev_pos": (p.prev_pos.x, p.prev_pos.y),
+            "prev_angle": p.prev_angle,
+            "dampening": p.dampening,
+            # presentation-only (never serialized in snapshot())
+            "flame_mags": dict(p.flame_mags),
+            "arcs": [([tuple(pt) for pt in pts], age, ttl)
+                     for pts, age, ttl in p.arcs],
+            "shield_impacts": [(theta, age, ttl)
+                               for theta, age, ttl in p.shield_impacts],
+            "scan_pulse": p.scan_pulse,
+            "contacts": [((pos.x, pos.y), dist, strength, confirmed)
+                         for pos, dist, strength, confirmed in p.contacts],
+            # synced state the HUD + presentation read (== snapshot() fields)
+            "targeting_on": p.targeting_on,
+            "tracked": p.tracked,
+            "sensor_on": p.sensor_on,
+            "scan_cd": p.scan_cd,
+            "scan_reveal": p.scan_reveal,
+            "shield_charge": p.shield_charge,
+            "shield_dump": p.shield_dump,
+            "shield_clock": p.shield_clock,
+            "brownout": p.brownout,
+            "power_used": p.power_used,
+            "power_supply": p.power_supply,
+            "compute_used": p.compute_used,
+            "compute_supply": p.compute_supply,
+            "weapons": [(w.cooldown, w.charge, w.lock_progress)
+                        for w in p.weapons],
+        }
+
     def handle_events(self):
         """Returns False when the window should close."""
         for event in pygame.event.get():

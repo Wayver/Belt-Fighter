@@ -112,6 +112,8 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
         return
     port = host.sock.getsockname()[1]
     conn = None
+    game = None   # defined here so the finally can close its debug log even
+                  # if the handshake fails before phase 3 builds the Game.
     try:
         # --- 1. wait for a client (waiting screen + timed accept) ---
         while conn is None:
@@ -144,8 +146,38 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
 
         # --- 4. the authoritative game loop ---
         last_sent = -1
+        # Session 7.10b: host-side frame-rate telemetry (F3-toggled, mirrors
+        # the client's 7.10a columns). The client's CSV can't tell a WIRE
+        # stall (host sent smoothly, packets queued + released in a burst)
+        # from a HOST frame stall (the host's sim is tied to its frame loop,
+        # so a host hiccup stalls the sim AND the snapshot sending). We log
+        # the host's raw frame time on each snapshot send (10 Hz) so the
+        # next re-test can be correlated: if the client's snapshot gap
+        # (newest jumping 1.3-1.6 s) lines up with a host hiccup (dt_max
+        # > 50 ms / low fps) at the same wall-clock time, it's a HOST stall
+        # (-> decouple the sim from the frame loop); if the host was clean
+        # (60 fps, no hiccups) at that moment, it's a WIRE stall (-> the
+        # catch-up is the right fix, nothing to do on the host).
+        game._dbg_frames = 0
+        game._dbg_dt_sum = 0.0
+        game._dbg_dt_max = 0.0
+        game._dbg_hiccups = 0
+        game._dbg_log_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "host_debug.csv")
+        game._dbg_log_f = None
         while True:
-            dt = min(clock.tick(FPS) / 1000.0, 0.05)
+            # Session 7.10b: capture the RAW frame time before the clamp
+            # (the clamp hides hiccups from the sim, but a raw frame > 50 ms
+            # is exactly the frame that stalls the sim + snapshot sending).
+            raw_dt = clock.tick(FPS) / 1000.0
+            dt = min(raw_dt, 0.05)
+            if game.debug_net:
+                game._dbg_frames += 1
+                game._dbg_dt_sum += raw_dt
+                if raw_dt > game._dbg_dt_max:
+                    game._dbg_dt_max = raw_dt
+                if raw_dt > 0.05:
+                    game._dbg_hiccups += 1
             if not game.handle_events():
                 return
             keys = pygame.key.get_pressed()
@@ -168,9 +200,40 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
                 conn.send({"type": T_SNAP, "sim_time": game.sim_time,
                            "snap": serialize_snapshot(game.snapshot())})
                 last_sent = tick
+                # Session 7.10b: host-side frame-rate telemetry (F3-toggled).
+                # One line per snapshot send (10 Hz), mirroring the client's
+                # 7.10a columns: t (wall clock), sim_time (the host's sim
+                # clock at send), fps (1/mean raw frame time since the last
+                # send), dt_max (longest raw frame), hic (frames past the
+                # 50 ms clamp), n (frames in the window). The wall-clock `t`
+                # is the join key: the client's CSV has the same `t` (both
+                # machines' wall clocks are roughly synced on the same LAN),
+                # so a client snapshot gap at t=X can be checked against the
+                # host's fps/dt_max/hic at t=X to tell a wire stall from a
+                # host stall.
+                if game.debug_net:
+                    f = game._dbg_log_f
+                    if f is None:
+                        f = open(game._dbg_log_path, "w", newline="")
+                        f.write("t,sim_time,fps,dt_max,hic,n\n")
+                        game._dbg_log_f = f
+                    n = game._dbg_frames
+                    fps = (1.0 / (game._dbg_dt_sum / n)) if n > 0 else 0.0
+                    dt_max = game._dbg_dt_max
+                    hic = game._dbg_hiccups
+                    game._dbg_frames = 0
+                    game._dbg_dt_sum = 0.0
+                    game._dbg_dt_max = 0.0
+                    game._dbg_hiccups = 0
+                    f.write("%.3f,%.4f,%.1f,%.4f,%d,%d\n" % (
+                        time.time(), game.sim_time, fps, dt_max, hic, n))
+                    f.flush()
             game.draw(dt)
             pygame.display.flip()
     finally:
+        if getattr(game, "_dbg_log_f", None) is not None:
+            game._dbg_log_f.close()
+            game._dbg_log_f = None
         if conn is not None:
             conn.close()
         host.close()

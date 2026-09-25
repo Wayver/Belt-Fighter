@@ -491,15 +491,21 @@ class RenderPoint:
     # `dt` is clamped by the caller to MAX_FRAME_DT, which bounds a hiccup.
     MAX_STEP_DELAY = LatencyTracker.MAX_STEP  # the delay's own per-frame move
     # Session 7.10: catch-up fraction. When the point is BEHIND the target by
-    # more than ~10 frames (d > 10*dt), it advances by CATCHUP * d per frame
-    # (10% of the gap) instead of just dt (1x real time), so a large initial
-    # gap (the buffer filling at the start, or a burst of snapshots) closes
-    # instead of persisting. For small gaps (d < 10*dt) the cap is dt (1x
-    # real time), preserving the staircase smoothing. The steady-state gap
-    # (where the catch-up rate equals the target's 1x advance) is 10*dt
-    # (~0.17 s at 60 FPS) — the point settles just behind the target, not
-    # 1.0 s behind it (the 7.9 behavior, where the gap never closed).
-    CATCHUP = 0.1
+    # more than ~5 frames (d > 5*dt), it advances by CATCHUP * d per frame
+    # (20% of the gap) instead of just dt (1x real time), so a large gap
+    # (a snapshot burst after a wire stall, or the buffer filling at the
+    # start) closes in ~5 frames (~83 ms at 60 FPS) instead of ~10 (166 ms).
+    # For small gaps (d < 5*dt) the cap is dt (1x real time), preserving the
+    # staircase smoothing. The steady-state gap (where the catch-up rate
+    # equals the target's 1x advance) is 5*dt (~0.083 s at 60 FPS) — the
+    # point settles just behind the target, inside the buffer's window.
+    # Session 7.10b: raised from 0.1 to 0.2 to halve the catch-up duration
+    # after a snapshot burst (the "big lag spike" in the 7.10 re-test: a
+    # 1.4 s gap took ~10 frames to close at CATCHUP=0.1; at 0.2 it takes
+    # ~5). The per-frame fast-forward is 20% of the gap (e.g. 280 ms of sim
+    # time in one 16.7 ms frame for a 1.4 s gap) — a visible but brief
+    # fast-forward, better than a 166 ms stall at 1x.
+    CATCHUP = 0.2
 
     def __init__(self, tracker=None):
         self._tracker = tracker
@@ -535,12 +541,12 @@ class RenderPoint:
         stayed there for the whole session (d = 0.96 -> 1.08 s, stable),
         rendering 700 ms of stale data (the buffer's oldest snapshot —
         the point was clamped to the buffer's back edge). The fix: when
-        the point is behind by more than ~10 frames (d > 10*dt), advance
-        by CATCHUP * d per frame (10% of the gap) instead of dt, so the
-        gap closes exponentially (halving every ~7 frames at 60 FPS) and
-        settles at the steady-state gap of 10*dt (~0.17 s at 60 FPS —
+        the point is behind by more than ~5 frames (d > 5*dt), advance
+        by CATCHUP * d per frame (20% of the gap) instead of dt, so the
+        gap closes exponentially (halving every ~3.5 frames at 60 FPS)
+        and settles at the steady-state gap of 5*dt (~0.083 s at 60 FPS —
         just behind the target, inside the buffer's window). For small
-        gaps (d < 10*dt) the cap is dt (1x real time), so the staircase
+        gaps (d < 5*dt) the cap is dt (1x real time), so the staircase
         smoothing is unchanged and the point never teleports. The step is
         always bounded by d (min(d, ...)), so the point can never
         overshoot the target. See the CATCHUP class attr for the
@@ -556,15 +562,16 @@ class RenderPoint:
         d = target - self._t
         if d > 0.0:
             # Session 7.10: catch-up. When the point is behind the target by
-            # more than ~10 frames (d > 10*dt), advance by CATCHUP * d per
-            # frame (10% of the gap) instead of just dt (1x real time), so a
-            # large initial gap (the buffer filling at the start, or a burst
-            # of snapshots) closes instead of persisting. For small gaps
-            # (d < 10*dt) the cap is dt (1x real time), preserving the
-            # staircase smoothing. The steady-state gap (where the catch-up
-            # rate equals the target's 1x advance) is 10*dt (~0.17 s at
-            # 60 FPS) — the point settles just behind the target, not 1.0 s
-            # behind it (the 7.9 behavior, where the gap never closed).
+            # more than ~5 frames (d > 5*dt), advance by CATCHUP * d per
+            # frame (20% of the gap) instead of just dt (1x real time), so a
+            # large gap (a snapshot burst after a wire stall, or the buffer
+            # filling at the start) closes in ~5 frames (~83 ms at 60 FPS).
+            # For small gaps (d < 5*dt) the cap is dt (1x real time),
+            # preserving the staircase smoothing. The steady-state gap
+            # (where the catch-up rate equals the target's 1x advance) is
+            # 5*dt (~0.083 s at 60 FPS) — the point settles just behind the
+            # target, not 1.0 s behind it (the 7.9 behavior, where the gap
+            # never closed). See the CATCHUP class attr for the rationale.
             step = min(d, max(dt, self.CATCHUP * d))
             self._t += step
         elif d < 0.0:

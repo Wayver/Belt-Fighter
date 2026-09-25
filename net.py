@@ -22,12 +22,13 @@ Pinned decisions (see the pinned plan note — do NOT re-derive):
         input   (client->host)  {'type':'input','inp':{...}}
         snap    (host->client)  {'type':'snap','sim_time':t,'snap':[...]}
   * `ShipInput` serializes via `dataclasses.asdict` / `ShipInput(**dict)`.
-  * The snapshot serializes directly (tuples -> JSON arrays). On deserialize
-    ONLY the rng state (index 6) is converted back: JSON `[v,[ints],null]`
-    -> `(v, tuple(ints), None)` for `random.Random.setstate()`. Everything
-    else stays a list — Python unpacking/indexing work identically on lists,
-    and `apply_snapshot` never type-checks them. This conversion lives HERE,
-    in the protocol layer, NOT in `apply_snapshot`.
+  * The snapshot is PRUNED on the wire (Session 7.11): the remote peer is a
+    presentation peer (it never runs the sim / never calls apply_snapshot),
+    so `serialize_snapshot` sends only what the interpolation buffer + the
+    prediction ghost read — asteroids as `[id, x, y]` (1-decimal) and the
+    rng state as a `None` placeholder. `deserialize_snapshot` is a
+    passthrough. The host keeps the full snapshot in its sim; this is a
+    send-side serialization only.
   * Stream integrity (Session 6.9): the send side sends frames in PARTS and
     keeps only the UNSENT remainder when the buffer fills (re-sending a
     partially-sent frame would duplicate bytes and corrupt the stream —
@@ -185,30 +186,58 @@ def deserialize_input(d):
 
 
 def serialize_snapshot(snap):
-    """Game.snapshot() tuple -> JSON-safe structure.
+    """Game.snapshot() tuple -> the PRUNED wire structure (Session 7.11).
 
-    A no-op passthrough: tuples become JSON arrays on `json.dumps`, and every
-    field is already a plain number / bool / None / tuple / list. The only
-    field that needs a REVERSE conversion on the way back is the rng state,
-    handled by `deserialize_snapshot`.
+    The remote peer is a PRESENTATION peer: it never runs the sim and never
+    calls `Game.apply_snapshot` — it only feeds the interpolation buffer
+    (`netcode.interp_positions`) and the local-ship prediction ghost. So the
+    wire carries only what those two actually read, and nothing else:
+
+      * ASTEROIDS (index 5) are pruned to `[id, x, y]` with x/y rounded to
+        1 decimal. `interp_positions` reads only `a_s[0]` (id), `a_s[1]` (x)
+        and `a_s[2]` (y) — the client draws a fixed-size circle and never
+        uses vel/size/angle/spin/verts. This is the bulk of the payload:
+        ~545 B/rock -> ~23 B/rock (the rock's verts alone were ~411 B).
+      * RNG STATE (index 6) is replaced with a `None` placeholder. The
+        client never restores the sim's rng (it has no sim to restore), so
+        the ~7.3 KB Mersenne-Twister state is dropped entirely. The slot is
+        kept (as None) so the 11-tuple shape is unchanged and
+        `interp_positions`'s index reads are untouched.
+
+    Everything else (players, enemies, bullets, enemy_bullets, missiles,
+    game_over, protect_timer, the two id counters) is passed through —
+    tuples become JSON arrays on `json.dumps`, and every field is already a
+    plain number / bool / None / tuple / list. The id counters (indices
+    9/10) are kept: they are tiny and future-proof the wire (a client-side
+    dead-reckoning rock model would want them).
+
+    The HOST keeps the full `Game.snapshot()` in its sim — this pruning is
+    purely a send-side serialization; it does not touch the authoritative
+    state. `deserialize_snapshot` is the (now trivial) inverse.
     """
-    return snap
+    s = list(snap)
+    # Prune each rock to [id, x, y] (1-decimal). id stays an int (stable
+    # identity for interpolation matching); x/y are the only fields the
+    # client's render reads.
+    s[5] = [[a[0], round(a[1], 1), round(a[2], 1)] for a in snap[5]]
+    # Drop the rng state (the client never restores it) — keep the slot.
+    s[6] = None
+    return s
 
 
 def deserialize_snapshot(snap):
-    """JSON-decoded snapshot -> a structure `Game.apply_snapshot` accepts.
+    """JSON-decoded snapshot -> the structure the client's
+    `Game.push_snapshot` / `netcode.interp_positions` consume.
 
-    After `json.loads`, every tuple is a list. That is fine for everything
-    EXCEPT the rng state (index 6): `random.Random.setstate()` requires
-    `(version, tuple_of_ints, None)`, but JSON gives `[version, [ints], None]`.
-    Convert ONLY that field back to the tuple form; leave the rest as lists
-    (unpacking/indexing work identically on lists, and apply_snapshot never
-    type-checks them).
+    After `json.loads` every tuple is a list — that is fine for everything
+    the client reads (unpacking/indexing work identically on lists, and
+    `interp_positions` never type-checks). The asteroids are already in the
+    pruned `[id, x, y]` form from `serialize_snapshot`, and the rng slot is
+    the `None` placeholder — neither needs a reverse conversion, so this is
+    a passthrough. (The pre-7.11 rng-tuple restore is gone: the client no
+    longer receives an rng state.)
     """
-    s = list(snap)
-    version, ints, gauss = s[6]
-    s[6] = (version, tuple(ints), gauss)
-    return s
+    return snap
 
 
 # --- hull/loadout wire mapping (Session 6.5) ------------------------------
@@ -717,7 +746,13 @@ def _self_test():
     if ok:
         print("PASS: hostile payload falls back to a valid stock fit")
 
-    # --- 3. snapshot (de)serialization incl. the rng-state tuple ---
+    # --- 3. snapshot wire pruning (Session 7.11) ---
+    # The remote peer is a PRESENTATION peer: it never runs the sim and never
+    # calls apply_snapshot, so the wire carries only what the interpolation
+    # buffer + the prediction ghost read. Verify (a) the pruned wire shape and
+    # (b) that the client's REAL consumer (interp_positions) accepts it.
+    from .netcode import interp_positions
+
     pygame.init()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
     font = pygame.font.SysFont("consolas,menlo,monospace", 18)
@@ -734,29 +769,43 @@ def _self_test():
         g.update(STEP, _Keys())
     snap = g.snapshot()
 
-    # The rng state must survive a real JSON round-trip as a proper tuple.
+    # The wire form: a real JSON round-trip of the pruned snapshot.
     as_json = json.loads(json.dumps(serialize_snapshot(snap)))
     d = deserialize_snapshot(as_json)
-    rng = d[6]
-    if (isinstance(rng, tuple) and len(rng) == 3
-            and isinstance(rng[1], tuple) and rng[2] is None
-            and rng == snap[6]):
-        print("PASS: snapshot rng-state tuple survives JSON round-trip")
-    else:
-        ok = False
-        print("FAIL: snapshot rng-state ->", type(rng))
 
-    # A FRESH game restored from the deserialized snapshot must match.
-    AIEnemy._next_id = 1
-    Asteroid._next_id = 1
-    g2 = Game(screen, font, big_font, light_tex, fog_surf, light_surf,
-              seed=1234)
-    g2.apply_snapshot(d)
-    if g2.snapshot() == snap:
-        print("PASS: snapshot -> JSON -> apply_snapshot is lossless")
+    # (a) The 11-tuple shape is preserved and the rng slot is the None
+    # placeholder (the client never restores the sim's rng).
+    shape_ok = (len(d) == 11 and d[6] is None)
+    # (b) Every rock is pruned to [id, x, y]: 3 elements, id an int, x/y
+    # carrying at most 1 decimal (no long float tails).
+    rocks_ok = (len(d[5]) == len(snap[5])
+                and all(len(r) == 3 and isinstance(r[0], int)
+                        and r[1] == round(r[1], 1) and r[2] == round(r[2], 1)
+                        for r in d[5]))
+    # (c) The pruned x/y are the source rock's x/y to 1 decimal, so the
+    # client's render sits within 0.05 px of the authoritative position.
+    pos_ok = all(abs(r[1] - a[1]) <= 0.051 and abs(r[2] - a[2]) <= 0.051
+                 for r, a in zip(d[5], snap[5]))
+    if shape_ok and rocks_ok and pos_ok:
+        print("PASS: snapshot wire pruning — %d rocks -> [id,x,y] 1-dec, "
+              "rng dropped, 11-tuple intact" % len(d[5]))
     else:
         ok = False
-        print("FAIL: snapshot JSON round-trip diverges")
+        print("FAIL: snapshot wire pruning -> shape=%s rocks=%s pos=%s"
+              % (shape_ok, rocks_ok, pos_ok))
+
+    # (d) The client's REAL consumer accepts the pruned snapshot: feed the
+    # pruned snapshot through interp_positions (the same one twice, alpha 0)
+    # and confirm it yields one interpolated rock per wire rock. This is the
+    # contract the client's render actually relies on.
+    n_rocks = interp_positions(d, d, 0.0, dt=0.0)['asteroids']
+    if len(n_rocks) == len(d[5]):
+        print("PASS: interp_positions consumes the pruned wire snapshot "
+              "(%d rocks)" % len(n_rocks))
+    else:
+        ok = False
+        print("FAIL: interp_positions on pruned snapshot -> %d rocks, "
+              "expected %d" % (len(n_rocks), len(d[5])))
 
     # --- 4. loopback TCP: handshake + one snapshot over a real socket ---
     host = Host(0)                      # OS picks a free ephemeral port
@@ -806,7 +855,12 @@ def _self_test():
             time.sleep(0.005)
         if got is not None:
             d2 = deserialize_snapshot(got["snap"])
-            if got["sim_time"] == g.sim_time and d2[6] == snap[6]:
+            # Integrity: the sim_time stamp matches and the wire carried the
+            # same rocks (by id) the host snapshotted. (The rng state is no
+            # longer on the wire — Session 7.11 — so the rock ids are the
+            # meaningful integrity check.)
+            if (got["sim_time"] == g.sim_time
+                    and [r[0] for r in d2[5]] == [a[0] for a in snap[5]]):
                 print("PASS: loopback snapshot host->client round-trip")
             else:
                 ok = False

@@ -26,6 +26,7 @@ from .net import (Host, connect, do_handshake_host, do_handshake_client,
                   deserialize_hull, deserialize_loadout,
                   serialize_snapshot, deserialize_snapshot,
                   serialize_input, deserialize_input,
+                  NetWorker,
                   T_INPUT, T_SNAP)
 from .netcode import (PredictedShip, HostTimeEstimator, LatencyTracker,
                       RenderPoint)
@@ -114,6 +115,9 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
     conn = None
     game = None   # defined here so the finally can close its debug log even
                   # if the handshake fails before phase 3 builds the Game.
+    worker = None  # Session 8.3: the host's NetWorker (created in phase 3);
+                   # defined here so the finally can stop() it even if the
+                   # handshake fails before phase 3 runs.
     try:
         # --- 1. wait for a client (waiting screen + timed accept) ---
         while conn is None:
@@ -142,26 +146,40 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
                     hull=menu.hull, loadout=menu.loadout,
                     seed=seed, sound=sfx, players=2)
         game.set_player_ship(1, Ship(hull=chull, loadout=clout))
-        conn.set_nonblocking()
+        # Session 8.3: the socket I/O + the 10 Hz snapshot send move to a
+        # NetWorker thread (the "Network Queue" pattern). The worker owns the
+        # Connection: it drains the client's input off the render thread and
+        # runs the REAL-TIME snapshot timer (checked every ~1 ms, NOT once
+        # per frame — the 7.10c in-loop timer was frame-quantized and fired
+        # at 112-150 ms at 24 FPS). The main thread publishes a fresh
+        # snapshot each frame via set_latest_snapshot; the worker's timer
+        # grabs the latest and sends it every 100 ms of REAL time. start()
+        # flips the socket to non-blocking + launches the thread.
+        worker = NetWorker(conn, is_host=True)
+        worker.start()
 
         # --- 4. the authoritative game loop ---
-        # Session 7.10c: the snapshot cadence is a FIXED 10 Hz REAL-TIME
-        # timer, decoupled from the frame loop. The old code sent on
-        # `tick % SNAPSHOT_INTERVAL == 0` (tick = round(sim_time / STEP)),
-        # which is a function of the frame loop's step pattern: at 60 FPS
-        # the tick advances by 1 per frame (regular 100 ms sends), but at
-        # 35 FPS the tick advances by 1 or 2 per frame (irregular
-        # 114 ms / 200 ms sends) — the bursty sends the client sees as
-        # "gaps" (newest jumping 0.3-1.6 s) and the catch-up fast-forwards
-        # to close = the "big lag spikes". A real-time timer sends every
-        # 100 ms of REAL time, independent of the frame rate, so the sends
-        # are a steady 10 Hz at any frame rate (35, 47, 60, 144). The
-        # snapshot is stamped with game.sim_time (the host's sim clock,
-        # which runs at 1x real time regardless of frame rate), so the
-        # client interpolates correctly. This is a GENERAL fix (works for
-        # any frame rate), not a machine-specific workaround.
-        last_snap_time = 0.0   # 0.0 -> the first send is immediate
-        SNAP_PERIOD = SNAPSHOT_INTERVAL * STEP   # 6 * 1/60 = 0.1 s (10 Hz)
+        # Session 8.3: the snapshot SEND is now owned by the worker's
+        # real-time timer (see the NetWorker start above) — the main thread
+        # no longer sends snapshots or runs the 7.10c in-loop timer. Each
+        # frame it publishes a fresh snapshot via set_latest_snapshot
+        # (cheap: game.snapshot() is ~0.13 ms, measured); the worker's timer
+        # (checked every ~1 ms, NOT once per frame) grabs the latest and
+        # sends it every 100 ms of REAL time — a true 10 Hz independent of
+        # the frame rate (the 7.10c in-loop timer was frame-quantized: at
+        # 24 FPS it fired at 112-150 ms, not 100 ms). The snapshot is
+        # stamped with game.sim_time (the host's sim clock, 1x real time
+        # regardless of frame rate), so the client's interpolation window is
+        # unchanged. This is a GENERAL fix (any frame rate), not a
+        # machine-specific workaround.
+        # Session 7.10b: host-side frame-rate telemetry (F3-toggled). The
+        # send moved to the worker, so the telemetry now runs on its OWN
+        # 10 Hz real-time timer in the main loop (it measures the host's
+        # FRAME rate — a main-thread concern — and the wall-clock `t` is the
+        # join key to the client's CSV, not the send event). last_telem_time
+        # anchors it (0.0 -> the first line is immediate).
+        last_telem_time = 0.0
+        TELEMETRY_PERIOD = SNAPSHOT_INTERVAL * STEP   # 0.1 s (10 Hz)
         # Session 7.10b: host-side frame-rate telemetry (F3-toggled, mirrors
         # the client's 7.10a columns). The client's CSV can't tell a WIRE
         # stall (host sent smoothly, packets queued + released in a burst)
@@ -198,43 +216,46 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
                 return
             keys = pygame.key.get_pressed()
             # Poll the client: apply its latest input (pinned #5: the host
-            # applies the LATEST received input each tick).
-            for m in conn.poll():
+            # applies the LATEST received input each tick). Session 8.3:
+            # worker.poll() drains the input the worker thread already
+            # parsed off the render thread (the JSON decode no longer
+            # happens here).
+            for m in worker.poll():
                 if m.get("type") == T_INPUT:
                     game.set_remote_input(deserialize_input(m["inp"]))
-            if conn.closed:
-                conn.close()
+            # Session 8.3: the worker owns the socket now — read
+            # worker.closed (the worker mirrors conn.closed) and never
+            # touch conn.* here. The worker also does the drain_send()
+            # (off the render thread), so the in-loop conn.drain_send() is
+            # gone.
+            if worker.closed:
                 _notice(screen, font, big_font, clock,
                         ["DISCONNECTED", "the other player left"])
                 return
-            conn.drain_send()
             game.update(dt, keys)
-            # Session 7.10c: broadcast a snapshot every SNAP_PERIOD of REAL
-            # time (10 Hz), decoupled from the frame loop — see the
-            # comment at the top of the loop for why the old
-            # `tick % SNAPSHOT_INTERVAL == 0` send was bursty at sub-60 FPS
-            # frame rates. The snapshot is stamped with game.sim_time (the
-            # host's sim clock, 1x real time regardless of frame rate), so
-            # the client's interpolation window is unchanged.
+            # Session 8.3: publish a fresh snapshot to the worker each frame (the
+            # worker's real-time timer sends the latest every 100 ms of REAL
+            # time — see the comment at the top of the loop). game.snapshot()
+            # is cheap (~0.13 ms, measured) and is handed off by reference
+            # (atomic swap under the GIL), so the worker always has a
+            # <16 ms-old snapshot to send. The snapshot is stamped with
+            # game.sim_time (the host's sim clock, 1x real time regardless of
+            # frame rate), so the client's interpolation window is unchanged.
+            worker.set_latest_snapshot(game.sim_time, game.snapshot())
+            # Session 7.10b: host-side frame-rate telemetry (F3-toggled), on
+            # its OWN 10 Hz real-time timer (the send moved to the worker, so
+            # it no longer rides the send). One line per 100 ms, mirroring
+            # the client's 7.10a columns: t (wall clock), sim_time (the
+            # host's sim clock), fps (1/mean raw frame time since the last
+            # line), dt_max (longest raw frame), hic (frames past the 50 ms
+            # clamp), n (frames in the window). The wall-clock `t` is the
+            # join key: the client's CSV has the same `t` (both machines'
+            # wall clocks are roughly synced on the same LAN), so a client
+            # snapshot gap at t=X can be checked against the host's
+            # fps/dt_max/hic at t=X to tell a wire stall from a host stall.
             now_t = pygame.time.get_ticks() / 1000.0
-            if now_t - last_snap_time >= SNAP_PERIOD:
-                conn.send({"type": T_SNAP, "sim_time": game.sim_time,
-                           "snap": serialize_snapshot(game.snapshot())})
-                # Anchor the next send to NOW + period (not last + period)
-                # so a slow frame can't build up a send backlog that fires
-                # as a burst next frame — the cadence stays 10 Hz.
-                last_snap_time = now_t
-                # Session 7.10b: host-side frame-rate telemetry (F3-toggled).
-                # One line per snapshot send (10 Hz), mirroring the client's
-                # 7.10a columns: t (wall clock), sim_time (the host's sim
-                # clock at send), fps (1/mean raw frame time since the last
-                # send), dt_max (longest raw frame), hic (frames past the
-                # 50 ms clamp), n (frames in the window). The wall-clock `t`
-                # is the join key: the client's CSV has the same `t` (both
-                # machines' wall clocks are roughly synced on the same LAN),
-                # so a client snapshot gap at t=X can be checked against the
-                # host's fps/dt_max/hic at t=X to tell a wire stall from a
-                # host stall.
+            if now_t - last_telem_time >= TELEMETRY_PERIOD:
+                last_telem_time = now_t
                 if game.debug_net:
                     f = game._dbg_log_f
                     if f is None:
@@ -258,6 +279,14 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
         if getattr(game, "_dbg_log_f", None) is not None:
             game._dbg_log_f.close()
             game._dbg_log_f = None
+        # Session 8.3: stop the worker (join its thread) BEFORE closing the
+        # connection — the worker owns the socket, and closing a socket a
+        # worker still owns crashes that worker with EBADF (the 8.1 gotcha).
+        # stop() is idempotent + a no-op when the worker was never started
+        # (handshake failed before phase 3), so this is safe on every exit
+        # path (ESC/QUIT, disconnect, port-in-use).
+        if worker is not None:
+            worker.stop()
         if conn is not None:
             conn.close()
         host.close()
@@ -474,9 +503,17 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
     game._dbg_dt_sum = 0.0
     game._dbg_dt_max = 0.0
     game._dbg_hiccups = 0
-    # Flip the socket to non-blocking for the game loop (the handshake used a
-    # 0.05 s recv timeout; it must be cleared before the loop).
-    conn.set_nonblocking()
+    # Session 8.2: the socket I/O + JSON move to a NetWorker thread (the
+    # "Network Queue" pattern). The worker owns the Connection: it drains the
+    # OS socket buffer the instant a packet lands (no bunching) and parses
+    # the JSON off the render thread. The main thread talks to it only
+    # through worker.send() / worker.poll() / worker.closed — it never
+    # touches conn.* once the worker starts (the ownership rule that avoids
+    # the "Python Pygame Trap" shared-state corruption). start() flips the
+    # socket to non-blocking (the handshake used a 0.05 s recv timeout; it
+    # must be cleared before the loop) and launches the thread.
+    worker = NetWorker(conn, is_host=False)
+    worker.start()
 
     while True:
         # Session 7.10 (Chunk 1): capture the RAW frame time before the
@@ -502,8 +539,9 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
         # frame.
         inp = ShipInput.from_keys(keys)
         # Send the local input every frame (pinned #5: the host applies the
-        # LATEST received input each tick).
-        conn.send({"type": T_INPUT, "inp": serialize_input(inp)})
+        # LATEST received input each tick). Session 8.2: queued to the
+        # worker (it flushes to the socket off the render thread).
+        worker.send({"type": T_INPUT, "inp": serialize_input(inp)})
         # Session 7.6: record the input in the ghost's rewind buffer,
         # stamped with the client's estimate of the host's sim clock at
         # this moment (the 7.1 HostTimeEstimator — the same clock the
@@ -523,20 +561,24 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
         # ghost (seed on the first, dead-reckoning rewind on the rest —
         # Session 7.6). `now` is the client's current estimate of the
         # host's sim clock: the rewind replays from the snapshot's stamp
-        # up to it.
-        for m in conn.poll():
+        # up to it. Session 8.2: worker.poll() drains the messages the
+        # worker thread already parsed off the render thread (the JSON
+        # decode no longer happens here).
+        for m in worker.poll():
             if m.get("type") == T_SNAP:
                 if game.host_time.record(now, m["sim_time"]):
                     game.latency.update(game.host_time.last_jitter)
                 game.push_snapshot(m["sim_time"],
                                    deserialize_snapshot(m["snap"]),
                                    now=game.host_time.now(now))
-        if conn.closed:
-            conn.close()
+        # Session 8.2: the worker owns the socket now — read worker.closed (the
+        # worker mirrors conn.closed) and never touch conn.* here. The
+        # worker also does the drain_send() (off the render thread), so the
+        # in-loop conn.drain_send() is gone.
+        if worker.closed:
             _notice(screen, font, big_font, clock,
                     ["DISCONNECTED", "the host left"])
             break
-        conn.drain_send()
         # Render point (Session 7.5b): the newest ARRIVED snapshot's
         # stamp minus the adaptive delay, chased at a bounded per-frame
         # rate — the buffer is the anchor, not the 7.1 host-time
@@ -571,6 +613,11 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
     if game._dbg_log_f is not None:
         game._dbg_log_f.close()
         game._dbg_log_f = None
+    # Session 8.2: stop the worker (join its thread) BEFORE closing the
+    # connection — the worker owns the socket, and closing a socket a worker
+    # still owns crashes that worker with EBADF (the 8.1 gotcha). stop() is
+    # idempotent, so this is safe on every exit path (ESC/QUIT, disconnect).
+    worker.stop()
     conn.close()
 
 

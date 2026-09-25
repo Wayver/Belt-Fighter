@@ -44,11 +44,14 @@ Run the self-test (headless, no display needed):
     python -m ship5.net
 """
 import json
+import queue
 import socket
 import struct
+import threading
 import time
 from dataclasses import asdict
 
+from .config import SNAPSHOT_INTERVAL, TICK
 from .intent import ShipInput
 from .hulls import (PLAYER_HULLS, COMPONENT_CATALOG, DEFAULT_HULL,
                     default_loadout, validate_loadout)
@@ -61,6 +64,7 @@ __all__ = [
     "serialize_loadout", "deserialize_loadout",
     "Connection", "Host", "connect",
     "do_handshake_client", "do_handshake_host",
+    "NetWorker",
     "T_JOIN", "T_WELCOME", "T_INPUT", "T_SNAP",
 ]
 
@@ -568,6 +572,184 @@ def do_handshake_host(conn, host_hull, host_loadout, timeout=30.0):
     return None, None
 
 
+# --- async worker: socket I/O + JSON off the main thread (Session 8.1) -----
+#
+# The 7.x netcode ran the socket recv + a ~30 KB json.loads (client) /
+# json.dumps (host) INSIDE the main pygame loop, once per frame. Two
+# problems: (1) the 7.10c "decoupled" snapshot timer is checked once per
+# frame, so at a 24 FPS host the 100 ms timer actually fires at ~112 ms mean
+# / 150 ms max gaps (frame-quantized, not a true 10 Hz); (2) the socket I/O +
+# JSON are CPU time taken from the render — a hiccup there is a frame hiccup.
+#
+# NetWorker moves BOTH to a dedicated daemon thread. The thread owns the
+# Connection (socket + buffers) and the real-time send timer; the main thread
+# talks to it ONLY through two thread-safe queues + a couple of atomic
+# flags. This is the "Network Queue" pattern: the worker does the raw socket
+# work + JSON and blindly dumps parsed messages into `in_queue`; the main
+# thread pulls them out at the start of the frame and updates game state
+# safely (single-threaded pygame).
+#
+# OWNERSHIP RULE (the fix for the "Python Pygame Trap" — shared-state
+# corruption): the worker thread touches ONLY the socket + JSON. It NEVER
+# touches pygame or sim state. The main thread does ALL pygame/sim work. The
+# two talk only through immutable hand-offs:
+#   * out_queue (queue.Queue): main -> worker, message dicts to send.
+#   * in_queue  (queue.Queue): worker -> main, parsed message dicts.
+#   * _latest_snapshot: a single shared slot the MAIN thread writes each
+#     frame with a fresh (sim_time, snapshot) tuple; the worker's host timer
+#     reads it. A tuple reference swap is atomic under the GIL, so no lock
+#     is needed for the hand-off itself (the worker only ever reads the
+#     reference, never mutates the tuple).
+# The Connection is owned ENTIRELY by the worker after start(); the main
+# thread must NOT call conn.poll()/drain_send()/touch conn.sock once the
+# worker is running.
+
+class NetWorker:
+    """A daemon thread that owns a Connection's socket I/O + JSON.
+
+    Lifecycle:
+      1. Built around a connected `Connection` (from `Host.accept_one` or
+         `connect`). The socket may still be blocking (the handshake phase);
+         the worker calls `set_nonblocking()` itself on start.
+      2. `start()` flips the socket to non-blocking and launches the thread.
+      3. The main thread calls `send(msg)` (queue it), `poll()` (drain the
+         parsed messages), and checks `.closed` — exactly where it used to
+         call `conn.send` / `conn.poll` / `conn.closed`.
+      4. Host only: the main thread calls `set_latest_snapshot((sim_time,
+         snap))` each frame; the worker's real-time timer (checked every
+         ~1 ms, NOT once per frame) sends the latest snapshot every
+         `period` seconds of REAL time — a true 10 Hz independent of the
+         frame rate (the 7.10c in-loop timer was frame-quantized).
+      5. `stop()` sets the stop flag and joins the thread. Idempotent.
+
+    The worker's per-iteration work:
+      1. drain out_queue -> conn.send() (queue the encoded frames);
+      2. conn.drain_send() (flush to the socket);
+      3. for m in conn.poll(): in_queue.put(m)  (JSON parse happens HERE);
+      4. host: if the timer is due, grab _latest_snapshot and send it;
+      5. stop_event.wait(WAIT)  (~1 ms; bounds CPU + makes stop() prompt).
+    """
+
+    # How long the worker sleeps between iterations when idle. ~1 ms keeps
+    # the send timer near-exact (a 100 ms period is checked every ~1 ms) and
+    # the receive drain near-instant, while bounding the thread's CPU. If
+    # receive latency ever matters more than CPU, this can be replaced by a
+    # short socket settimeout block (a small follow-up).
+    WAIT = 0.001
+
+    def __init__(self, conn, is_host=False, period=None):
+        self._conn = conn
+        self._is_host = is_host
+        # The host snapshot period in REAL seconds (10 Hz by default). The
+        # client ignores it (it never sends snapshots).
+        self._period = (SNAPSHOT_INTERVAL * TICK) if period is None else period
+        self._out = queue.Queue()
+        self._in = queue.Queue()
+        # The host's latest (sim_time, snapshot) tuple, written by the main
+        # thread each frame, read by the worker's timer. None until the main
+        # thread provides one. A reference swap is atomic under the GIL.
+        self._latest_snapshot = None
+        self._stop = threading.Event()
+        self._thread = None
+        self._started = False
+        # Mirrors conn.closed once the worker has observed it. The main
+        # thread reads THIS (not conn.closed) so it never touches the
+        # Connection after start().
+        self.closed = False
+
+    # -- main-thread API ----------------------------------------------------
+    def send(self, msg):
+        """Queue one message dict for sending (main thread). Non-blocking —
+        the bytes go out on the worker's next iteration. Replaces the
+        in-loop `conn.send(msg)`."""
+        self._out.put(msg)
+
+    def poll(self):
+        """Drain the parsed messages the worker has received (main thread).
+        Returns a list of dicts in arrival order (possibly empty). Replaces
+        the in-loop `conn.poll()` — call it once per frame, exactly where
+        `conn.poll()` was."""
+        out = []
+        while True:
+            try:
+                out.append(self._in.get_nowait())
+            except queue.Empty:
+                return out
+
+    def set_latest_snapshot(self, sim_time, snap):
+        """Host only: publish the latest (sim_time, snapshot) for the
+        worker's timer to send (main thread, once per frame). The tuple is
+        handed off by reference (atomic swap under the GIL); the worker only
+        ever reads it, never mutates it."""
+        self._latest_snapshot = (sim_time, snap)
+
+    def start(self):
+        """Flip the socket to non-blocking and launch the worker thread.
+        Call once, after the handshake (the socket is still blocking during
+        the handshake; the worker takes it over from here)."""
+        if self._started:
+            return
+        self._conn.set_nonblocking()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        self._started = True
+
+    def stop(self):
+        """Signal the worker to stop and join it. Idempotent — safe to call
+        from a `finally` block more than once (e.g. on disconnect AND on
+        menu return)."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
+
+    # -- worker thread ------------------------------------------------------
+    def _run(self):
+        conn = self._conn
+        last_snap = 0.0   # 0.0 -> the first host send is immediate
+        while not self._stop.is_set():
+            try:
+                # 1. send side: queue any pending messages, then flush.
+                while True:
+                    try:
+                        conn.send(self._out.get_nowait())
+                    except queue.Empty:
+                        break
+                conn.drain_send()
+                # 2. receive side: drain the socket, parse JSON HERE, hand off.
+                for m in conn.poll():
+                    self._in.put(m)
+                # 3. host: the real-time snapshot timer (checked every ~1 ms,
+                #    NOT once per frame — the 7.10c in-loop timer was
+                #    frame-quantized and fired at 112-150 ms at 24 FPS).
+                if self._is_host:
+                    now = time.monotonic()
+                    if now - last_snap >= self._period:
+                        latest = self._latest_snapshot
+                        if latest is not None:
+                            sim_time, snap = latest
+                            conn.send({"type": T_SNAP, "sim_time": sim_time,
+                                       "snap": serialize_snapshot(snap)})
+                        # Anchor to NOW (not last + period) so a slow
+                        # iteration can't build a send backlog that fires as
+                        # a burst.
+                        last_snap = now
+            except OSError:
+                # The socket went away out from under us (a stray close, or
+                # the peer reset in a way recv surfaces as OSError rather
+                # than the ConnectionError poll() already handles). A daemon
+                # network thread must never crash with a traceback: mark the
+                # connection closed and stop cleanly. The main thread notices
+                # via .closed on its next frame.
+                self.closed = True
+                break
+            # 4. propagate the close flag to the main thread.
+            if conn.closed:
+                self.closed = True
+            # 5. sleep ~1 ms (bounds CPU + makes stop() prompt).
+            self._stop.wait(self.WAIT)
+
+
 # ---------------------------------------------------------------------------
 # Self-test (headless). Exercises the framing in isolation AND a real
 # loopback TCP round-trip of the handshake + one snapshot. Run:
@@ -872,6 +1054,213 @@ def _self_test():
         hconn.close()
         client.close()
     finally:
+        host.close()
+
+    # --- 5. NetWorker (Session 8.1): the async worker thread, loopback ---
+    # Exercises the worker in isolation (no pygame game loop): the send path,
+    # the receive path, the host real-time snapshot timer's cadence, clean
+    # shutdown, and close propagation. Each sub-test uses a fresh loopback
+    # connection so the tests don't cross-contaminate.
+    def _loopback():
+        h = Host(0)
+        p = h.sock.getsockname()[1]
+        c = connect("127.0.0.1", p)
+        hc, _addr = h.accept_one()
+        return h, hc, c
+
+    def _wait_for(worker, want_type, timeout=2.0):
+        """Poll `worker` until a message of `want_type` arrives (or timeout).
+        Returns the message or None."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            for m in worker.poll():
+                if m.get("type") == want_type:
+                    return m
+            time.sleep(0.002)
+        return None
+
+    # (a) send path (host->client) + (b) receive path (client->host): the
+    # worker drains the socket in BOTH directions and hands parsed messages
+    # to the peer's worker. One loopback setup, both directions at once.
+    host, hconn, client = _loopback()
+    hw = NetWorker(hconn, is_host=False)
+    cw = NetWorker(client, is_host=False)
+    hw.start()
+    cw.start()
+    try:
+        hw.send({"type": T_SNAP, "sim_time": 1.0, "snap": [1, 2, 3]})
+        cw.send({"type": T_INPUT, "inp": {"turn": 1.0, "fire": True}})
+        got_snap = _wait_for(cw, T_SNAP)
+        got_inp = _wait_for(hw, T_INPUT)
+        if (got_snap is not None and got_snap["sim_time"] == 1.0
+                and got_inp is not None and got_inp["inp"]["turn"] == 1.0):
+            print("PASS: NetWorker send + receive (both directions, loopback)")
+        else:
+            ok = False
+            print("FAIL: NetWorker send/receive -> snap=%r inp=%r"
+                  % (got_snap, got_inp))
+    finally:
+        hw.stop()
+        cw.stop()
+        hconn.close()
+        client.close()
+        host.close()
+
+    # (c) host real-time snapshot timer cadence: over a fixed wall-clock
+    # window the worker must send ~window/period snapshots with gaps ~period.
+    # This is the frame-quantization regression check — the 7.10c in-loop
+    # timer fired at 112-150 ms at 24 FPS; the worker's timer (checked every
+    # ~1 ms) must sit at ~100 ms regardless of frame rate.
+    host, hconn, client = _loopback()
+    PERIOD = 0.1
+    hw = NetWorker(hconn, is_host=True, period=PERIOD)
+    cw = NetWorker(client, is_host=False)
+    hw.start()
+    cw.start()
+    try:
+        # Publish one snapshot; the worker's timer re-sends it every PERIOD.
+        hw.set_latest_snapshot(g.sim_time, snap)
+        start = time.monotonic()
+        WINDOW = 0.5
+        arrivals = []
+        while time.monotonic() - start < WINDOW:
+            for m in cw.poll():
+                if m.get("type") == T_SNAP:
+                    arrivals.append(time.monotonic())
+            time.sleep(0.002)
+        gaps = [b - a for a, b in zip(arrivals, arrivals[1:])]
+        n = len(arrivals)
+        mean_gap = (sum(gaps) / len(gaps)) if gaps else 0.0
+        max_gap = max(gaps) if gaps else 0.0
+        # Expect ~5 sends over 0.5 s at 10 Hz (immediate first + one per
+        # period). Generous bounds so a slow CI machine does not fail it.
+        cadence_ok = (4 <= n <= 8
+                      and 0.07 <= mean_gap <= 0.14
+                      and max_gap <= 0.16)
+        if cadence_ok:
+            print("PASS: NetWorker host timer cadence — %d snaps in %.1f s, "
+                  "mean gap %.0f ms, max gap %.0f ms (target %.0f ms)"
+                  % (n, WINDOW, mean_gap * 1000, max_gap * 1000,
+                     PERIOD * 1000))
+        else:
+            ok = False
+            print("FAIL: NetWorker host timer cadence -> n=%d mean_gap=%.0fms "
+                  "max_gap=%.0fms (expected ~%d snaps, ~%d ms gaps)"
+                  % (n, mean_gap * 1000, max_gap * 1000,
+                     int(WINDOW / PERIOD), PERIOD * 1000))
+    finally:
+        hw.stop()
+        cw.stop()
+        hconn.close()
+        client.close()
+        host.close()
+
+    # (d) clean shutdown + idempotent stop: stop() joins the thread, a second
+    # stop() is a no-op, and no thread is left running.
+    host, hconn, client = _loopback()
+    hw = NetWorker(hconn, is_host=False)
+    hw.start()
+    try:
+        hw.stop()
+        hw.stop()          # idempotent: must not raise
+        if hw._thread is None:
+            print("PASS: NetWorker clean shutdown (stop() joins, idempotent)")
+        else:
+            ok = False
+            print("FAIL: NetWorker shutdown left a thread running")
+    finally:
+        hconn.close()
+        client.close()
+        host.close()
+
+    # (e) close propagation: when the peer closes, worker.closed becomes True
+    # (the main thread reads THIS, never conn.closed, after start()). Only the
+    # HOST worker runs here; the client end is a BARE socket we close directly
+    # to simulate the peer going away. (We do NOT run a worker on the client
+    # end: the worker contract is that the main thread never closes a socket a
+    # worker owns — it calls stop() first — so closing a worker-owned socket
+    # would crash that worker with EBADF. A bare socket has no worker, so
+    # closing it just sends the peer a clean FIN.)
+    host, hconn, client = _loopback()
+    hw = NetWorker(hconn, is_host=False)
+    hw.start()
+    try:
+        client.close()     # the peer (client end) goes away
+        deadline = time.monotonic() + 2.0
+        while not hw.closed and time.monotonic() < deadline:
+            time.sleep(0.002)
+        if hw.closed:
+            print("PASS: NetWorker close propagation (peer close -> .closed)")
+        else:
+            ok = False
+            print("FAIL: NetWorker did not propagate the peer close")
+    finally:
+        hw.stop()
+        hconn.close()
+        host.close()
+
+    # (f) concurrent stress: a BUSY main thread (60 Hz send + poll) runs
+    # concurrently with the worker thread for 3 s — the explicit shake-out
+    # for the "Python Pygame Trap" (shared-state corruption). The peer runs
+    # its OWN worker that echoes every T_INPUT back as a T_SNAP, so the main
+    # thread verifies the round-trip integrity under real concurrency.
+    # Asserts: no exception, every echoed message is well-formed (no
+    # corruption), a healthy number of echoes arrived, and stop() leaves no
+    # leaked thread (active thread count returns to baseline).
+    host, hconn, client = _loopback()
+    hw = NetWorker(hconn, is_host=False)
+    ew = NetWorker(client, is_host=False)   # the peer's echo worker
+    # Capture the thread baseline BEFORE starting the workers, so that after
+    # stop() joins both, active_count() returns to exactly this value (a
+    # leaked thread would leave it higher).
+    base_threads = threading.active_count()
+    hw.start()
+    ew.start()
+    try:
+        sent = 0
+        received = []
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            # The "main thread" (this one) does what the game loop does:
+            # send an input every ~16 ms and drain the worker's inbox.
+            hw.send({"type": T_INPUT, "inp": {"turn": 1.0, "seq": sent}})
+            sent += 1
+            for m in hw.poll():
+                if m.get("type") == T_SNAP:
+                    received.append(m)
+            # Peer-side echo routing (normal usage: main thread drains the
+            # peer worker's inbox and sends replies): forward each T_INPUT
+            # the peer received back as a T_SNAP carrying the original inp.
+            for m in ew.poll():
+                if m.get("type") == T_INPUT:
+                    ew.send({"type": T_SNAP, "inp": m["inp"]})
+            time.sleep(0.016)
+        # The echo worker forwards each T_INPUT as a T_SNAP carrying the
+        # original 'inp'. Verify integrity: every received message is a
+        # well-formed echo (no corruption from concurrent access).
+        intact = all(isinstance(m.get("inp"), dict)
+                     and m["inp"].get("turn") == 1.0
+                     and isinstance(m["inp"].get("seq"), int)
+                     for m in received)
+        # A healthy number of echoes (the main thread sends ~180 over 3 s;
+        # allow generous slack for a slow/loaded machine, but require a
+        # meaningful fraction so a silent drop-out fails the test).
+        count_ok = 50 <= len(received) <= sent
+        # stop() must join both threads and leave none behind.
+        hw.stop()
+        ew.stop()
+        no_leak = threading.active_count() == base_threads
+        if intact and count_ok and no_leak:
+            print("PASS: NetWorker concurrent stress — %d echoes in 3 s, "
+                  "all well-formed, no leaked thread" % len(received))
+        else:
+            ok = False
+            print("FAIL: NetWorker concurrent stress -> intact=%s "
+                  "received=%d/%d no_leak=%s"
+                  % (intact, len(received), sent, no_leak))
+    finally:
+        hconn.close()
+        client.close()
         host.close()
 
     pygame.quit()

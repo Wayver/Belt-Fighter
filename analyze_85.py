@@ -22,7 +22,20 @@ def fnum(row, key):
     except (ValueError, TypeError): return None
 
 rows = load('host_sim_debug.csv')
-print(f"=== 8.5 Step 1: host_sim_debug.csv ({len(rows)} frames) ===")
+# Column 3 was clamped_dt pre-fix (what the sim saw) and draw_dt post-fix
+# (the clamped dt that drives draw() — the sim now sees raw_dt). Accept both.
+dt_col = 'clamped_dt' if 'clamped_dt' in rows[0] else 'draw_dt'
+PRE_FIX = (dt_col == 'clamped_dt')
+# The user's run had a death: after game_over the host sim FREEZES
+# (advance == 0 forever). Truncate at the last frame that advanced the sim
+# so the frozen tail doesn't dilute the rate / drop calculations.
+last_live = max(i for i, r in enumerate(rows) if (fnum(r, 'advance') or 0) > 0)
+frozen = len(rows) - 1 - last_live
+rows = rows[:last_live + 1]
+print(f"=== 8.5 {'Step 1 (pre-fix)' if PRE_FIX else 'Step 3 (post-fix verify)'}: "
+      f"host_sim_debug.csv ({len(rows)} live frames"
+      + (f", {frozen} post-death frozen frames excluded" if frozen else "")
+      + ") ===")
 
 raw = [fnum(r, 'raw_dt') for r in rows]
 raw = [x for x in raw if x is not None]
@@ -39,7 +52,7 @@ print(f"  TIME DROPPED:       {sum(raw)-sum(adv):.3f} s  "
 print(f"  sim-clock rate:     {(s1-s0)/(t1-t0):.4f} x real time  "
       f"(target ~1.0; 8.4 measured 0.9762)")
 
-# Hiccup frames: raw_dt > 0.05 (the clamp threshold)
+# Hiccup frames: raw_dt > 0.05 (the old clamp threshold)
 hic = [r for r in rows if (fnum(r, 'raw_dt') or 0) > 0.05]
 print(f"\n  hiccup frames (raw_dt > 0.05): {len(hic)} of {len(rows)}")
 if hic:
@@ -49,7 +62,8 @@ if hic:
     print(f"    raw_dt:   mean {st.mean(h_raw)*1000:.1f} ms  max {max(h_raw)*1000:.1f} ms")
     print(f"    advance:  mean {st.mean(h_adv)*1000:.1f} ms  max {max(h_adv)*1000:.1f} ms")
     print(f"    LOST:     mean {st.mean(h_lost)*1000:.1f} ms  total {sum(h_lost):.3f} s")
-    # advance distribution on hiccup frames (should cluster at ~0.05 = the clamp)
+    # Pre-fix: advance clusters at ~0.05 (the clamp). Post-fix: advance
+    # tracks raw_dt (within STEP quantization + backlog-cap slack).
     from collections import Counter
     hist = Counter(round(a*1000) for a in h_adv)
     print(f"    advance histogram (ms): {dict(sorted(hist.items()))}")
@@ -72,10 +86,25 @@ print(f"\n  acc_after: max {max(acc)*1000:.2f} ms  (must be < 16.67 ms = STEP)")
 dropped = sum(raw) - sum(adv)
 rate = (s1 - s0) / (t1 - t0)
 print("\n=== VERDICT ===")
-if dropped > 0.5 and rate < 0.99:
-    print(f"  CONFIRMED: the dt clamp drops {dropped:.2f} s over {t1-t0:.0f} s "
-          f"({100*dropped/(t1-t0):.1f}% of wall time). Sim-clock rate {rate:.4f}x.")
-    print("  -> Proceed to 8.5 Step 2 (feed unclamped dt + cap steps/frame).")
+if PRE_FIX:
+    if dropped > 0.5 and rate < 0.99:
+        print(f"  CONFIRMED: the dt clamp drops {dropped:.2f} s over {t1-t0:.0f} s "
+              f"({100*dropped/(t1-t0):.1f}% of wall time). Sim-clock rate {rate:.4f}x.")
+        print("  -> Proceed to 8.5 Step 2 (feed unclamped dt + cap steps/frame).")
+    else:
+        print(f"  NOT CONFIRMED: dropped={dropped:.2f}s, rate={rate:.4f}x. "
+              "Re-examine the mechanism before Step 2.")
 else:
-    print(f"  NOT CONFIRMED: dropped={dropped:.2f}s, rate={rate:.4f}x. "
-          "Re-examine the mechanism before Step 2.")
+    # Post-fix success bar: sim-clock rate ~1.0 (>= 0.995), hiccup frames no
+    # longer pinned at 50 ms (advance tracks raw_dt), no backlog-cap drops
+    # (lost ~0 unless a pathological stall hit the 0.25 s cap).
+    hic_lost = sum(fnum(r, 'raw_dt') - fnum(r, 'advance') for r in hic)
+    if rate >= 0.995 and hic_lost < 0.05:
+        print(f"  FIX VERIFIED: sim-clock rate {rate:.4f}x (target ~1.0), "
+              f"hiccup-frame loss {hic_lost*1000:.0f} ms total "
+              f"(was pinned at 50 ms pre-fix).")
+        print("  -> 8.5 Step 3: fresh two-machine CSV run; check the client's")
+        print("     50/67/83 ms gap cluster is gone + jitter/delay back to baseline.")
+    else:
+        print(f"  FIX INCOMPLETE: rate={rate:.4f}x, hiccup-frame loss "
+              f"{hic_lost*1000:.0f} ms. Inspect the hiccup advance histogram.")

@@ -441,11 +441,38 @@ class Game:
                     self.debug_net = not self.debug_net   # 7.8 net debug overlay + log
         return True
 
+    # Session 8.5: the fixed-step loop's hiccup policy. `dt` is the
+    # UNCLAMPED frame time (the host loop no longer pre-clamps it), so the
+    # sim clock tracks real time: a 62 ms hiccup frame advances the sim
+    # 62 ms (here, or over the next frame or two) instead of dropping the
+    # 12 ms the old frame-loop clamp lost. Two guards keep a pathological
+    # stall (GC pause, window drag, OS suspend) from spiraling:
+    #   MAX_STEPS_PER_FRAME — one frame may run at most this many fixed
+    #     steps (5 = 83 ms of sim time). Covers every observed hiccup
+    #     (max 77 ms — the 8.5 Step 1 diagnostic) with zero loss; a
+    #     500 ms stall would otherwise fire 30 steps in one frame.
+    #   ACC_BACKLOG_CAP — the accumulator itself is capped, so a
+    #     pathological stall drops its excess backlog (the old
+    #     min(dt, 0.25) semantics, now applied to the backlog instead of
+    #     the per-frame dt). The bounded catch-up then runs at most
+    #     MAX_STEPS_PER_FRAME steps/frame until the backlog drains.
+    MAX_STEPS_PER_FRAME = 5
+    ACC_BACKLOG_CAP = 0.25
+
     def update(self, dt, keys):
         # Sample input once per frame; apply it to each fixed step.
         inp = ShipInput.from_keys(keys)
-        self.acc += min(dt, 0.25)   # clamp: no spiral of death after a hitch
-        while self.acc >= STEP:
+        # Session 8.5: dt is the UNCLAMPED frame time — the sim clock
+        # tracks real time. The old min(dt, 0.25) here + the host loop's
+        # min(raw_dt, 0.05) DROPPED the excess on every hiccup frame and
+        # the sim clock never caught up (8.5 Step 1 proved it: 0.77 s
+        # lost over 63 s, hiccup-frame advances pinned at exactly 50 ms,
+        # sim-clock rate 0.988x). The ACC_BACKLOG_CAP above is the
+        # spiral-of-death guard now.
+        self.acc = min(self.acc + dt, self.ACC_BACKLOG_CAP)
+        for _ in range(self.MAX_STEPS_PER_FRAME):
+            if self.acc < STEP:
+                break
             self._step(STEP, inp)
             self.acc -= STEP
     def _step(self, dt, inp):

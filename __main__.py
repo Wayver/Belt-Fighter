@@ -200,12 +200,13 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
             os.path.dirname(os.path.abspath(__file__)), "host_debug.csv")
         game._dbg_log_f = None
         # Session 8.5 Step 1: per-frame sim-clock diagnostic (F3-toggled,
-        # additive — NO behavior change). Proves the dt clamp is losing time
-        # on hiccup frames: logs raw_dt (real frame time), clamped_dt (what
-        # the sim sees), sim_before/sim_after (the sim clock), advance (sim
-        # time gained this frame), and acc_after (accumulator remainder). If
-        # the clamp drops time, sum(advance) < sum(raw_dt) and the sim-clock
-        # rate (sim_after over wall time) is < 1.0.
+        # additive). Logs raw_dt (real frame time — what the sim is fed),
+        # draw_dt (the clamped dt that drives draw()), sim_before/sim_after
+        # (the sim clock), advance (sim time gained this frame), and
+        # acc_after (accumulator remainder). Step 1 (pre-fix) used it to
+        # prove the dt clamp was losing time on hiccup frames; post-Step-2
+        # it verifies the fix: sim-clock rate ~1.0, advance tracking
+        # raw_dt (modulo STEP quantization + the backlog cap).
         game._dbg_sim_log_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "host_sim_debug.csv")
         game._dbg_sim_log_f = None
@@ -246,20 +247,30 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
             # update so the per-frame diagnostic can measure exactly how much
             # sim time this frame advanced (vs the real raw_dt).
             sim_before = game.sim_time
-            game.update(dt, keys)
+            # Session 8.5 Step 2: feed the sim the UNCLAMPED frame time
+            # (raw_dt) — the sim clock now tracks real time instead of
+            # dropping the excess on every hiccup frame (the 8.5 Step 1
+            # diagnostic proved the old clamp lost 0.77 s over 63 s).
+            # game.update's own guards (MAX_STEPS_PER_FRAME +
+            # ACC_BACKLOG_CAP) are the spiral-of-death protection now.
+            # `dt` (clamped) still drives draw() — presentation only.
+            game.update(raw_dt, keys)
             # Session 8.5 Step 1: per-frame sim-clock diagnostic (F3-toggled,
-            # additive — NO behavior change). One line per frame: t (wall
-            # clock), raw_dt (real frame time), clamped_dt (the dt the sim
-            # actually saw — min(raw_dt, 0.05)), sim_before/sim_after (the
-            # host sim clock), advance (sim time gained this frame),
-            # acc_after (accumulator remainder). The clamp drops time on
-            # hiccup frames: when raw_dt > 0.05, advance <= 0.05 < raw_dt, so
-            # sum(advance) < sum(raw_dt) and the sim clock lags real time.
+            # additive). One line per frame: t (wall clock), raw_dt (real
+            # frame time — what the sim is fed, Session 8.5 Step 2),
+            # draw_dt (the clamped dt that drives draw() — presentation
+            # only), sim_before/sim_after (the host sim clock), advance
+            # (sim time gained this frame), acc_after (accumulator
+            # remainder). Pre-fix this proved the clamp dropped time
+            # (advance pinned at 50 ms on hiccup frames); post-fix the
+            # check is sim-clock rate ~1.0 and advance tracking raw_dt
+            # (modulo the 16.67 ms STEP quantization + the backlog cap on
+            # pathological stalls).
             if game.debug_net:
                 f = game._dbg_sim_log_f
                 if f is None:
                     f = open(game._dbg_sim_log_path, "w", newline="")
-                    f.write("t,raw_dt,clamped_dt,sim_before,sim_after,"
+                    f.write("t,raw_dt,draw_dt,sim_before,sim_after,"
                             "advance,acc_after\n")
                     game._dbg_sim_log_f = f
                 f.write("%.3f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n" % (
@@ -715,10 +726,14 @@ def main():
                     test_mode=('--test' in sys.argv), seed=seed, sound=sfx)
         running = True
         while running:
-            dt = min(clock.tick(FPS) / 1000.0, 0.05)
+            raw_dt = clock.tick(FPS) / 1000.0
+            dt = min(raw_dt, 0.05)
             running = game.handle_events()
             keys = pygame.key.get_pressed()
-            game.update(dt, keys)
+            # Session 8.5 Step 2: same fix as the host loop — feed the sim
+            # the UNCLAMPED frame time so the sim clock tracks real time
+            # (game.update's guards handle the spiral-of-death case).
+            game.update(raw_dt, keys)
             game.draw(dt)
             pygame.display.flip()
         break

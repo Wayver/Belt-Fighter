@@ -199,6 +199,16 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
         game._dbg_log_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "host_debug.csv")
         game._dbg_log_f = None
+        # Session 8.5 Step 1: per-frame sim-clock diagnostic (F3-toggled,
+        # additive — NO behavior change). Proves the dt clamp is losing time
+        # on hiccup frames: logs raw_dt (real frame time), clamped_dt (what
+        # the sim sees), sim_before/sim_after (the sim clock), advance (sim
+        # time gained this frame), and acc_after (accumulator remainder). If
+        # the clamp drops time, sum(advance) < sum(raw_dt) and the sim-clock
+        # rate (sim_after over wall time) is < 1.0.
+        game._dbg_sim_log_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "host_sim_debug.csv")
+        game._dbg_sim_log_f = None
         while True:
             # Session 7.10b: capture the RAW frame time before the clamp
             # (the clamp hides hiccups from the sim, but a raw frame > 50 ms
@@ -232,7 +242,29 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
                 _notice(screen, font, big_font, clock,
                         ["DISCONNECTED", "the other player left"])
                 return
+            # Session 8.5 Step 1: capture the sim clock before/after the
+            # update so the per-frame diagnostic can measure exactly how much
+            # sim time this frame advanced (vs the real raw_dt).
+            sim_before = game.sim_time
             game.update(dt, keys)
+            # Session 8.5 Step 1: per-frame sim-clock diagnostic (F3-toggled,
+            # additive — NO behavior change). One line per frame: t (wall
+            # clock), raw_dt (real frame time), clamped_dt (the dt the sim
+            # actually saw — min(raw_dt, 0.05)), sim_before/sim_after (the
+            # host sim clock), advance (sim time gained this frame),
+            # acc_after (accumulator remainder). The clamp drops time on
+            # hiccup frames: when raw_dt > 0.05, advance <= 0.05 < raw_dt, so
+            # sum(advance) < sum(raw_dt) and the sim clock lags real time.
+            if game.debug_net:
+                f = game._dbg_sim_log_f
+                if f is None:
+                    f = open(game._dbg_sim_log_path, "w", newline="")
+                    f.write("t,raw_dt,clamped_dt,sim_before,sim_after,"
+                            "advance,acc_after\n")
+                    game._dbg_sim_log_f = f
+                f.write("%.3f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n" % (
+                    time.time(), raw_dt, dt, sim_before, game.sim_time,
+                    game.sim_time - sim_before, game.acc))
             # Session 8.3: publish a fresh snapshot to the worker each frame (the
             # worker's real-time timer sends the latest every 100 ms of REAL
             # time — see the comment at the top of the loop). game.snapshot()
@@ -279,6 +311,10 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
         if getattr(game, "_dbg_log_f", None) is not None:
             game._dbg_log_f.close()
             game._dbg_log_f = None
+        # Session 8.5 Step 1: close the per-frame sim-clock diagnostic log.
+        if getattr(game, "_dbg_sim_log_f", None) is not None:
+            game._dbg_sim_log_f.close()
+            game._dbg_sim_log_f = None
         # Session 8.3: stop the worker (join its thread) BEFORE closing the
         # connection — the worker owns the socket, and closing a socket a
         # worker still owns crashes that worker with EBADF (the 8.1 gotcha).

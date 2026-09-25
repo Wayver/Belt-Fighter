@@ -14,6 +14,7 @@ env/
 # were 7.9-era baselines and are no longer tracked.
 net_debug.csv
 host_debug.csv
+host_sim_debug.csv
 net_debug_latest.csv
 host_debug_latest.csv
 

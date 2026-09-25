@@ -145,7 +145,23 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
         conn.set_nonblocking()
 
         # --- 4. the authoritative game loop ---
-        last_sent = -1
+        # Session 7.10c: the snapshot cadence is a FIXED 10 Hz REAL-TIME
+        # timer, decoupled from the frame loop. The old code sent on
+        # `tick % SNAPSHOT_INTERVAL == 0` (tick = round(sim_time / STEP)),
+        # which is a function of the frame loop's step pattern: at 60 FPS
+        # the tick advances by 1 per frame (regular 100 ms sends), but at
+        # 35 FPS the tick advances by 1 or 2 per frame (irregular
+        # 114 ms / 200 ms sends) — the bursty sends the client sees as
+        # "gaps" (newest jumping 0.3-1.6 s) and the catch-up fast-forwards
+        # to close = the "big lag spikes". A real-time timer sends every
+        # 100 ms of REAL time, independent of the frame rate, so the sends
+        # are a steady 10 Hz at any frame rate (35, 47, 60, 144). The
+        # snapshot is stamped with game.sim_time (the host's sim clock,
+        # which runs at 1x real time regardless of frame rate), so the
+        # client interpolates correctly. This is a GENERAL fix (works for
+        # any frame rate), not a machine-specific workaround.
+        last_snap_time = 0.0   # 0.0 -> the first send is immediate
+        SNAP_PERIOD = SNAPSHOT_INTERVAL * STEP   # 6 * 1/60 = 0.1 s (10 Hz)
         # Session 7.10b: host-side frame-rate telemetry (F3-toggled, mirrors
         # the client's 7.10a columns). The client's CSV can't tell a WIRE
         # stall (host sent smoothly, packets queued + released in a burst)
@@ -193,13 +209,21 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
                 return
             conn.drain_send()
             game.update(dt, keys)
-            # Broadcast a snapshot every SNAPSHOT_INTERVAL sim ticks.
-            # round() guards against float drift in sim_time/STEP.
-            tick = round(game.sim_time / STEP)
-            if tick != last_sent and tick % SNAPSHOT_INTERVAL == 0:
+            # Session 7.10c: broadcast a snapshot every SNAP_PERIOD of REAL
+            # time (10 Hz), decoupled from the frame loop — see the
+            # comment at the top of the loop for why the old
+            # `tick % SNAPSHOT_INTERVAL == 0` send was bursty at sub-60 FPS
+            # frame rates. The snapshot is stamped with game.sim_time (the
+            # host's sim clock, 1x real time regardless of frame rate), so
+            # the client's interpolation window is unchanged.
+            now_t = pygame.time.get_ticks() / 1000.0
+            if now_t - last_snap_time >= SNAP_PERIOD:
                 conn.send({"type": T_SNAP, "sim_time": game.sim_time,
                            "snap": serialize_snapshot(game.snapshot())})
-                last_sent = tick
+                # Anchor the next send to NOW + period (not last + period)
+                # so a slow frame can't build up a send backlog that fires
+                # as a burst next frame — the cadence stays 10 Hz.
+                last_snap_time = now_t
                 # Session 7.10b: host-side frame-rate telemetry (F3-toggled).
                 # One line per snapshot send (10 Hz), mirroring the client's
                 # 7.10a columns: t (wall clock), sim_time (the host's sim

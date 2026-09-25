@@ -8,7 +8,12 @@ venv/
 .venv/
 env/
 
-# Net debug logs (Session 7.8 client, 7.10b host; F3-toggled)
+# Net debug logs (Session 7.8 client, 7.10b host; F3-toggled). The
+# *_latest.csv names are the regenerated artifacts from the 8.x
+# re-test; the old machine-suffixed CSVs (net_debug_4090.csv etc.)
+# were 7.9-era baselines and are no longer tracked.
 net_debug.csv
 host_debug.csv
+net_debug_latest.csv
+host_debug_latest.csv
 

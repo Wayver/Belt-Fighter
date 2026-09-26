@@ -29,11 +29,17 @@ Game.update — MAX_STEPS_PER_FRAME + ACC_BACKLOG_CAP):
      with the LATEST published local input (pinned #5: the host applies
      the latest received input each tick — the local input gets the same
      treatment);
-  3. PUBLISH: latest_model = game.render_model() (atomic reference swap;
-     the render thread reads it and draws with it), and
+  3. PUBLISH (only when >= 1 step ran): g.acc = acc (so render_model's
+     step_alpha is the sim's real acc/STEP), then
+     latest_model = game.render_model() (atomic reference swap; the
+     render thread reads it and draws with it), and
      worker.set_latest_snapshot(game.sim_time, game.snapshot()) (moved
      from the render loop to the sim thread — the worker's 10 Hz timer
-     now always has a fresh snapshot to send);
+     now always has a fresh snapshot to send). Publishing only on a step
+     keeps the model object STABLE between steps (the render clock
+     detects a new model by identity and advances its alpha while the
+     same model is re-read) and avoids ~94% wasted render_model() calls
+     (the thread iterates every ~1 ms but only steps 60x/sec);
   4. stop_event.wait(WAIT) (~1 ms; bounds CPU + makes stop() prompt).
 
 The render thread's interpolation alpha is NOT this thread's acc/STEP
@@ -178,18 +184,36 @@ class SimThread:
             acc = min(acc + (now - last), self.ACC_BACKLOG_CAP)
             last = now
             inp = self._latest_input
+            steps = 0
             for _ in range(self.MAX_STEPS_PER_FRAME):
                 if acc < STEP:
                     break
                 g._step(STEP, inp)
                 acc -= STEP
-            # 3. publish: the RenderModel (atomic reference swap — the
-            #    render thread reads .latest_model and draws with it)
-            #    and the wire snapshot (the worker's 10 Hz real-time
-            #    timer grabs the latest and sends it; moved here from
-            #    the render loop in M3).
-            self.latest_model = g.render_model()
-            if self._worker is not None:
-                self._worker.set_latest_snapshot(g.sim_time, g.snapshot())
+                steps += 1
+            # 3. publish ONLY when the sim actually stepped. Publishing a
+            #    fresh model every ~1 ms iteration (even when nothing
+            #    changed) caused two problems: (a) the render clock
+            #    detects a "new model" by object identity, so a fresh
+            #    dict every ~1 ms made it re-anchor every render frame
+            #    (it never advanced its alpha between publishes), and
+            #    (b) ~94% of the render_model() calls were wasted CPU
+            #    (the model was identical to the last step's). Publishing
+            #    only on a step keeps the model object STABLE between
+            #    steps (so the render clock can advance its alpha) and
+            #    cuts the sim thread's CPU ~94%.
+            #
+            #    Also write g.acc = acc before publishing: render_model()
+            #    reads self.acc for step_alpha, but this thread uses its
+            #    OWN local acc (it steps g._step directly, not
+            #    g.update()). Without this, step_alpha was always 0 and
+            #    the render clock's re-anchor (t = sim_time +
+            #    step_alpha*STEP) landed on alpha=0 every frame.
+            if steps:
+                g.acc = acc
+                self.latest_model = g.render_model()
+                if self._worker is not None:
+                    self._worker.set_latest_snapshot(g.sim_time,
+                                                     g.snapshot())
             # 4. sleep ~1 ms (bounds CPU + makes stop() prompt).
             self._stop.wait(self.WAIT)

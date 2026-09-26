@@ -16,6 +16,11 @@ The checks:
   1. SMOKE    — the thread runs, publishes a plain-data model, and the
                 sim clock advances at ~1x real time (not tied to any
                 render frame rate — there is no render loop here at all).
+  1b. PUBLISH-ON-STEP — the thread publishes a NEW model only on a step
+                (the model object is stable between steps), so a render
+                thread reading at its own pace sees the same model across
+                reads and _HostRenderClock's alpha VARIES (not pinned at
+                0). Regression for the M4 alpha=0 / wasted-CPU bug.
   2. INPUT    — the LATEST published local input drives player 0 (the
                 ship moves), while the remote input (a direct reference
                 swap on game.remote_input, the render-thread hand-off)
@@ -179,6 +184,64 @@ def main():
                 "n=%d" % len(worker.snapshots))
     ok &= check("smoke: the last snapshot is stamped with the sim clock",
                 abs(worker.snapshots[-1][0] - m["sim_time"]) < 2 * STEP)
+
+    # --- 1b. PUBLISH-ON-STEP: the REAL host-loop pattern (regression for
+    #     the M4 alpha=0 / wasted-CPU bug). The thread iterates every
+    #     ~1 ms but only STEPS 60x/sec; it must publish a NEW model only
+    #     on a step, so the model object is STABLE between steps. A render
+    #     thread reading at its own pace (here ~22 FPS, 45 ms — the M4
+    #     host's measured rate) must then see the SAME model object across
+    #     reads (so _HostRenderClock advances its alpha between publishes)
+    #     and the alpha must VARY, not sit at 0. Before the fix the thread
+    #     published a fresh dict every ~1 ms iteration, so the render
+    #     clock (which detects a new model by object identity) re-anchored
+    #     every frame and alpha was 0.0000 for 100% of frames — exactly
+    #     what the M4 host_sim_debug.csv showed. ---
+    from .__main__ import _HostRenderClock
+    g = make_game(screen, font, big_font, light_tex, fog_surf, light_surf,
+                  seed=1234)
+    worker = FakeWorker()
+    st = SimThread(g, worker)
+    st.start()
+    wait_for(lambda: st.latest_model is not None)
+    rc = _HostRenderClock()
+    alphas = []
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 1.0:
+        m = st.latest_model
+        if m is None:
+            time.sleep(0.005)
+            continue
+        alphas.append(rc.advance(0.045, m))   # a ~22 FPS render frame
+        time.sleep(0.045)
+    st.stop()
+    # The worker receives set_latest_snapshot ONLY on a step. ~1 s of sim
+    # time = ~60 steps, so ~60 snapshots. Before the fix the thread
+    # published (and snapshotted) every ~1 ms iteration -> ~1000 in 1 s.
+    # This is the direct "publish-on-step" signal.
+    ok &= check("publish-on-step: the worker got ~one snapshot per step "
+                "(~60/s, not ~1000/s)",
+                40 <= len(worker.snapshots) <= 80,
+                "n=%d in ~1 s (sim_time=%.2f)"
+                % (len(worker.snapshots), g.sim_time))
+    # The render clock's alpha must NOT be pinned at exactly 0. Pre-fix,
+    # g.acc was never written by the sim thread (it steps g._step directly,
+    # not g.update()), so step_alpha was always 0.0 and the render clock
+    # (re-anchoring on every fresh ~1 ms model) gave alpha=0.0000 for 100%
+    # of frames — exactly the M4 host_sim_debug.csv. Post-fix, the render
+    # (at ~22 FPS here) sees a fresh model each frame and re-anchors to the
+    # sim's step_alpha at publish, which is the sub-step overshoot (varies
+    # in ~[0, 0.1]) — so the alphas vary and reach > 0.01. (They do NOT
+    # span [0,1): the sim thread feeds its own acc at ~1 ms granularity, so
+    # the post-step remainder is small; the smoothness comes from t
+    # advancing between publishes at a higher render FPS.)
+    ok &= check("publish-on-step: render alpha is not pinned at 0 (varies)",
+                len(alphas) > 5 and max(alphas) > 0.01
+                and len(set(round(a, 4) for a in alphas)) > 2,
+                "alpha: n=%d min=%.4f max=%.4f distinct=%d"
+                % (len(alphas), min(alphas) if alphas else -1,
+                   max(alphas) if alphas else -1,
+                   len(set(round(a, 4) for a in alphas))))
 
     # --- 2. INPUT: local (published) + remote (reference swap) ----------
     g = make_game(screen, font, big_font, light_tex, fog_surf, light_surf,

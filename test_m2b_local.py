@@ -47,6 +47,13 @@ The checks:
                     live Ship.shield_impact_point; the start matches the
                     live pose. (The default hull has no laser, so this is a
                     focused geometry check, not a scripted discharge.)
+  6b. BEAM-MODEL-TUPLE — the FULL model-tuple path through _draw_world_beam
+                    with a SURVIVING target: no TypeError (the port/starboard
+                    laser crash — the model's tuple `d` must be converted
+                    back to a Vector2) and the beam lands on the computed
+                    end-point. (One-shot lasers like the 360 kill the target,
+                    so their beams take the vis_end branch and never touched
+                    the bug.)
   7. RETICLE      — with targeting on, the model lead point + alignment
                     match the live AIEnemy.lead_point / Game._lead_aligned,
                     and the fog reticle lights match.
@@ -67,13 +74,15 @@ import textwrap
 
 import pygame
 
-from .config import (WIDTH, HEIGHT, BG, BULLET_SPEED,
+from .config import (WIDTH, HEIGHT, BG, BULLET_SPEED, LASER_COLOR,
                     TARGETING_USE_ACCEL, TARGETING_RANGE)
 from .fog import make_light_texture
 from .game import (Game, STEP,
                    _ship_pose, _sync_local_ship, _draw_local_ship,
-                   _shield_impact_point_pose, _lead_point, _lead_aligned,
+                   _draw_world_beam, _shield_impact_point_pose,
+                   _lead_point, _lead_aligned,
                    _build_lights_model, _draw_sensor_contacts_model)
+from .camera import Camera
 from .ai_enemy import AIEnemy
 from .asteroid import Asteroid
 from .intent import ShipInput
@@ -331,6 +340,88 @@ def main():
         ok = False
         print("FAIL: BEAM — beam geometry differs (oval=%s end=%s start=%s)"
               % (oval_ok, end_ok, start_ok))
+
+    # --- 6b. BEAM-MODEL-TUPLE: the FULL model-tuple path through
+    #     _draw_world_beam — the regression for the port/starboard laser
+    #     crash. render_model() serializes the beam's `d` (a unit direction
+    #     Vector2 in the live sim) as a PLAIN TUPLE; _draw_world_beam must
+    #     convert it back before the `d * e[6]` math. The bug only fired when
+    #     the beam's target was STILL ALIVE (in enemies_by_id) — a one-shot
+    #     laser (360) kills the target, so its target_id misses the lookup
+    #     and the vis_end branch (which never touches d) runs instead. That
+    #     is why the 360 laser "worked" while port/starboard crashed. This
+    #     check feeds a model-shaped beam (tuple d, tuple vis_end) with a
+    #     SURVIVING target and asserts: (a) no TypeError, and (b) the beam
+    #     line lands exactly where _draw_world_beam's own end-point math
+    #     says (the shield oval, or the hull point when the target has no
+    #     shield) — not just "didn't crash". ---
+    beamtuple_ok = True
+    bt_detail = ""
+    if fresh.enemies:
+        e = fresh.enemies[0]
+        proxies = fresh._get_remote_enemies()
+        proxy = proxies.get(fresh._enemy_tag(e))
+        # model-shaped beam: local_start tuple, target_id, d TUPLE,
+        # vis_end TUPLE, age, ttl — exactly what render_model() emits.
+        d_live = fship.pos - e.pos
+        if d_live.length_squared() < 1e-6:
+            d_live = pygame.Vector2(1, 0)
+        d_live.normalize_ip()
+        vis_end = e.pos - d_live * e.collision_radius
+        beam = ((0.0, 0.0), e.ship.id, (d_live.x, d_live.y),
+                (vis_end.x, vis_end.y), 0.0, 0.15)
+        enemies_by_id = {e.ship.id: (fresh._enemy_tag(e), e.ship.id,
+                                     (e.pos.x, e.pos.y), e.ship.angle,
+                                     (e.ship.vel.x, e.ship.vel.y),
+                                     (e._acc_smooth.x, e._acc_smooth.y),
+                                     e.collision_radius,
+                                     tuple(e.ship.collision.local_poly))}
+        # Mirror _draw_world_beam's own end-point math (same branch choice).
+        if proxy is not None and proxy.ship.shield_comp is not None:
+            want_end = _shield_impact_point_pose(e.pos, e.ship.angle,
+                                                 proxy.ship.shield_oval,
+                                                 vis_end)
+        else:
+            want_end = vis_end
+        # Center the camera on the ship->endpoint midpoint so both ends are
+        # on-screen (to_screen is a plain affine: world - cam + center).
+        fcam.pos = (fship.pos + want_end) / 2
+        bt_surf = _surface()
+        try:
+            _draw_world_beam(bt_surf, fcam, fship.pos, fship.angle, beam,
+                             enemies_by_id, proxies)
+        except TypeError as ex:
+            beamtuple_ok = False
+            bt_detail = "TypeError: %s" % ex
+        else:
+            # age=0 -> fade=1 -> full LASER_COLOR. Probe a small
+            # neighborhood of the endpoint pixel (2px line rasterization).
+            gx, gy = int(fcam.to_screen(want_end).x), \
+                     int(fcam.to_screen(want_end).y)
+            hit = False
+            for ox in range(-3, 4):
+                for oy in range(-3, 4):
+                    px, py = gx + ox, gy + oy
+                    if 0 <= px < WIDTH and 0 <= py < HEIGHT:
+                        got = bt_surf.get_at((px, py))
+                        if (abs(got.r - LASER_COLOR[0]) <= 8
+                                and abs(got.g - LASER_COLOR[1]) <= 8
+                                and abs(got.b - LASER_COLOR[2]) <= 8):
+                            hit = True
+                            break
+                if hit:
+                    break
+            if not hit:
+                beamtuple_ok = False
+                bt_detail = "beam not drawn at the end-point (%s)" \
+                            % (want_end,)
+    if beamtuple_ok:
+        print("PASS: BEAM-MODEL-TUPLE — a model-tuple beam with a SURVIVING "
+              "target draws without TypeError and lands on the computed "
+              "end-point (the port/starboard crash regression)")
+    else:
+        ok = False
+        print("FAIL: BEAM-MODEL-TUPLE — %s" % (bt_detail or "no enemy"))
 
     # --- 7. RETICLE: with targeting on, the model lead point + alignment
     #     match the live AIEnemy.lead_point / Game._lead_aligned, and the

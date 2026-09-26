@@ -324,6 +324,12 @@ def _draw_world_beam(screen, cam, rpos, rangle, beam, enemies_by_id,
     via the same math as Ship.shield_impact_point. Mirrors the live beam
     loop in draw()."""
     local, target_id, d, vis_end, age, ttl = beam
+    # `d` is a PLAIN TUPLE in the model (render_model serializes the live
+    # Vector2 as (x, y)) — convert it back before the `d * e[6]` math, or a
+    # beam whose target is still alive crashes (tuple * float). The
+    # target-dead branch (vis_end) never touches d, which is why one-shot
+    # lasers (360) masked the bug.
+    d = pygame.Vector2(d)
     fade = 1.0 - age / ttl
     c = tuple(int(ch * fade) for ch in LASER_COLOR)
     fwd = pygame.Vector2(math.cos(rangle), math.sin(rangle))

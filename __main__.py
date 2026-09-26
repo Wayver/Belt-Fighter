@@ -31,8 +31,69 @@ from .net import (Host, connect, do_handshake_host, do_handshake_client,
 from .netcode import (PredictedShip, HostTimeEstimator, LatencyTracker,
                       RenderPoint)
 from .ship import Ship
+from .sim_thread import SimThread
 from .sound import SoundBank
 from .intent import ShipInput
+
+
+class _HostRenderClock:
+    """Session 9.x M3: the host render thread's own interpolation clock.
+
+    With the sim on the SimThread, the render thread no longer owns the
+    sim's accumulator — so it computes its OWN interpolation alpha
+    instead of reading the model's `step_alpha` (the sim's acc/STEP at
+    publish time). The model still CARRIES step_alpha (the M1/M2b parity
+    tests read it), and it is also what this clock re-anchors on.
+
+    The model carries the local ship's prev+curr pose (the window
+    [T - STEP, T], where T = model.sim_time), so no 2-deep model ring is
+    needed — the latest model alone spans the interpolation window. The
+    clock keeps an estimate of the sim's CURRENT time (sim_time + the
+    in-progress step's fraction):
+
+      * on each NEW published model: re-anchor on the data —
+        t = model.sim_time + model.step_alpha * STEP (the sim's current
+        time at publish, ~1-2 ms old). Re-anchoring (instead of
+        free-running) is what keeps the estimate honest: the sim's
+        hiccup policy DROPS backlog time (ACC_BACKLOG_CAP), so a
+        free-running 1x-real-time estimate would drift ahead of the sim
+        clock after any stall and stay clamped at alpha=1 forever.
+      * between publishes (the same model re-read): advance t by the
+        frame's real dt (1x real time — the host's sim rate).
+
+    The alpha is then (t - T) / STEP, clamped to [0, 1] (the 70460de
+    rule: on a hiccup render the LATEST simulated state, never
+    extrapolate past the current pose). In steady state t - T equals the
+    sim's acc at publish (plus ~1 ms of publish latency), so the alpha
+    matches the old sim-acc/STEP behavior exactly — the rendered pose is
+    sim_now - STEP, one step behind the sim's current time, as before.
+    """
+
+    def __init__(self):
+        self._curr = None    # the newest published model
+        self._t = None       # the render-thread estimate of the sim's current time
+
+    def advance(self, dt, model):
+        """One render frame of real time `dt` (the CLAMPED dt — a hiccup
+        frame must not drag the estimate forward faster than 1x).
+        `model` is the latest published model (an atomic reference read
+        of SimThread.latest_model; None before the first publish).
+        Returns the interpolation alpha for this frame."""
+        if model is None:
+            return 0.0
+        if model is not self._curr:
+            # A new model was published: re-anchor on its stamp + the
+            # sim's in-progress fraction (the sim's current time at
+            # publish). Do NOT also add dt — the anchor is fresh.
+            self._curr = model
+            self._t = model["sim_time"] + model["step_alpha"] * STEP
+        else:
+            # Same model as last frame: advance the estimate at 1x real
+            # time (the host's sim rate) until the next publish.
+            self._t += dt
+        T = self._curr["sim_time"]
+        alpha = (self._t - T) / STEP
+        return max(0.0, min(1.0, alpha))
 
 
 def _lan_ip():
@@ -118,6 +179,9 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
     worker = None  # Session 8.3: the host's NetWorker (created in phase 3);
                    # defined here so the finally can stop() it even if the
                    # handshake fails before phase 3 runs.
+    sim_thread = None  # Session 9.x M3: the host's SimThread (created in
+                       # phase 4); defined here so the finally can stop() it
+                       # even if the handshake fails before phase 4 runs.
     try:
         # --- 1. wait for a client (waiting screen + timed accept) ---
         while conn is None:
@@ -159,25 +223,38 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
         worker.start()
 
         # --- 4. the authoritative game loop ---
-        # Session 8.3: the snapshot SEND is now owned by the worker's
-        # real-time timer (see the NetWorker start above) — the main thread
-        # no longer sends snapshots or runs the 7.10c in-loop timer. Each
-        # frame it publishes a fresh snapshot via set_latest_snapshot
-        # (cheap: game.snapshot() is ~0.13 ms, measured); the worker's timer
-        # (checked every ~1 ms, NOT once per frame) grabs the latest and
-        # sends it every 100 ms of REAL time — a true 10 Hz independent of
-        # the frame rate (the 7.10c in-loop timer was frame-quantized: at
-        # 24 FPS it fired at 112-150 ms, not 100 ms). The snapshot is
-        # stamped with game.sim_time (the host's sim clock, 1x real time
-        # regardless of frame rate), so the client's interpolation window is
-        # unchanged. This is a GENERAL fix (any frame rate), not a
-        # machine-specific workaround.
+        # Session 9.x M3: the sim moves OFF the render thread onto the
+        # SimThread — a daemon thread that steps the Game at a real-time
+        # 60 Hz clock (a monotonic accumulator, NOT tied to the frame
+        # rate) and publishes the plain-data RenderModel via an atomic
+        # reference swap (the NetWorker _latest_snapshot pattern). The
+        # render thread becomes a LOCAL CLIENT of that sim: it publishes
+        # the latest local input + T/V/G/R/F commands, and reads
+        # sim_thread.latest_model to draw. The snapshot hand-off to the
+        # worker (set_latest_snapshot) moves to the sim thread too — the
+        # worker's 10 Hz real-time timer (unchanged) now always has a
+        # fresh snapshot to send, and the snapshot is still stamped with
+        # game.sim_time (the host's sim clock, 1x real time regardless of
+        # frame rate), so the client's interpolation window is unchanged.
+        # `game` is now OWNED by the sim thread: the render thread never
+        # calls game.update() or mutates sim state — it publishes input
+        # (a fresh ShipInput per frame), commands (a queue), and reads
+        # latest_model (a reference swap).
+        sim_thread = SimThread(game, worker)
+        sim_thread.start()
+        # Session 9.x M3: the render thread's own interpolation clock
+        # (the sim's acc/STEP is no longer the render thread's — see the
+        # class docstring).
+        render_clock = _HostRenderClock()
         # Session 7.10b: host-side frame-rate telemetry (F3-toggled). The
-        # send moved to the worker, so the telemetry now runs on its OWN
+        # send moved to the worker (8.3), so the telemetry runs on its OWN
         # 10 Hz real-time timer in the main loop (it measures the host's
-        # FRAME rate — a main-thread concern — and the wall-clock `t` is the
-        # join key to the client's CSV, not the send event). last_telem_time
-        # anchors it (0.0 -> the first line is immediate).
+        # FRAME rate — a main-thread concern — and the wall-clock `t` is
+        # the join key to the client's CSV, not the send event).
+        # Session 9.x M3: this is now the headline gate — with the sim
+        # cost OFF the render thread, the host's render FPS should rise
+        # (the 8.5 caveat's outstanding item). last_telem_time anchors it
+        # (0.0 -> the first line is immediate).
         last_telem_time = 0.0
         TELEMETRY_PERIOD = SNAPSHOT_INTERVAL * STEP   # 0.1 s (10 Hz)
         # Session 7.10b: host-side frame-rate telemetry (F3-toggled, mirrors
@@ -223,14 +300,24 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
                     game._dbg_dt_max = raw_dt
                 if raw_dt > 0.05:
                     game._dbg_hiccups += 1
-            if not game.handle_events():
+            # Session 9.x M3: the T/V/G/R/F keys are ROUTED to the sim thread
+            # (command_sink) instead of mutating live state — the sim
+            # thread applies them at the top of its next iteration.
+            # QUIT/ESC (exit) + F3 (the render diagnostic) stay handled
+            # here. handle_events still reads game.game_over/test_mode
+            # for the same gating (a bool read — atomic, no mutation).
+            if not game.handle_events(sim_thread.command):
                 return
             keys = pygame.key.get_pressed()
             # Poll the client: apply its latest input (pinned #5: the host
             # applies the LATEST received input each tick). Session 8.3:
             # worker.poll() drains the input the worker thread already
             # parsed off the render thread (the JSON decode no longer
-            # happens here).
+            # happens here). Session 9.x M3: the hand-off to the sim
+            # thread is a direct reference swap (game.remote_input = inp)
+            # — atomic under the GIL, and _step only READS the input
+            # (the world-cap replace() builds a new object), so the swap
+            # is race-free.
             for m in worker.poll():
                 if m.get("type") == T_INPUT:
                     game.set_remote_input(deserialize_input(m["inp"]))
@@ -243,48 +330,37 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
                 _notice(screen, font, big_font, clock,
                         ["DISCONNECTED", "the other player left"])
                 return
-            # Session 8.5 Step 1: capture the sim clock before/after the
-            # update so the per-frame diagnostic can measure exactly how much
-            # sim time this frame advanced (vs the real raw_dt).
-            sim_before = game.sim_time
-            # Session 8.5 Step 2: feed the sim the UNCLAMPED frame time
-            # (raw_dt) — the sim clock now tracks real time instead of
-            # dropping the excess on every hiccup frame (the 8.5 Step 1
-            # diagnostic proved the old clamp lost 0.77 s over 63 s).
-            # game.update's own guards (MAX_STEPS_PER_FRAME +
-            # ACC_BACKLOG_CAP) are the spiral-of-death protection now.
-            # `dt` (clamped) still drives draw() — presentation only.
-            game.update(raw_dt, keys)
-            # Session 8.5 Step 1: per-frame sim-clock diagnostic (F3-toggled,
-            # additive). One line per frame: t (wall clock), raw_dt (real
-            # frame time — what the sim is fed, Session 8.5 Step 2),
-            # draw_dt (the clamped dt that drives draw() — presentation
-            # only), sim_before/sim_after (the host sim clock), advance
-            # (sim time gained this frame), acc_after (accumulator
-            # remainder). Pre-fix this proved the clamp dropped time
-            # (advance pinned at 50 ms on hiccup frames); post-fix the
-            # check is sim-clock rate ~1.0 and advance tracking raw_dt
-            # (modulo the 16.67 ms STEP quantization + the backlog cap on
-            # pathological stalls).
+            # Session 9.x M3: the sim no longer runs here. The SimThread steps it
+            # at a real-time 60 Hz clock (its own monotonic accumulator —
+            # the 8.5 hiccup policy, MAX_STEPS_PER_FRAME + ACC_BACKLOG_CAP,
+            # now lives in sim_thread.py) and publishes the RenderModel +
+            # the wire snapshot. The render thread's job each frame:
+            # publish the latest local input, read the published model,
+            # draw. `dt` (clamped) drives draw() + the render clock —
+            # presentation only.
+            sim_thread.publish_input(ShipInput.from_keys(keys))
+            # Session 9.x M3: read the PUBLISHED model (an atomic reference read —
+            # the render thread never reads live sim state, which would
+            # race the sim thread's _step) and compute the render
+            # thread's own interpolation alpha (see _HostRenderClock).
+            model = sim_thread.latest_model
+            alpha = render_clock.advance(dt, model)
+            # Session 9.x M3: the per-frame sim-clock diagnostic (F3-
+            # toggled, additive) now reads the published model + the
+            # render thread's alpha instead of the live game.sim_time /
+            # game.acc. One line per frame: t (wall clock), raw_dt (real
+            # frame time), draw_dt (the clamped dt that drives draw() —
+            # presentation only), sim_time (the published model's sim
+            # clock), alpha (the render thread's interpolation alpha).
             if game.debug_net:
                 f = game._dbg_sim_log_f
                 if f is None:
                     f = open(game._dbg_sim_log_path, "w", newline="")
-                    f.write("t,raw_dt,draw_dt,sim_before,sim_after,"
-                            "advance,acc_after\n")
+                    f.write("t,raw_dt,draw_dt,sim_time,alpha\n")
                     game._dbg_sim_log_f = f
-                f.write("%.3f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n" % (
-                    time.time(), raw_dt, dt, sim_before, game.sim_time,
-                    game.sim_time - sim_before, game.acc))
-            # Session 8.3: publish a fresh snapshot to the worker each frame (the
-            # worker's real-time timer sends the latest every 100 ms of REAL
-            # time — see the comment at the top of the loop). game.snapshot()
-            # is cheap (~0.13 ms, measured) and is handed off by reference
-            # (atomic swap under the GIL), so the worker always has a
-            # <16 ms-old snapshot to send. The snapshot is stamped with
-            # game.sim_time (the host's sim clock, 1x real time regardless of
-            # frame rate), so the client's interpolation window is unchanged.
-            worker.set_latest_snapshot(game.sim_time, game.snapshot())
+                f.write("%.3f,%.4f,%.4f,%.4f,%.4f\n" % (
+                    time.time(), raw_dt, dt,
+                    model["sim_time"] if model else 0.0, alpha))
             # Session 7.10b: host-side frame-rate telemetry (F3-toggled), on
             # its OWN 10 Hz real-time timer (the send moved to the worker, so
             # it no longer rides the send). One line per 100 ms, mirroring
@@ -314,9 +390,18 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
                     game._dbg_dt_max = 0.0
                     game._dbg_hiccups = 0
                     f.write("%.3f,%.4f,%.1f,%.4f,%d,%d\n" % (
-                        time.time(), game.sim_time, fps, dt_max, hic, n))
+                        time.time(),
+                        model["sim_time"] if model else 0.0,
+                        fps, dt_max, hic, n))
                     f.flush()
-            game.draw(dt)
+            # Session 9.x M3: draw the PUBLISHED model (the M3 seam:
+            # draw(dt, model) — the model is built by the sim thread, not
+            # here), with the render thread's OWN interpolation alpha
+            # (the sim's acc/STEP is no longer the render thread's — see
+            # the _HostRenderClock docstring). The model still carries
+            # the sim's step_alpha (the M1/M2b parity tests read it);
+            # draw() uses the render thread's instead.
+            game.draw(dt, {**model, "step_alpha": alpha} if model else None)
             pygame.display.flip()
     finally:
         if getattr(game, "_dbg_log_f", None) is not None:
@@ -326,6 +411,12 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
         if getattr(game, "_dbg_sim_log_f", None) is not None:
             game._dbg_sim_log_f.close()
             game._dbg_sim_log_f = None
+        # Session 9.x M3: stop the sim thread (join it) BEFORE stopping the
+        # worker — the sim thread feeds the worker (set_latest_snapshot),
+        # and the worker must not be sending a snapshot the sim thread is
+        # about to mutate (a reset). stop() is idempotent.
+        if sim_thread is not None:
+            sim_thread.stop()
         # Session 8.3: stop the worker (join its thread) BEFORE closing the
         # connection — the worker owns the socket, and closing a socket a
         # worker still owns crashes that worker with EBADF (the 8.1 gotcha).

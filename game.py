@@ -982,8 +982,19 @@ class Game:
                         for w in p.weapons],
         }
 
-    def handle_events(self):
-        """Returns False when the window should close."""
+    def handle_events(self, command_sink=None):
+        """Returns False when the window should close.
+
+        `command_sink` (Session 9.x M3): a callable receiving one of
+        'targeting' / 'sensor' / 'scan' / 'reset' for the T/V/G/R/F
+        keys. When given (the host, whose sim runs on the SimThread),
+        the keys are ROUTED to the sim thread instead of mutating live
+        state — the sim thread applies them at the top of its next
+        iteration (the event -> sim-command queue). When None
+        (single-player + the client, whose sim runs on this thread),
+        the keys mutate the live state exactly as before. QUIT/ESC
+        (exit) and F3 (the render diagnostic) are always handled here.
+        """
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return False
@@ -991,15 +1002,30 @@ class Game:
                 if event.key == pygame.K_ESCAPE:
                     return False
                 elif event.key == pygame.K_t and not self.game_over:
-                    self.ship.targeting_on = not self.ship.targeting_on
+                    if command_sink is not None:
+                        command_sink("targeting")
+                    else:
+                        self.ship.targeting_on = not self.ship.targeting_on
                 elif event.key == pygame.K_r and self.game_over:
-                    self.reset()
+                    if command_sink is not None:
+                        command_sink("reset")
+                    else:
+                        self.reset()
                 elif event.key == pygame.K_v and not self.game_over:
-                    self.ship.sensor_on = not self.ship.sensor_on
+                    if command_sink is not None:
+                        command_sink("sensor")
+                    else:
+                        self.ship.sensor_on = not self.ship.sensor_on
                 elif event.key == pygame.K_g and not self.game_over:
-                    self.ship.fire_scan()
+                    if command_sink is not None:
+                        command_sink("scan")
+                    else:
+                        self.ship.fire_scan()
                 elif event.key == pygame.K_f and (self.test_mode or self.game_over):
-                    self.reset()
+                    if command_sink is not None:
+                        command_sink("reset")
+                    else:
+                        self.reset()
                 elif event.key == pygame.K_F3:
                     self.debug_net = not self.debug_net   # 7.8 net debug overlay + log
         return True

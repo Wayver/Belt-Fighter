@@ -253,7 +253,7 @@ def main():
     s_model = _surface()
     for e in fresh.enemies:
         e.draw(s_live, fcam)
-    for tag, pos, angle, _vel, _acc, _cr, _poly in fm["enemies"]:
+    for tag, _id, pos, angle, _vel, _acc, _cr, _poly in fm["enemies"]:
         _draw_world_enemy(s_model, fcam, tag, pos, angle, standins)
     if _pixels(s_live) == _pixels(s_model):
         print("PASS: ENEMY — %d fresh enemies render their hull "

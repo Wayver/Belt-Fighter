@@ -158,9 +158,10 @@ def check_parity(m, g):
         assert mverts == tuple((v.x, v.y) for v in a.verts), "asteroid verts"
     # --- enemies ---
     assert len(m["enemies"]) == len(g.enemies), "enemies len"
-    for (mtag, mpos, mang, mvel, macc, mcr, mpoly), e in \
+    for (mtag, mid, mpos, mang, mvel, macc, mcr, mpoly), e in \
             zip(m["enemies"], g.enemies):
         assert mtag == g._enemy_tag(e), "enemy tag"
+        assert mid == e.ship.id, "enemy ship_id"
         assert mpos == (e.pos.x, e.pos.y), "enemy pos"
         assert mang == e.ship.angle, "enemy angle"
         assert mvel == (e.ship.vel.x, e.ship.vel.y), "enemy vel"

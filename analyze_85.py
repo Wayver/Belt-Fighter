@@ -61,7 +61,12 @@ if hic:
     h_lost = [fnum(r, 'raw_dt') - fnum(r, 'advance') for r in hic]
     print(f"    raw_dt:   mean {st.mean(h_raw)*1000:.1f} ms  max {max(h_raw)*1000:.1f} ms")
     print(f"    advance:  mean {st.mean(h_adv)*1000:.1f} ms  max {max(h_adv)*1000:.1f} ms")
-    print(f"    LOST:     mean {st.mean(h_lost)*1000:.1f} ms  total {sum(h_lost):.3f} s")
+    if PRE_FIX:
+        print(f"    LOST:     mean {st.mean(h_lost)*1000:.1f} ms  total {sum(h_lost):.3f} s")
+    else:
+        print(f"    carryover: mean {st.mean(h_lost)*1000:.1f} ms  total "
+              f"{sum(h_lost):.3f} s  (STEP-quantization remainder kept in the "
+              f"accumulator — NOT a loss; it is used on the next frame)")
     # Pre-fix: advance clusters at ~0.05 (the clamp). Post-fix: advance
     # tracks raw_dt (within STEP quantization + backlog-cap slack).
     from collections import Counter
@@ -95,16 +100,24 @@ if PRE_FIX:
         print(f"  NOT CONFIRMED: dropped={dropped:.2f}s, rate={rate:.4f}x. "
               "Re-examine the mechanism before Step 2.")
 else:
-    # Post-fix success bar: sim-clock rate ~1.0 (>= 0.995), hiccup frames no
-    # longer pinned at 50 ms (advance tracks raw_dt), no backlog-cap drops
-    # (lost ~0 unless a pathological stall hit the 0.25 s cap).
-    hic_lost = sum(fnum(r, 'raw_dt') - fnum(r, 'advance') for r in hic)
-    if rate >= 0.995 and hic_lost < 0.05:
-        print(f"  FIX VERIFIED: sim-clock rate {rate:.4f}x (target ~1.0), "
-              f"hiccup-frame loss {hic_lost*1000:.0f} ms total "
-              f"(was pinned at 50 ms pre-fix).")
+    # Post-fix success bar. The REAL metric is the CUMULATIVE sim-clock rate:
+    # per-frame (raw_dt - advance) is NOT a loss — it's STEP quantization
+    # carryover that stays in the accumulator (acc_after) and is used next
+    # frame. The only genuine drop is when the backlog cap (0.25 s) is hit,
+    # which shows up as acc_after near 250 ms. So gate on:
+    #   (1) cumulative rate ~1.0 (>= 0.995) — the drift is gone;
+    #   (2) acc_after never near the backlog cap (no real dropped time);
+    #   (3) the net "time dropped" (sum raw - sum advance) is just the final
+    #       accumulator remainder — bounded, not a loss.
+    acc = [fnum(r, 'acc_after') for r in rows if fnum(r, 'acc_after') is not None]
+    cap_hits = sum(1 for a in acc if a > 0.20)   # near the 0.25 s backlog cap
+    if rate >= 0.995 and cap_hits == 0:
+        print(f"  FIX VERIFIED: sim-clock rate {rate:.4f}x (target ~1.0; was "
+              f"0.9762x pre-fix). Net time dropped {dropped*1000:.0f} ms = the "
+              f"final accumulator remainder (bounded, not a loss). Backlog cap "
+              f"never hit (max acc_after {max(acc)*1000:.1f} ms << 250 ms).")
         print("  -> 8.5 Step 3: fresh two-machine CSV run; check the client's")
         print("     50/67/83 ms gap cluster is gone + jitter/delay back to baseline.")
     else:
-        print(f"  FIX INCOMPLETE: rate={rate:.4f}x, hiccup-frame loss "
-              f"{hic_lost*1000:.0f} ms. Inspect the hiccup advance histogram.")
+        print(f"  FIX INCOMPLETE: rate={rate:.4f}x, backlog-cap hits={cap_hits}. "
+              "Inspect the hiccup advance histogram + acc_after.")

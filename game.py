@@ -44,7 +44,8 @@ from .hud import draw_hud, draw_game_over
 from .camera import Camera
 from .netcode import SnapshotBuffer, PredictedShip
 from .config import (INTERP_DELAY, SNAPSHOT_INTERVAL, ROCK_FILL, ROCK_EDGE,
-                    ENEMY_FILL, ENEMY_EDGE, ENEMY_FLAME)
+                    ENEMY_FILL, ENEMY_EDGE, ENEMY_FLAME,
+                    SHIP_COLOR, SHIP_EDGE)
 
 STEP = 1 / 60   # fixed simulation timestep
 
@@ -208,6 +209,295 @@ def _draw_world_particle(screen, cam, pos, vel, color, life, max_life):
                      max(1, int(2 * a)))
 
 
+# --- Session 9.x M2b: model-driven LOCAL-SHIP render helpers --------------
+#
+# M2a moved the WORLD entities onto the plain-data RenderModel. M2b moves
+# the rest of draw() — the local ship (hull + flames + shield + arcs +
+# scan pulse), the camera, the laser beams, the targeting reticle, the fog
+# lights, the sensor contacts, and the HUD — so the render path reads NO
+# live sim state. That is what makes the M3 atomic reference swap safe:
+# the render thread will hold a model and call these, never self.*.
+#
+# The local ship reuses the SAME stand-in pattern as the world enemies:
+# a lazily-built presentation Ship (the player's hull + loadout are fixed
+# on both peers by construction) whose PRESENTATION fields are synced from
+# the model's per-ship pack each frame, then drawn via Ship.draw. The
+# stand-in is never stepped and never fed to the sim — pure presentation.
+# (The ship's draw code is large — hull/panels/flames/shield/impacts/arcs/
+# laser-charge/missile-lock — so reusing Ship.draw on a synced stand-in is
+# far cleaner than re-implementing it as a plain-data function.)
+
+
+def _ship_pose(pack, alpha):
+    """The interpolated render pose (rpos, rangle) from the model's
+    prev/curr pose + the accumulator alpha. Mirrors Ship.sync_render
+    exactly (lerp pos, shortest-arc lerp angle)."""
+    p0 = pygame.Vector2(pack["prev_pos"])
+    p1 = pygame.Vector2(pack["pos"])
+    rpos = p0.lerp(p1, alpha)
+    a0, a1 = pack["prev_angle"], pack["angle"]
+    da = (a1 - a0 + math.pi) % (2 * math.pi) - math.pi
+    rangle = a0 + da * alpha
+    return rpos, rangle
+
+
+def _sync_local_ship(standin, pack):
+    """Copy the model's per-ship presentation state onto the local-ship
+    stand-in so its Ship.draw renders exactly what the live ship would.
+    Only presentation fields are touched (the stand-in is never stepped,
+    so its synced fields are irrelevant to draw())."""
+    s = standin
+    s.flame_mags = dict(pack["flame_mags"])
+    s.arcs = [([pygame.Vector2(pt) for pt in pts], age, ttl)
+              for pts, age, ttl in pack["arcs"]]
+    s.shield_impacts = [list(t) for t in pack["shield_impacts"]]
+    s.scan_pulse = pack["scan_pulse"]
+    s.contacts = [(pygame.Vector2(pos), dist, strength, confirmed)
+                  for pos, dist, strength, confirmed in pack["contacts"]]
+    s.targeting_on = pack["targeting_on"]
+    s.tracked = pack["tracked"]
+    s.sensor_on = pack["sensor_on"]
+    s.scan_cd = pack["scan_cd"]
+    s.scan_reveal = pack["scan_reveal"]
+    s.shield_charge = pack["shield_charge"]
+    s.shield_dump = pack["shield_dump"]
+    s.shield_clock = pack["shield_clock"]
+    s.brownout = pack["brownout"]
+    s.power_used = pack["power_used"]
+    s.power_supply = pack["power_supply"]
+    s.compute_used = pack["compute_used"]
+    s.compute_supply = pack["compute_supply"]
+    for w, (cooldown, charge, lock_progress) in zip(s.weapons,
+                                                    pack["weapons"]):
+        w.cooldown = cooldown
+        w.charge = charge
+        w.lock_progress = lock_progress
+
+
+def _draw_local_ship(screen, cam, standin, pack, alpha,
+                     fill=None, edge=None):
+    """Draw the local player's ship from the model: sync the stand-in's
+    presentation from the pack, compute the interpolated pose, and draw.
+    Mirrors the live `p.sync_render(alpha); p.draw(screen, cam, p.rpos,
+    p.rangle)` exactly.
+
+    The stand-in's CURRENT pose (pos/angle) is also set from the pack, so
+    the fog (draw_fog reads ship.pos/vel/angle/axes) sees the same pose the
+    live ship has — the fog is drawn AFTER the ship, mirroring the live
+    order. Returns the interpolated (rpos, rangle) so the beams (drawn
+    after the ship) can use it, exactly as the live code reads
+    self.ship.rpos/rangle."""
+    _sync_local_ship(standin, pack)
+    standin.pos = pygame.Vector2(pack["pos"])
+    standin.vel = pygame.Vector2(pack["vel"])
+    standin.angle = pack["angle"]
+    rpos, rangle = _ship_pose(pack, alpha)
+    standin.draw(screen, cam, rpos, rangle,
+                 fill=fill if fill is not None else (standin.hull.fill
+                                                     or SHIP_COLOR),
+                 edge=edge if edge is not None else (standin.hull.edge
+                                                     or SHIP_EDGE))
+    return rpos, rangle
+
+
+def _draw_world_beam(screen, cam, rpos, rangle, beam, enemies_by_id,
+                     standins):
+    """One laser beam from the model. `beam` is (local_start, target_id,
+    d, vis_end, age, ttl); (rpos, rangle) is the LOCAL ship's interpolated
+    pose (returned by _draw_local_ship this frame); `enemies_by_id` maps
+    ship_id -> model enemy tuple (tag, ship_id, pos, angle, vel, acc, cr,
+    poly); `standins` is the {tag: _RemoteEnemyProxy} dict (for the
+    target's shield oval). The start is computed from the local ship's
+    interpolated pose; the end resolves the target by ship_id (a plain
+    lookup, no live-list membership) and lands on the TARGET's shield oval
+    via the same math as Ship.shield_impact_point. Mirrors the live beam
+    loop in draw()."""
+    local, target_id, d, vis_end, age, ttl = beam
+    fade = 1.0 - age / ttl
+    c = tuple(int(ch * fade) for ch in LASER_COLOR)
+    fwd = pygame.Vector2(math.cos(rangle), math.sin(rangle))
+    right = pygame.Vector2(-fwd.y, fwd.x)
+    start = rpos + fwd * local[0] + right * local[1]
+    if target_id is not None and target_id in enemies_by_id:
+        e = enemies_by_id[target_id]
+        epos = pygame.Vector2(e[2])
+        eangle = e[3]
+        proxy = standins.get(e[0])
+        if proxy is not None and proxy.ship.shield_comp is not None:
+            end = _shield_impact_point_pose(epos, eangle,
+                                            proxy.ship.shield_oval,
+                                            epos - d * e[6])
+        else:
+            end = epos - d * e[6]
+    else:
+        end = pygame.Vector2(vis_end)
+    pygame.draw.line(screen, c, cam.to_screen(start),
+                     cam.to_screen(end), 2)
+
+
+def _shield_impact_point_pose(pos, angle, oval, world_pos):
+    """Plain-data mirror of Ship.shield_impact_point: the point on the
+    shield oval (a, b, cx, cy) centered at `pos` facing `angle`, in the
+    direction of world_pos. The live method uses self.pos/self.angle/
+    self.shield_oval; this takes them explicitly so it works on a model
+    enemy (whose oval comes from its per-tag stand-in)."""
+    a, b, cx, cy = oval
+    d = world_pos - pos
+    if d.length_squared() < 1e-6:
+        return pos
+    fwd = pygame.Vector2(math.cos(angle), math.sin(angle))
+    right = pygame.Vector2(-fwd.y, fwd.x)
+    dx, dy = d.dot(fwd) - cx, d.dot(right) - cy
+    t = 1.0 / math.sqrt((dx / a) ** 2 + (dy / b) ** 2)
+    return pos + fwd * (cx + t * dx) + right * (cy + t * dy)
+
+
+def _lead_point(pos, vel, acc, shooter_pos, bullet_speed, use_accel=True):
+    """Plain-data mirror of AIEnemy.lead_point / _RemoteEnemyProxy.lead_point:
+    the intercept solution for a target at (pos, vel, acc). Same 6-iteration
+    math, so the model-driven reticle lines up with the live one."""
+    e0 = pygame.Vector2(pos)
+    v = pygame.Vector2(vel)
+    a = pygame.Vector2(acc) if use_accel else pygame.Vector2(0, 0)
+    d0 = (e0 - shooter_pos).length()
+    if d0 < 1:
+        return None
+    T = d0 / bullet_speed
+    for _ in range(6):
+        eT = e0 + v * T + 0.5 * a * (T * T)
+        T_new = (eT - shooter_pos).length() / bullet_speed
+        if T_new > TARGETING_MAX_LEAD:
+            return None
+        if abs(T_new - T) < 1e-3:
+            T = T_new
+            break
+        T = T_new
+    return e0 + v * T + 0.5 * a * (T * T)
+
+
+def _lead_aligned(e_pos, p, ship_pos, ship_angle):
+    """Plain-data mirror of Game._lead_aligned: True when the player's nose
+    points between the reticle and the enemy."""
+    to_ret = p - ship_pos
+    to_en = pygame.Vector2(e_pos) - ship_pos
+    if to_ret.length() < 1 or to_en.length() < 1:
+        return False
+    ang_r = math.atan2(to_ret.y, to_ret.x)
+    ang_e = math.atan2(to_en.y, to_en.x)
+    d_f = wrapped_delta(ang_r, ship_angle, 2 * math.pi)   # reticle -> facing
+    d_e = wrapped_delta(ang_r, ang_e, 2 * math.pi)        # reticle -> enemy
+    if d_f * d_e < 0:
+        return False   # facing on the far side of the reticle
+    return abs(d_f) <= abs(d_e) + TARGETING_ALIGN_TOL
+
+
+def _draw_lead_model(screen, cam, e, ship_pos, ship_angle):
+    """One targeting reticle from the model. `e` is a model enemy tuple
+    (tag, ship_id, pos, angle, vel, acc, cr, poly); (ship_pos, ship_angle)
+    is the LOCAL ship's interpolated pose. Mirrors Game._draw_lead
+    exactly (same lead math, same green-flash tick, same crosshair)."""
+    p = _lead_point(e[2], e[4], e[5], ship_pos, BULLET_SPEED,
+                    TARGETING_USE_ACCEL)
+    if p is None or (p - ship_pos).length() > TARGETING_RANGE:
+        return
+    if _lead_aligned(e[2], p, ship_pos, ship_angle):
+        c = (TARGETING_COLOR_GREEN if (pygame.time.get_ticks() // 100) % 2
+             else TARGETING_COLOR)
+    else:
+        c = TARGETING_COLOR
+    s = cam.to_screen(p)
+    x, y = int(s.x), int(s.y)
+    R, gap = 8, 3
+    pygame.draw.line(screen, c, (x, y - R), (x, y - gap), 2)
+    pygame.draw.line(screen, c, (x, y + R), (x, y + gap), 2)
+    pygame.draw.line(screen, c, (x - R, y), (x - gap, y), 2)
+    pygame.draw.line(screen, c, (x + R, y), (x + gap, y), 2)
+
+
+def _build_lights_model(model, standin):
+    """Whitelist of things that shine through the fog, built from the
+    model (no live state). Mirrors Game._build_lights: the targeting
+    reticle lights (one per lead point in range), the bullets/missiles,
+    and the local ship's shield-impact flashes.
+
+    The live _build_lights reads the ship's CURRENT pose (ship.pos /
+    ship.angle / ship.axes()), so this uses the stand-in's current pose —
+    which _draw_local_ship set from the pack this frame (the fog is drawn
+    after the ship, mirroring the live order)."""
+    lights = []
+    ship_pos = standin.pos
+    ship_angle = standin.angle
+    # --- Targeting reticle: a small light at each predicted lead point.
+    if TARGETING_ASSIST and standin.targeting_on:
+        for e in model["enemies"]:
+            p = _lead_point(e[2], e[4], e[5], ship_pos, BULLET_SPEED,
+                            TARGETING_USE_ACCEL)
+            if p is not None and (p - ship_pos).length() <= TARGETING_RANGE:
+                lights.append(LightSource(p, 50, 0.6))
+    # --- Weapon fire: bullets glow as they fly through the dark.
+    for pos, _vel in model["bullets"]:
+        lights.append(LightSource(pygame.Vector2(pos), 30, 0.5))
+    for pos, _vel in model["enemy_bullets"]:
+        lights.append(LightSource(pygame.Vector2(pos), 24, 0.4))
+    for pos, _vel, _boost, _life in model["missiles"]:
+        lights.append(LightSource(pygame.Vector2(pos), 30, 0.5))
+    # --- Shield impacts: a fading flash at the hit point on the oval.
+    # The synced shield_impacts are [theta, age, ttl] in local hull space;
+    # convert to world the same way _draw_shield_impacts does.
+    if standin.shield_impacts:
+        a, b, cx, cy = standin.shield_oval
+        fwd = pygame.Vector2(math.cos(ship_angle), math.sin(ship_angle))
+        right = pygame.Vector2(-fwd.y, fwd.x)
+        for theta, age, ttl in standin.shield_impacts:
+            fade = 1.0 - age / ttl
+            world = (ship_pos + fwd * (cx + a * math.cos(theta))
+                             + right * (cy + b * math.sin(theta)))
+            lights.append(LightSource(world, 40, 0.5 * fade))
+    return lights
+
+
+def _draw_sensor_contacts_model(screen, cam, font, ship_pos, contacts):
+    """Sensor contacts above the fog: on-screen blips, off-screen edge
+    arrows. Plain-data mirror of Game._draw_sensor_contacts — `contacts`
+    is the model's [(pos, dist, strength, confirmed), ...] and ship_pos
+    is the local ship's CURRENT pose (the live method reads ship.pos)."""
+    if not contacts:
+        return
+    sp = cam.to_screen(ship_pos)
+    for pos, dist, strength, confirmed in contacts:
+        s = cam.to_screen(pygame.Vector2(pos))
+        base = SENSOR_SCAN_COLOR if confirmed else SENSOR_COLOR
+        color = _dim_color(base, 0.35 + 0.65 * strength)
+        if -20 <= s.x <= WIDTH + 20 and -20 <= s.y <= HEIGHT + 20:
+            pygame.draw.circle(screen, color, (int(s.x), int(s.y)), 5, 2)
+            continue
+        d = pygame.Vector2(s.x - sp.x, s.y - sp.y)
+        if d.length_squared() < 1:
+            continue
+        d.normalize_ip()
+        m = SENSOR_ARROW_MARGIN
+        ts = []
+        if d.x > 0:
+            ts.append((WIDTH - m - sp.x) / d.x)
+        elif d.x < 0:
+            ts.append((m - sp.x) / d.x)
+        if d.y > 0:
+            ts.append((HEIGHT - m - sp.y) / d.y)
+        elif d.y < 0:
+            ts.append((m - sp.y) / d.y)
+        if not ts:
+            continue
+        p = sp + d * min(ts)
+        ang = math.atan2(d.y, d.x)
+        for off in (0.5, -0.5):
+            pygame.draw.line(screen, color, (p.x, p.y),
+                             (p.x - math.cos(ang + off) * 9,
+                              p.y - math.sin(ang + off) * 9), 2)
+        if confirmed:
+            txt = font.render(f"{dist:.0f}", True, color)
+            screen.blit(txt, (p.x - txt.get_width() / 2, p.y + 10))
+
+
 class Game:
     def __init__(self, screen, font, big_font, light_tex, fog_surf, light_surf,
                 hull=None, loadout=None, test_mode=False, seed=None, sound=None,
@@ -270,6 +560,12 @@ class Game:
         # (built lazily on first use — the client only, via
         # _get_remote_enemies; the host never draws remote enemies).
         self._remote_enemies = None
+        # Session 9.x M2b: per-player presentation stand-ins (built lazily on
+        # first draw; see _get_standin). Each is a real Ship with that
+        # player's FIXED hull + loadout, whose presentation fields are
+        # synced from the model's per-ship pack each frame. Never stepped,
+        # never fed to the sim — pure presentation.
+        self._standins = {}
         # Remote player's latest input (Session 6.2a): the host stores the
         # client's ShipInput here (set_remote_input) and _step applies it to
         # player 1. Empty default = no thrust/fire; single-player never sets
@@ -559,8 +855,11 @@ class Game:
                         (the local ship's pos/vel + its dampening flag)
           stars         [(x, y, r), ...] — the parallax background
           asteroids     [(pos, angle, verts), ...]
-          enemies       [(tag, pos, angle, vel, acc_smooth, collision_radius,
-                         local_poly), ...]
+          enemies       [(tag, ship_id, pos, angle, vel, acc_smooth,
+                         collision_radius, local_poly), ...]
+                         (ship_id: the enemy's ship id — M2b resolves a
+                         beam's target_id back to this tuple, a plain
+                         lookup with no live-list membership)
           bullets       [(pos, vel), ...]
           enemy_bullets [(pos, vel), ...]
           missiles      [(pos, vel, boost, life), ...]
@@ -591,6 +890,7 @@ class Game:
                            tuple((v.x, v.y) for v in a.verts))
                           for a in self.asteroids],
             "enemies": [((self._enemy_tag(e),
+                          e.ship.id,
                           (e.pos.x, e.pos.y),
                           e.ship.angle,
                           (e.ship.vel.x, e.ship.vel.y),
@@ -1285,79 +1585,105 @@ class Game:
 
     def draw(self, dt, model=None):
         screen = self.screen
-        # Session 9.x M2a: the WORLD entities are drawn from the plain-data
+        # Session 9.x M2b: the ENTIRE render path reads the plain-data
         # RenderModel, not live sim state. The model is built once per frame
         # (here, when the caller doesn't supply one) — M3 moves this build to
-        # the sim thread. Still live-state (deferred to M2b): the local ship,
-        # camera, fog, HUD, the laser beams, and the targeting reticle.
+        # the sim thread and the render thread will hold the published model
+        # and call this with it. No self.* live reads remain in this method
+        # (the grep gate in test_m2b_local asserts that), which is what makes
+        # the M3 atomic reference swap safe.
         if model is None:
             model = self.render_model()
-        self.cam.update(dt, self.ship)
+        # Camera: the model's camera target (the local ship's pos/vel/
+        # dampening) — plain values, no live ship.
+        cpos, cvel, cdamp = model["camera"]
+        self.cam.update(dt, cpos, cvel, cdamp)
         screen.fill(BG)
         _draw_world_stars(screen, self.cam, model["stars"])
         for pos, angle, verts in model["asteroids"]:
             _draw_world_asteroid(screen, self.cam, pos, angle, verts)
         standins = self._get_remote_enemies()
-        for tag, pos, angle, _vel, _acc, _cr, _poly in model["enemies"]:
+        # ship_id -> model enemy tuple (for beam-target resolution).
+        enemies_by_id = {e[1]: e for e in model["enemies"]}
+        for tag, _id, pos, angle, _vel, _acc, _cr, _poly in model["enemies"]:
             _draw_world_enemy(screen, self.cam, tag, pos, angle, standins)
-        # Targeting reticle (DEFERRED to M2b — still reads the live enemy
-        # list + the local ship; it moves with the local-ship milestone).
-        if TARGETING_ASSIST and self.ship.targeting_on:
-            for e in self.enemies:
-                self._draw_lead(screen, e, self.ship)
+        # The LOCAL player's model pack (fog / beams / reticle / contacts / HUD
+        # all read the local ship, mirroring the live self.ship = players[0]
+        # on the host, players[local_index] on a client).
+        local_pack = model["players"][self.local_index]
+        # Targeting reticle from the model (the local ship's CURRENT pose —
+        # the live _draw_lead reads ship.pos/ship.angle, not rpos/rangle).
+        ship_pos = pygame.Vector2(local_pack["pos"])
+        ship_angle = local_pack["angle"]
+        if TARGETING_ASSIST and local_pack["targeting_on"]:
+            for e in model["enemies"]:
+                _draw_lead_model(screen, self.cam, e, ship_pos, ship_angle)
         for pos, vel in model["bullets"]:
             _draw_world_bullet(screen, self.cam, pos, BULLET_COLOR)
-        
-
         for pos, vel, boost, life in model["missiles"]:
             _draw_world_missile(screen, self.cam, pos, vel, boost, life)
-
-
-        for local, target, d, vis_end, age, ttl in self.beams:
-            fade = 1.0 - age / ttl
-            c = tuple(int(ch * fade) for ch in LASER_COLOR)
-            fwd = pygame.Vector2(math.cos(self.ship.rangle),
-                                 math.sin(self.ship.rangle))
-            right = pygame.Vector2(-fwd.y, fwd.x)
-            start = self.ship.rpos + fwd * local[0] + right * local[1]
-            if target in self.enemies:
-                end = target.ship.shield_impact_point(
-                    target.pos - d * target.collision_radius)
-            else:
-                end = vis_end
-            pygame.draw.line(screen, c, self.cam.to_screen(start),
-                             self.cam.to_screen(end), 2)
-
-
+        # Laser beams from the model — drawn BEFORE the ships, mirroring the
+        # live order. The start uses the local ship's INTERPOLATED pose
+        # (computed from the model pack, the same value the live code reads
+        # as self.ship.rpos/rangle); the end resolves the target by ship_id.
+        local_rpos, local_rangle = _ship_pose(local_pack, model["step_alpha"])
+        for beam in model["beams"]:
+            _draw_world_beam(screen, self.cam, local_rpos, local_rangle,
+                             beam, enemies_by_id, standins)
         for pos, vel in model["enemy_bullets"]:
             _draw_world_bullet(screen, self.cam, pos, ENEMY_BULLET_COLOR)
         for pos, vel, color, life, max_life in model["particles"]:
             _draw_world_particle(screen, self.cam, pos, vel, color, life,
                                  max_life)
-        if not self.game_over:
-            # Draw EVERY player ship (Session 6.2a), each with its own
-            # shield ring (self.shields[i], sized by that hull's radius).
-            for i, p in enumerate(self.players):
-                p.sync_render(self.acc / STEP)
-                p.draw(screen, self.cam, p.rpos, p.rangle)
-                if self.protect_timer > 0:
+        # EVERY player ship (Session 6.2a), each with its own shield ring —
+        # mirroring the live `if not game_over: for i, p in
+        # enumerate(self.players)`. The stand-in is built lazily from that
+        # player's fixed hull + loadout; its presentation is synced from the
+        # model pack. (On game_over the live code skips the ships, so this
+        # loop is gated the same way.)
+        if not model["game_over"]:
+            for i, pack in enumerate(model["players"]):
+                standin = self._get_standin(i)
+                rpos, rangle = _draw_local_ship(screen, self.cam, standin,
+                                                pack, model["step_alpha"])
+                if model["protect_timer"] > 0:
                     sh = self.shields[i]
-                    ssx, ssy = self.cam.to_screen(p.rpos)
+                    ssx, ssy = self.cam.to_screen(rpos)
                     screen.blit(sh, (ssx - sh.get_width() // 2,
                                      ssy - sh.get_height() // 2))
-        draw_fog(screen, self.ship, self.cam, self.light_tex, self.fog_surf, self.light_surf, self._build_lights(self.ship))
-        # Scan pulse above the fog: a bright ring sweeping through the dark
-        if not self.game_over:
-            self.ship._draw_scan_pulse(screen, self.cam, self.ship.rpos)
-        self._draw_sensor_contacts()
-        draw_hud(screen, self.font, self.enemies, self.ship)
-        if self.game_over:
+        # Fog: the local stand-in must carry the local ship's current pose +
+        # synced presentation for draw_fog + the model-built light list. The
+        # ships loop sets these when it draws the local ship, but on
+        # game_over the loop is skipped — so set them explicitly here
+        # (idempotent when the loop already ran).
+        local_standin = self._get_standin(self.local_index)
+        local_standin.pos = pygame.Vector2(local_pack["pos"])
+        local_standin.vel = pygame.Vector2(local_pack["vel"])
+        local_standin.angle = local_pack["angle"]
+        _sync_local_ship(local_standin, local_pack)
+        draw_fog(screen, local_standin, self.cam, self.light_tex,
+                 self.fog_surf, self.light_surf,
+                 _build_lights_model(model, local_standin))
+        # Scan pulse above the fog: a bright ring sweeping through the dark.
+        if not model["game_over"]:
+            local_standin._draw_scan_pulse(screen, self.cam, local_rpos)
+        _draw_sensor_contacts_model(screen, self.cam, self.font, ship_pos,
+                                    local_pack["contacts"])
+        draw_hud(screen, self.font, model["enemies"], local_standin)
+        if model["game_over"]:
             draw_game_over(screen, self.big_font, self.font)
-
         if DEBUG_COLLISION:
-            self.ship.draw_collision(screen, self.cam)
-            for e in self.enemies:
-                e.ship.draw_collision(screen, self.cam)
+            local_standin.draw_collision(screen, self.cam)
+            for e in model["enemies"]:
+                proxy = standins.get(e[0])
+                if proxy is not None:
+                    # draw_collision reads self.pos/self.angle (no explicit
+                    # pose arg), so set the proxy's pose to the model enemy's
+                    # first. Debug-only (DEBUG_COLLISION off by default); the
+                    # hull draw passes explicit pos/angle and ignores these.
+                    proxy.ship.pos = pygame.Vector2(e[2])
+                    proxy.ship.angle = e[3]
+                    proxy.ship.draw_collision(screen, self.cam)
 
     # --- networking: remote-interpolation render (Session 5b.3) ---
     #
@@ -1383,7 +1709,8 @@ class Game:
         draw a "waiting for snapshots" state.
         """
         screen = self.screen
-        self.cam.update(dt, self.ship)
+        self.cam.update(dt, self.ship.pos, self.ship.vel,
+                        self.ship.dampening)
         screen.fill(BG)
         for x, y, r in self.stars:
             sx = (x - self.cam.pos.x * 0.2) % WIDTH
@@ -1506,7 +1833,8 @@ class Game:
         self.ghost.advance(dt, inp)
 
         screen = self.screen
-        self.cam.update(dt, self.ghost.ship)
+        self.cam.update(dt, self.ghost.ship.pos, self.ghost.ship.vel,
+                        self.ghost.ship.dampening)
         screen.fill(BG)
         for x, y, r in self.stars:
             sx = (x - self.cam.pos.x * 0.2) % WIDTH
@@ -1648,6 +1976,25 @@ class Game:
             'ai': _RemoteEnemyProxy(ENEMY_HULL, enemy_loadout()),
             'mote': _RemoteEnemyProxy(MOTE_HULL, mote_loadout()),
         }
+
+    def _get_standin(self, i):
+        """The presentation stand-in for player `i` (Session 9.x M2b),
+        built lazily ONCE per player. A real Ship with that player's
+        FIXED hull + loadout (identical on both peers by construction) —
+        the M2b render path syncs its presentation fields from the
+        model's per-ship pack each frame, then draws it via Ship.draw.
+        It is never stepped and never fed to the sim; its synced fields
+        are irrelevant to draw() (which takes explicit pos/angle).
+
+        The local player's stand-in (i == local_index) is the one the
+        fog / beams / reticle / contacts / HUD read; the remote player's
+        (2P host) is drawn like any other world entity."""
+        s = self._standins.get(i)
+        if s is None:
+            p = self.players[i]
+            s = Ship(hull=p.hull, loadout=p.components)
+            self._standins[i] = s
+        return s
 
     def _draw_remote_enemy_hull(self, screen, tag, x, y, ang):
         """Draw a remote enemy as its REAL hull at the interpolated

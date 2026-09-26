@@ -1,7 +1,10 @@
 """Entry point: run with  python -m ship5
 
 Three modes (chosen on the menu's mode screen, Session 6.4):
-  single — the classic solo run (unchanged).
+  single — the classic solo run. Session 9.x M5: unified onto the
+           SimThread — the same architecture as the host (the sim on its
+           own real-time 60 Hz thread, the render thread a local client
+           of the published RenderModel; no NetWorker).
   host   — Session 6.5: wait for ONE client, run the authoritative 2-ship
            sim, apply the client's input, broadcast a snapshot every
            SNAPSHOT_INTERVAL ticks. ESC/QUIT or a client disconnect
@@ -811,22 +814,65 @@ def main():
                        light_tex, fog_surf, light_surf)
             continue          # back to the menu (pinned #8: no reconnect)
 
-        # --- single player (the classic path, unchanged) ---
+        # --- single player (Session 9.x M5: unified onto the SimThread) ---
+        # The classic solo run now uses the SAME architecture as the host:
+        # the sim runs on a SimThread (a real-time 60 Hz clock — the 8.5
+        # hiccup policy, its own monotonic accumulator, NOT tied to the
+        # frame rate) and the render thread is a LOCAL CLIENT of that sim:
+        # it publishes the latest local input + T/V/G/R/F commands, reads
+        # the published RenderModel, and draws it with the render thread's
+        # OWN interpolation alpha (_HostRenderClock — the same class the
+        # host loop uses; "Host" is a misnomer now, it is just "the render
+        # thread's clock for a sim it does not own"). worker=None: SP has
+        # no NetWorker, so the sim thread publishes the model only.
+        #
+        # The sim itself is UNCHANGED (Game._step) — only its thread moved,
+        # exactly what M3 proved for the host: test_determinism (which
+        # steps the Game directly, not through this loop) stays
+        # bit-identical. The old in-loop `game.update(raw_dt, keys)` +
+        # `game.draw(dt)` path is gone for SP; the render thread never
+        # mutates sim state anymore (it publishes input, a fresh ShipInput
+        # per frame, and commands, a queue — the sim thread applies them).
         game = Game(screen, font, big_font, light_tex, fog_surf, light_surf,
                     hull=menu.hull, loadout=menu.loadout,
                     test_mode=('--test' in sys.argv), seed=seed, sound=sfx)
+        sim_thread = SimThread(game)
+        sim_thread.start()
+        render_clock = _HostRenderClock()
         running = True
-        while running:
-            raw_dt = clock.tick(FPS) / 1000.0
-            dt = min(raw_dt, 0.05)
-            running = game.handle_events()
-            keys = pygame.key.get_pressed()
-            # Session 8.5 Step 2: same fix as the host loop — feed the sim
-            # the UNCLAMPED frame time so the sim clock tracks real time
-            # (game.update's guards handle the spiral-of-death case).
-            game.update(raw_dt, keys)
-            game.draw(dt)
-            pygame.display.flip()
+        try:
+            while running:
+                raw_dt = clock.tick(FPS) / 1000.0
+                dt = min(raw_dt, 0.05)
+                # T/V/G/R/F are ROUTED to the sim thread (command_sink)
+                # instead of mutating live state — the sim thread applies
+                # them at the top of its next iteration (<= 1-2 ms).
+                # QUIT/ESC (exit) + F3 (the render diagnostic) stay
+                # handled here.
+                if not game.handle_events(sim_thread.command):
+                    running = False
+                keys = pygame.key.get_pressed()
+                # Publish the latest local input (reference swap; the sim
+                # applies the LATEST published input at each step — the
+                # same rule the host applies to the client's input).
+                sim_thread.publish_input(ShipInput.from_keys(keys))
+                # Read the PUBLISHED model (an atomic reference read — the
+                # render thread never reads live sim state, which would
+                # race the sim thread's _step) and compute the render
+                # thread's own interpolation alpha (see _HostRenderClock).
+                model = sim_thread.latest_model
+                alpha = render_clock.advance(dt, model)
+                # Draw the PUBLISHED model with the render thread's alpha
+                # (the model still carries the sim's step_alpha for the
+                # M1/M2b parity tests; draw() uses the render thread's).
+                game.draw(dt, {**model, "step_alpha": alpha} if model else None)
+                pygame.display.flip()
+        finally:
+            # Stop the sim thread (join it) before the menu loop resumes —
+            # it owns the Game, and the next mode's Game must not be built
+            # while a live sim thread is still stepping the old one.
+            # stop() is idempotent.
+            sim_thread.stop()
         break
 
     pygame.quit()

@@ -21,6 +21,12 @@ The checks:
                 thread reading at its own pace sees the same model across
                 reads and _HostRenderClock's alpha VARIES (not pinned at
                 0). Regression for the M4 alpha=0 / wasted-CPU bug.
+  1c. SP-ON-SIMTHREAD (M5) — the single-player loop pattern: the same
+                thread with worker=None (no NetWorker), driven the way
+                the SP render loop does (publish_input + read
+                latest_model + draw the published model with the render
+                clock's alpha). The production SP path is the host loop
+                minus the network, so it must run end-to-end.
   2. INPUT    — the LATEST published local input drives player 0 (the
                 ship moves), while the remote input (a direct reference
                 swap on game.remote_input, the render-thread hand-off)
@@ -243,6 +249,49 @@ def main():
                    max(alphas) if alphas else -1,
                    len(set(round(a, 4) for a in alphas))))
 
+    # --- 1c. SP-ON-SIMTHREAD (M5): the production single-player loop ---
+    # SP is the host loop minus the NetWorker: SimThread(game) with
+    # worker=None, the render thread publishes input + reads the
+    # published model + draws it with the render clock's alpha. This
+    # drives that exact pattern (worker=None + a real draw() of the
+    # published model each frame) so the SP path is covered end-to-end,
+    # not just the host's worker-fed variant.
+    g = make_game(screen, font, big_font, light_tex, fog_surf, light_surf,
+                  seed=1234)
+    st = SimThread(g)   # worker=None: the SP shape
+    st.start()
+    wait_for(lambda: st.latest_model is not None)
+    rc = _HostRenderClock()
+    frames = 0
+    alphas = []
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 0.6:
+        m = st.latest_model
+        if m is None:
+            time.sleep(0.005)
+            continue
+        a = rc.advance(0.016, m)
+        # The SP render loop's draw: the published model + the render
+        # thread's own alpha (the same {**model, "step_alpha": alpha}
+        # seam the host loop uses).
+        g.draw(0.016, {**m, "step_alpha": a})
+        frames += 1
+        alphas.append(a)
+        time.sleep(0.005)
+    st.stop()
+    ok &= check("sp-on-simthread: worker=None thread runs + the render "
+                "thread draws the published model",
+                frames > 10 and g.sim_time > 0.2,
+                "frames=%d sim_time=%.3f" % (frames, g.sim_time))
+    ok &= check("sp-on-simthread: the render clock's alpha varies "
+                "(interpolation is live, not pinned)",
+                len(alphas) > 10 and max(alphas) > 0.01
+                and len(set(round(a, 4) for a in alphas)) > 2,
+                "alpha: n=%d min=%.4f max=%.4f distinct=%d"
+                % (len(alphas), min(alphas) if alphas else -1,
+                   max(alphas) if alphas else -1,
+                   len(set(round(a, 4) for a in alphas))))
+
     # --- 2. INPUT: local (published) + remote (reference swap) ----------
     g = make_game(screen, font, big_font, light_tex, fog_surf, light_surf,
                   seed=1234, players=2)
@@ -306,7 +355,7 @@ def main():
     ok &= check("stop: idempotent (second stop() is a no-op)", True)
 
     pygame.quit()
-    print("\nSIM THREAD (M3):", "ALL PASS" if ok else "FAILURES")
+    print("\nSIM THREAD (M3/M5):", "ALL PASS" if ok else "FAILURES")
     raise SystemExit(0 if ok else 1)
 
 

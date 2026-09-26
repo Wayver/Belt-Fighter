@@ -1,10 +1,14 @@
 """Session 9.x M3: the authoritative sim on its own thread.
 
-The host's Game moves off the render thread onto a daemon thread that
-steps it at a real-time 60 Hz clock (a monotonic accumulator, mirroring
-the NetWorker's real-time snapshot timer — NOT tied to the render frame
-rate). The render thread becomes a LOCAL CLIENT of that sim: it publishes
-the latest local input + commands, and reads the published RenderModel.
+The authoritative Game moves off the render thread onto a daemon thread
+that steps it at a real-time 60 Hz clock (a monotonic accumulator,
+mirroring the NetWorker's real-time snapshot timer — NOT tied to the
+render frame rate). The render thread becomes a LOCAL CLIENT of that
+sim: it publishes the latest local input + commands, and reads the
+published RenderModel. M3 did this for the 2P host; M5 (Session 9.x)
+unified single-player onto the same thread — SP is now the host loop
+minus the NetWorker (worker=None), so there is exactly ONE sim
+architecture in the game.
 
 Threading model (the NetWorker `_latest_snapshot` pattern, everywhere):
   * All cross-thread hand-offs are single reference swaps (atomic under
@@ -62,7 +66,9 @@ class SimThread:
 
     Lifecycle:
       1. Built around a fully-constructed Game (handshake done, player
-         ships set) + the host's NetWorker (may be None in tests).
+         ships set) + the host's NetWorker. The worker is None for
+         single-player (M5: SP runs this same thread with no network —
+         the sim thread then publishes the model only) and in tests.
       2. `start()` launches the thread. The first published model
          appears within ~one iteration (~1-2 ms).
       3. The render thread calls `publish_input(ShipInput)` each frame

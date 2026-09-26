@@ -17,4 +17,5 @@ host_debug.csv
 host_sim_debug.csv
 net_debug_latest.csv
 host_debug_latest.csv
+error.txt
 

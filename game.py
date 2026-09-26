@@ -231,7 +231,18 @@ def _draw_world_particle(screen, cam, pos, vel, color, life, max_life):
 def _ship_pose(pack, alpha):
     """The interpolated render pose (rpos, rangle) from the model's
     prev/curr pose + the accumulator alpha. Mirrors Ship.sync_render
-    exactly (lerp pos, shortest-arc lerp angle)."""
+    exactly (lerp pos, shortest-arc lerp angle).
+
+    `alpha` is clamped to [0, 1]: on a hiccup frame the accumulator can
+    exceed one step — update() caps the backlog at ACC_BACKLOG_CAP (0.25 s)
+    but runs at most MAX_STEPS_PER_FRAME (5) steps, so a >83 ms frame leaves
+    acc up to ~10 steps behind (step_alpha up to ~10). Interpolating past
+    the current pose would extrapolate into the future, so we render the
+    latest simulated state (alpha=1) instead. pygame's lerp raises on alpha
+    outside [0, 1], so this clamp is required, not just cosmetic. (The SP
+    host is light enough to never exceed the 5-step cap; the MP host runs
+    two ships + the snapshot + the NetWorker, so it hiccups past it.)"""
+    alpha = max(0.0, min(1.0, alpha))
     p0 = pygame.Vector2(pack["prev_pos"])
     p1 = pygame.Vector2(pack["pos"])
     rpos = p0.lerp(p1, alpha)

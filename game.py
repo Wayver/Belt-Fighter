@@ -106,6 +106,108 @@ class _RemoteEnemyProxy:
         return e0 + v * T + 0.5 * a * (T * T)
 
 
+# --- Session 9.x M2a: model-driven WORLD render helpers -------------------
+#
+# The 9.x goal is for the render to stop reading live mutable sim state
+# (self.asteroids / self.enemies / self.bullets / ...) and instead consume
+# the plain-data RenderModel (see Game.render_model). M2a moves the WORLD
+# entities (stars, asteroids, enemies, bullets, enemy_bullets, missiles,
+# particles) onto that path. These are module-level functions that read ONLY
+# the plain-data model + the camera + per-tag presentation stand-ins — never
+# a live sim object — so they are safe to call from a render thread later
+# (M3) once the model is published by an atomic reference swap.
+#
+# They mirror the live `a.draw` / `e.draw` / `p.draw` / inline bullet-missile
+# code exactly, so the world renders identically. The one deliberate loss
+# (restorable in M2b): the enemy tuple carries pose + hull tag, NOT the
+# enemy ship's presentation state (flame_mags / shield_impacts / arcs), so a
+# stand-in draws the enemy hull WITHOUT its thruster flames / shield flash.
+# The local ship (M2b) keeps its full presentation, so the host's own feel is
+# unaffected. To restore enemy flames later, add flame_mags/shield_impacts to
+# the model's enemy tuple and pass them into _draw_world_enemy.
+#
+# Deferred to M2b (still read live state in draw() for now): the laser BEAMS
+# and the targeting RETICLE — both are entangled with the local ship's
+# interpolated pose (self.ship.rpos/rangle) and the local ship's own
+# presentation, so they move with the local-ship milestone, not the world.
+
+def _draw_world_stars(screen, cam, stars):
+    """Parallax background: one dim dot per star, offset by 0.2x the camera.
+    `stars` is the model's [(x, y, r), ...] (plain data)."""
+    for x, y, r in stars:
+        sx = (x - cam.pos.x * 0.2) % WIDTH
+        sy = (y - cam.pos.y * 0.2) % HEIGHT
+        pygame.draw.circle(screen, STAR_COLOR, (sx, sy), r)
+
+
+def _draw_world_asteroid(screen, cam, pos, angle, verts):
+    """One asteroid as a filled+stroked polygon at (pos, angle). Mirrors
+    Asteroid.draw exactly (same rotation + ROCK_FILL/ROCK_EDGE). `verts` is
+    the model's plain [(vx, vy), ...] rock shape."""
+    sx, sy = cam.to_screen(pygame.Vector2(pos))
+    ca, sa = math.cos(angle), math.sin(angle)
+    pts = []
+    for v in verts:
+        pts.append((sx + v[0] * ca - v[1] * sa, sy + v[0] * sa + v[1] * ca))
+    pygame.draw.polygon(screen, ROCK_FILL, pts)
+    pygame.draw.polygon(screen, ROCK_EDGE, pts, 2)
+
+
+def _draw_world_enemy(screen, cam, tag, pos, angle, standins):
+    """One enemy as its REAL hull at (pos, angle), via the per-tag
+    presentation stand-in (the same stand-ins the client's remote render
+    uses — the hull + loadout are fixed on both peers by construction).
+    Mirrors AIEnemy.draw. `standins` is a {tag: _RemoteEnemyProxy} dict.
+    Unknown tags (e.g. 'test') draw nothing (a test-range construct)."""
+    e = standins.get(tag)
+    if e is None:
+        return
+    e.ship.draw(screen, cam, pygame.Vector2(pos), angle,
+                fill=e.hull.fill or ENEMY_FILL,
+                edge=e.hull.edge or ENEMY_EDGE,
+                flame_out=ENEMY_FLAME, flame_in=ENEMY_FLAME)
+
+
+def _draw_world_bullet(screen, cam, pos, color):
+    """One bullet as a 3px dot at (pos). Mirrors the inline bullet code in
+    draw() (the host draws a plain dot, not the client's velocity streak)."""
+    s = cam.to_screen(pygame.Vector2(pos))
+    pygame.draw.circle(screen, color, (int(s.x), int(s.y)), 3)
+
+
+def _draw_world_missile(screen, cam, pos, vel, boost, life):
+    """One missile: body line + nose + boost exhaust flicker. Mirrors the
+    inline missile code in draw() exactly (the flicker is a pure function of
+    `life`, so it is identical for the same model)."""
+    p = pygame.Vector2(pos)
+    v = pygame.Vector2(vel)
+    s = cam.to_screen(p)
+    fwd = v.normalize()
+    tail = cam.to_screen(p - fwd * 14)
+    # body: longer, thicker than a bullet
+    pygame.draw.line(screen, _dim_color(MISSILE_COLOR, 0.7), tail, s, 3)
+    # nose: bright tip
+    pygame.draw.circle(screen, MISSILE_COLOR, (int(s.x), int(s.y)), 3)
+    # exhaust: only during the boost ramp, flickering length
+    if boost > 0:
+        flick = 6 * (0.5 + 0.5 * math.sin(life * 40))
+        flame = cam.to_screen(p - fwd * (14 + flick))
+        pygame.draw.line(screen, (255, 220, 120), tail, flame, 2)
+
+
+def _draw_world_particle(screen, cam, pos, vel, color, life, max_life):
+    """One explosion particle: a short streak along -vel, fading with life.
+    Mirrors Particle.draw exactly."""
+    p = pygame.Vector2(pos)
+    v = pygame.Vector2(vel)
+    a = max(0.0, life / max_life)
+    tail = p - v * 0.03
+    s1 = cam.to_screen(p)
+    s2 = cam.to_screen(tail)
+    pygame.draw.line(screen, color, (s1.x, s1.y), (s2.x, s2.y),
+                     max(1, int(2 * a)))
+
+
 class Game:
     def __init__(self, screen, font, big_font, light_tex, fog_surf, light_surf,
                 hull=None, loadout=None, test_mode=False, seed=None, sound=None,
@@ -1181,39 +1283,34 @@ class Game:
                     spawn_enemy(self.enemies, self.ship, rng=self.rng)   # instant respawn
                     break
 
-    def draw(self, dt):
+    def draw(self, dt, model=None):
         screen = self.screen
+        # Session 9.x M2a: the WORLD entities are drawn from the plain-data
+        # RenderModel, not live sim state. The model is built once per frame
+        # (here, when the caller doesn't supply one) — M3 moves this build to
+        # the sim thread. Still live-state (deferred to M2b): the local ship,
+        # camera, fog, HUD, the laser beams, and the targeting reticle.
+        if model is None:
+            model = self.render_model()
         self.cam.update(dt, self.ship)
         screen.fill(BG)
-        for x, y, r in self.stars:
-            sx = (x - self.cam.pos.x * 0.2) % WIDTH
-            sy = (y - self.cam.pos.y * 0.2) % HEIGHT
-            pygame.draw.circle(screen, STAR_COLOR, (sx, sy), r)
-        for a in self.asteroids:
-            a.draw(screen, self.cam)
-        for e in self.enemies:
-            e.draw(screen, self.cam)
-            if TARGETING_ASSIST and self.ship.targeting_on:
+        _draw_world_stars(screen, self.cam, model["stars"])
+        for pos, angle, verts in model["asteroids"]:
+            _draw_world_asteroid(screen, self.cam, pos, angle, verts)
+        standins = self._get_remote_enemies()
+        for tag, pos, angle, _vel, _acc, _cr, _poly in model["enemies"]:
+            _draw_world_enemy(screen, self.cam, tag, pos, angle, standins)
+        # Targeting reticle (DEFERRED to M2b — still reads the live enemy
+        # list + the local ship; it moves with the local-ship milestone).
+        if TARGETING_ASSIST and self.ship.targeting_on:
+            for e in self.enemies:
                 self._draw_lead(screen, e, self.ship)
-        for b in self.bullets:
-            s = self.cam.to_screen(b.pos)
-            pygame.draw.circle(screen, BULLET_COLOR, (int(s.x), int(s.y)), 3)
+        for pos, vel in model["bullets"]:
+            _draw_world_bullet(screen, self.cam, pos, BULLET_COLOR)
         
 
-        for m in self.missiles:
-
-            s = self.cam.to_screen(m.pos)
-            fwd = m.vel.normalize()
-            tail = self.cam.to_screen(m.pos - fwd * 14)
-            # body: longer, thicker than a bullet
-            pygame.draw.line(screen, _dim_color(MISSILE_COLOR, 0.7), tail, s, 3)
-            # nose: bright tip
-            pygame.draw.circle(screen, MISSILE_COLOR, (int(s.x), int(s.y)), 3)
-            # exhaust: only during the boost ramp, flickering length
-            if m.boost > 0:
-                flick = 6 * (0.5 + 0.5 * math.sin(m.life * 40))
-                flame = self.cam.to_screen(m.pos - fwd * (14 + flick))
-                pygame.draw.line(screen, (255, 220, 120), tail, flame, 2)
+        for pos, vel, boost, life in model["missiles"]:
+            _draw_world_missile(screen, self.cam, pos, vel, boost, life)
 
 
         for local, target, d, vis_end, age, ttl in self.beams:
@@ -1232,11 +1329,11 @@ class Game:
                              self.cam.to_screen(end), 2)
 
 
-        for b in self.enemy_bullets:
-            s = self.cam.to_screen(b.pos)
-            pygame.draw.circle(screen, ENEMY_BULLET_COLOR, (int(s.x), int(s.y)), 3)
-        for p in self.particles:
-            p.draw(screen, self.cam)
+        for pos, vel in model["enemy_bullets"]:
+            _draw_world_bullet(screen, self.cam, pos, ENEMY_BULLET_COLOR)
+        for pos, vel, color, life, max_life in model["particles"]:
+            _draw_world_particle(screen, self.cam, pos, vel, color, life,
+                                 max_life)
         if not self.game_over:
             # Draw EVERY player ship (Session 6.2a), each with its own
             # shield ring (self.shields[i], sized by that hull's radius).

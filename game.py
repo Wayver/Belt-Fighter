@@ -676,6 +676,7 @@ class Game:
             p.angle = -math.pi / 2
             p.prev_pos = p.pos.copy()
             p.prev_angle = p.angle
+            p.dead = False   # 10.1: a full reset revives dead ships
             p.reset_shield()
             p.targeting_on = False
             p.tracked = 0

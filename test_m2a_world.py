@@ -253,8 +253,10 @@ def main():
     s_model = _surface()
     for e in fresh.enemies:
         e.draw(s_live, fcam)
-    for tag, _id, pos, angle, _vel, _acc, _cr, _poly in fm["enemies"]:
-        _draw_world_enemy(s_model, fcam, tag, pos, angle, standins)
+    for (tag, _id, pos, angle, _vel, _acc, _cr, _poly,
+             s_dump, s_clock) in fm["enemies"]:
+        _draw_world_enemy(s_model, fcam, tag, pos, angle, standins,
+                          s_dump, s_clock)
     if _pixels(s_live) == _pixels(s_model):
         print("PASS: ENEMY — %d fresh enemies render their hull "
               "pixel-identically via the model (flames deferred to M2b)"

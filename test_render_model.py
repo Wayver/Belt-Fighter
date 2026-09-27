@@ -94,7 +94,8 @@ FIELD_MAP = {
     "asteroids":       "for a in self.asteroids: a.draw  (pos/angle/verts)",
     "enemies":         "for e in self.enemies: e.draw + _draw_lead + "
                        "lead_point (tag/pos/angle/vel/acc_smooth/"
-                       "collision_radius/local_poly)",
+                       "collision_radius/local_poly/shield_dump/"
+                       "shield_clock — 10.2b)",
     "bullets":         "for b in self.bullets  (pos/vel)",
     "enemy_bullets":   "for b in self.enemy_bullets  (pos/vel)",
     "missiles":        "for m in self.missiles  (pos/vel/boost/life)",
@@ -158,8 +159,8 @@ def check_parity(m, g):
         assert mverts == tuple((v.x, v.y) for v in a.verts), "asteroid verts"
     # --- enemies ---
     assert len(m["enemies"]) == len(g.enemies), "enemies len"
-    for (mtag, mid, mpos, mang, mvel, macc, mcr, mpoly), e in \
-            zip(m["enemies"], g.enemies):
+    for (mtag, mid, mpos, mang, mvel, macc, mcr, mpoly,
+             mdump, mclock), e in zip(m["enemies"], g.enemies):
         assert mtag == g._enemy_tag(e), "enemy tag"
         assert mid == e.ship.id, "enemy ship_id"
         assert mpos == (e.pos.x, e.pos.y), "enemy pos"
@@ -168,6 +169,10 @@ def check_parity(m, g):
         assert macc == (e._acc_smooth.x, e._acc_smooth.y), "enemy acc_smooth"
         assert mcr == e.collision_radius, "enemy collision_radius"
         assert mpoly == tuple(e.ship.collision.local_poly), "enemy local_poly"
+        # 10.2b: the model carries the enemy's shield-impact state so the
+        # host's rendered enemies flash (restores the M2a deliberate loss).
+        assert mdump == e.ship.shield_dump, "enemy shield_dump"
+        assert mclock == e.ship.shield_clock, "enemy shield_clock"
     # --- projectiles ---
     assert len(m["bullets"]) == len(g.bullets), "bullets len"
     for (mpos, mvel), b in zip(m["bullets"], g.bullets):

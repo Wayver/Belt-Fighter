@@ -364,8 +364,11 @@ def snap_positions(s):
         # 10.2: ships also carry shield_dump (ship_s[6]) + shield_clock
         # (ship_s[7]) so the remote ship's impact flash renders.
         'ships': [(p[0], p[1], p[4], p[20], p[6], p[7]) for p in s[0]],
+        # 10.2b: enemies also carry shield_dump (e_s[0][6]) + shield_clock
+        # (e_s[0][7]) so the remote enemy's impact flash renders.
         'enemies': [(tag, e_s[0][0], e_s[0][1], e_s[0][4],
-                     e_s[0][2], e_s[0][3], e_s[2]) for tag, e_s in s[1]],
+                     e_s[0][2], e_s[0][3], e_s[2],
+                     e_s[0][6], e_s[0][7]) for tag, e_s in s[1]],
         'asteroids': [(a_s[1], a_s[2]) for a_s in s[5]],
         'bullets': _snap_bullets(s),
     }
@@ -478,10 +481,12 @@ def id_oracle(prev_s, curr_s, alpha, dt=None):
                 mix_scalar(None if pp is None else pp[3], c[6]),
                 mix_scalar(None if pp is None else pp[4], c[7]))
 
+    # 10.2b: the prev enemy also carries (shield_dump, shield_clock) =
+    # (es[6], es[7]) — lerp'd with the pose like the player ships'.
     prev_e = {}
     for _tag, p in prev_s[1]:
         es = p[0]
-        prev_e[_eid(p)] = (es[0], es[1], es[4])
+        prev_e[_eid(p)] = (es[0], es[1], es[4], es[6], es[7])
     prev_r = {_akey(t): (t[1], t[2]) for t in prev_s[5]}
 
     def mix_enemy_angle(pp, cp):
@@ -502,12 +507,16 @@ def id_oracle(prev_s, curr_s, alpha, dt=None):
         # mix takes a (x, y) pair only — at the endpoints it returns its
         # argument BY IDENTITY, so feeding it the 3-tuple (x, y, angle)
         # would duplicate the angle into the output (7-tuple -> 8-tuple).
+        # 10.2b: the entry also carries (shield_dump, shield_clock) —
+        # mix_scalar lerp's them (endpoint-exact) like the player ships'.
         enemies.append((tag,
                         *mix((pe[0], pe[1]) if pe is not None else None,
                              (t[0][0], t[0][1])),
                         mix_enemy_angle(None if pe is None else pe[2],
                                         t[0][4]),
-                        t[0][2], t[0][3], _eid(t)))
+                        t[0][2], t[0][3], _eid(t),
+                        mix_scalar(None if pe is None else pe[3], t[0][6]),
+                        mix_scalar(None if pe is None else pe[4], t[0][7])))
     # Player ships are matched by INDEX (Session 6.1) — ships don't turn
     # over, so slot i of curr_s[0] is the same ship as slot i of prev_s[0].
     # Pose = (x, y, raw angle) (Session 6.8). 10.2: the prev ship also
@@ -1130,8 +1139,9 @@ def main():
             print(f"FAIL: enemy angle — positions_at returned None at "
                   f"render_t={INTERP_DELAY + i * STEP}")
             break
-        cur = {eid: ang for (_tag, _x, _y, ang, _vx, _vy, eid)
-               in P['enemies']}
+        # 10.2b: the entry is now a 9-tuple (… + shield_dump, shield_clock).
+        cur = {eid: ang for (_tag, _x, _y, ang, _vx, _vy, eid,
+                             _s_dump, _s_clock) in P['enemies']}
         for eid, ang in cur.items():
             if eid in prev_enemy_angles:
                 d = abs((ang - prev_enemy_angles[eid] + math.pi)

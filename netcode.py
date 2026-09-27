@@ -683,7 +683,8 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
     no pygame objects, no sim state touched:
 
         {'ships': [(x, y, angle, dead, shield_dump, shield_clock), ...],
-         'enemies': [(tag, x, y, angle, vx, vy, id), ...],
+         'enemies': [(tag, x, y, angle, vx, vy, id,
+                      shield_dump, shield_clock), ...],
          'asteroids': [(x, y), ...],
          'bullets': [(x, y, vx, vy, kind, owner, boost), ...]}
 
@@ -791,10 +792,14 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
     # ships, 6.8); the tag and velocity come from the CURRENT snapshot
     # (membership follows curr; velocity is presentation data for the
     # targeting proxy).
+    # The prev enemy carries (x, y, angle, shield_dump, shield_clock) —
+    # the shield state (10.2b) is lerp'd with the pose so the remote
+    # enemy's impact flash fades smoothly across the window (same rule as
+    # the player ships' shield state).
     prev_enemies = {}
     for _tag, p in prev_s[1]:
         es = p[0]
-        prev_enemies[_enemy_id(p)] = (es[0], es[1], es[4])
+        prev_enemies[_enemy_id(p)] = (es[0], es[1], es[4], es[6], es[7])
     enemies = []
     for tag, c in curr_s[1]:
         ce = c[0]
@@ -803,14 +808,16 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
         pp = prev_enemies.get(eid)
         if pp is None:
             enemies.append((tag, cpos[0], cpos[1], ce[4], ce[2], ce[3],
-                            eid))
+                            eid, ce[6], ce[7]))
         else:
             enemies.append((tag,
                             lerp(pp[0], cpos[0], a),
                             lerp(pp[1], cpos[1], a),
                             lerp_angle(pp[2], ce[4], a),
                             ce[2], ce[3],
-                            eid))
+                            eid,
+                            lerp(pp[3], ce[6], a),
+                            lerp(pp[4], ce[7], a)))
 
     prev_rocks = {_asteroid_key(p): (p[1], p[2]) for p in prev_s[5]}
     asteroids = []
@@ -913,7 +920,8 @@ class SnapshotBuffer:
 
         Returns the same dict shape as `interp_positions`
         ({'ships': [(x, y, angle, dead, shield_dump, shield_clock), ...],
-        'enemies': [(tag, x, y, angle, vx, vy, id), ...],
+        'enemies': [(tag, x, y, angle, vx, vy, id,
+                     shield_dump, shield_clock), ...],
         'asteroids': [(x, y), ...],
         'bullets': [(x, y, vx, vy, kind, owner, boost), ...]}) or None
         when there is not yet a window to interpolate between (fewer than

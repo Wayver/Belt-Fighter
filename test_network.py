@@ -40,9 +40,11 @@ What it proves (the 6.6 client wiring, end to end):
     angular span) — this is what lets the client draw the remote hull at
     its interpolated orientation instead of a dot.
   * the buffer carries FULL REMOTE RENDERING data (Session 7.2):
-    'enemies' entries are (tag, x, y, angle, vx, vy, id) with the angle
-    tracking the authoritative sim (the D4 fix — real enemy hulls, not
-    dots), and a 'bullets' key holds (x, y, vx, vy, kind, owner, boost)
+    'enemies' entries are (tag, x, y, angle, vx, vy, id, shield_dump,
+    shield_clock) with the angle tracking the authoritative sim (the D4
+    fix — real enemy hulls, not dots; 10.2b adds the shield state so the
+    enemy's shield-impact flash renders), and a 'bullets' key holds
+    (x, y, vx, vy, kind, owner, boost)
     entries for every projectile (the D3 fix — the client rendered no
     bullets at all).
 
@@ -505,11 +507,12 @@ def run(res, impairment=None, label="clean", run_s=3.5):
             e_shape_ok = True
             tags = set()
             for e in P.get('enemies', ()):
-                if not (isinstance(e, tuple) and len(e) == 7):
+                if not (isinstance(e, tuple) and len(e) == 9):
                     e_shape_ok = False
                     break
                 tags.add(e[0])
-            check("buffer enemy entries are (tag, x, y, angle, vx, vy, id) (7.2)",
+            check("buffer enemy entries are (tag, x, y, angle, vx, vy, id, "
+                  "s_dump, s_clock) (7.2 + 10.2b)",
                   e_shape_ok, "n=%d" % len(P.get('enemies', ())))
             check("buffer enemy tags are real hull tags (7.2, D4)",
                   tags <= {'ai', 'mote'}, "tags=%r" % (sorted(tags),))
@@ -586,7 +589,9 @@ def run(res, impairment=None, label="clean", run_s=3.5):
                 curr_ang = {es[2]: es[0][4] for _tag, es in s_curr[1]}
                 in_span = True
                 checked = 0
-                for (_tag, _x, _y, ang, _vx, _vy, eid) in P.get('enemies', ()):
+                # 10.2b: the entry is now a 9-tuple (… + shield_dump, shield_clock).
+                for (_tag, _x, _y, ang, _vx, _vy, eid,
+                     _s_dump, _s_clock) in P.get('enemies', ()):
                     if eid not in prev_ang or eid not in curr_ang:
                         continue
                     checked += 1

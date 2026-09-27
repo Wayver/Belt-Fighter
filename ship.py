@@ -140,6 +140,12 @@ class Ship:
 
         self.missile_target = None   # enemy candidate; set by Game each tick
         self.missile_dump = 0.0      # decaying power spike from launches
+        # 10.3b: per-ship missile launch counter. The host assigns each
+        # launched missile the id (player_index, missile_seq) and bumps
+        # this; it is SYNCED via the ship snapshot so the client's
+        # prediction ghost keeps the same counter (its ghost missiles get
+        # the same ids the host's get — the no-double-draw dedup key).
+        self.missile_seq = 0
 
         # sensors: passive ear (V) + active ping (G). The fitted part
         # decides which exist (0 range/cooldown = not fitted).
@@ -353,6 +359,10 @@ class Ship:
     #                              before its first step)
     #   weapons: per weapon (cooldown, charge, lock_progress)
     #   id                         owner tag for shots (enemy id = None/0)
+    #   missile_seq                10.3b: per-ship missile launch counter
+    #                              (the host bumps it on each launch; the
+    #                              client's ghost resyncs it so its ghost
+    #                              missiles get the same ids the host's do)
     #
     # PRESENTATION-ONLY (never serialized):
     #   flame_mags, arcs, arc_clock, shield_impacts
@@ -387,6 +397,7 @@ class Ship:
                   for w in self.weapons),
             self.id,
             self.dead,   # 10.1: per-player death
+            self.missile_seq,   # 10.3b: per-ship missile launch counter
         )
 
     def sync_render(self, alpha):
@@ -403,7 +414,8 @@ class Ship:
          scan_cd, scan_reveal, scan_dump, scan_pulse,
          brownout, power_factor,
          weapons, ship_id,
-         dead) = s   # 10.1: per-player death
+         dead,
+         missile_seq) = s   # 10.1: per-player death; 10.3b: missile counter
         self.pos = pygame.Vector2(px, py)
         self.vel = pygame.Vector2(vx, vy)
         self.angle = a
@@ -426,6 +438,7 @@ class Ship:
             w.lock_progress = lock_progress
         self.id = ship_id
         self.dead = dead   # 10.1: per-player death
+        self.missile_seq = missile_seq   # 10.3b: resync the launch counter
 
     # --- simulation: per-thruster pipeline ---
 

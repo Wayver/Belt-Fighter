@@ -91,7 +91,7 @@ class EnemyBullet:
         self.life -= dt
 
 class Missile:
-    def __init__(self, pos, vel, owner=0, target=None):
+    def __init__(self, pos, vel, owner=0, target=None, mid=None):
         self.pos = pos
         self.prev_pos = pos.copy()
         self.vel = vel.copy()
@@ -100,16 +100,24 @@ class Missile:
         self.life = MISSILE_LIFE
         self.boost = MISSILE_BOOST_TIME
         self.dmg = MISSILE_DAMAGE
+        # 10.3b: unique identity (player_index, seq) — the player-prefixed
+        # id the host assigns at launch (see Game._step). The client uses it
+        # to dedup its own ghost missiles against the buffer's copy of the
+        # same missile (no double-draw). None for pre-10.3b snapshots.
+        self.id = mid
 
     def snapshot(self):
         # target is stored as the enemy's ship id (or None); Game
         # apply_snapshot() re-wires it to the live AIEnemy object.
+        # 10.3b: the id (player_index, seq) is carried too (the client's
+        # dedup key); stored as a 2-tuple (None-safe).
         return (self.pos.x, self.pos.y, self.vel.x, self.vel.y,
                 self.owner, self.life, self.boost,
-                self.target.ship.id if self.target is not None else None)
+                self.target.ship.id if self.target is not None else None,
+                self.id)
 
     def apply_snapshot(self, s):
-        (px, py, vx, vy, owner, life, boost, target_id) = s
+        (px, py, vx, vy, owner, life, boost, target_id, mid) = s
         self.pos = pygame.Vector2(px, py)
         self.prev_pos = self.pos.copy()   # no interpolation artifact on restore
         self.vel = pygame.Vector2(vx, vy)
@@ -118,6 +126,7 @@ class Missile:
         self.boost = boost
         self.target = None                # Game wires the real ref
         self._target_id = target_id
+        self.id = mid                     # 10.3b: restore the unique id
 
     def update(self, dt):
         self.prev_pos = self.pos.copy()

@@ -948,10 +948,10 @@ class Game:
         # enemy exists.
         self.missiles.clear()
         for m_s in missiles_s:
-            px, py, vx, vy, owner, _life, _boost, _tid = m_s
+            px, py, vx, vy, owner, _life, _boost, _tid, _mid = m_s
             m = Missile(pygame.Vector2(px, py), pygame.Vector2(vx, vy),
                         owner=owner)
-            m.apply_snapshot(m_s)
+            m.apply_snapshot(m_s)   # also restores m.id (10.3b)
             self.missiles.append(m)
         id_map = {e.ship.id: e for e in self.enemies}
         for m in self.missiles:
@@ -1288,8 +1288,14 @@ class Game:
                     self._sfx_throttled("laser", SFX_LASER_MIN_INTERVAL)
 
                 for m in missiles:
+                    # 10.3b: assign the unique player-prefixed id
+                    # (player_index, per-ship seq) and bump the counter.
+                    # The counter is synced via the ship snapshot, so the
+                    # client's ghost derives the same ids (the dedup key).
+                    mid = (i, p.missile_seq)
+                    p.missile_seq += 1
                     self.missiles.append(Missile(m.pos, m.vel, owner=m.owner,
-                                                 target=m.target))
+                                                 target=m.target, mid=mid))
                 if missiles:
                     self._sfx("missile_launch")
 
@@ -1998,8 +2004,10 @@ class Game:
         for (tag, x, y, ang, vx, vy, _eid, s_dump, s_clock) in pos['enemies']:
             self._draw_remote_enemy_hull(screen, tag, x, y, ang,
                                          s_dump, s_clock)
-        # Remote projectiles (Session 7.2, the D3 fix).
-        for (x, y, vx, vy, kind, owner, boost) in pos['bullets']:
+        # Remote projectiles (Session 7.2, the D3 fix). 10.3b: the entry
+        # carries the missile id (mid) too — unused here (remote_view has
+        # no ghost to dedup against).
+        for (x, y, vx, vy, kind, owner, boost, _mid) in pos['bullets']:
             self._draw_remote_bullet(screen, x, y, vx, vy, kind, boost)
         # All player ships (Session 6.1): the buffer's 'ships' list, by index.
         # Session 6.8: each is drawn as its REAL hull at the interpolated
@@ -2185,7 +2193,23 @@ class Game:
                                          s_dump, s_clock)
         # Remote projectiles (Session 7.2, the D3 fix): every bullet and
         # missile in the buffer, at its interpolated position.
-        for (x, y, vx, vy, kind, owner, boost) in pos['bullets']:
+        # 10.3b: DEDUP — the buffer also carries the LOCAL player's own
+        # missiles (the host's snapshot includes them ~100 ms after the
+        # ghost fired them). Those are drawn from the ghost (predicted,
+        # immediate) instead, so the buffer's copy of a missile whose id
+        # matches a ghost missile is SKIPPED — the same missile never
+        # appears twice. The other player's missiles (ids the ghost never
+        # made) are drawn from the buffer as before.
+        #
+        # The id is a (player_index, seq) tuple. The ghost's local missiles
+        # carry it as a tuple (created client-side); the buffer's copy
+        # arrives via JSON, where the tuple is a LIST. tuple() normalizes
+        # both sides so the set membership is type-robust.
+        local_missile_ids = {tuple(m.id) for m in self.ghost.local_missiles}
+        for (x, y, vx, vy, kind, owner, boost, mid) in pos['bullets']:
+            if kind == 'missile' and mid is not None \
+                    and tuple(mid) in local_missile_ids:
+                continue   # drawn from the ghost (predicted) instead
             self._draw_remote_bullet(screen, x, y, vx, vy, kind, boost)
         # Remote ships (Session 6.6, hulls drawn in 6.8): every player
         # EXCEPT the local one, from the buffer by index (Session 6.1:
@@ -2261,11 +2285,22 @@ class Game:
         # ~100 ms later when the host's next snapshot arrives. Drawn the
         # same way the host draws the local player's bullets (a
         # BULLET_COLOR dot at the bullet's position). Presentation only:
-        # no collision, no sim feedback. (Beams are drawn above, 10.3a;
-        # missiles are 10.3b.)
+        # no collision, no sim feedback. (Beams are drawn above, 10.3a.)
         for b in self.ghost.local_bullets:
             s = self.cam.to_screen(b.pos)
             pygame.draw.circle(screen, BULLET_COLOR, (int(s.x), int(s.y)), 3)
+        # 10.3b: the player's OWN missiles — the ghost's predicted
+        # missiles, drawn immediately at their predicted (homing) positions
+        # so the player sees their fire the instant they launch — not
+        # ~100 ms later when the host's next snapshot arrives. Drawn with
+        # the host's missile visual (body line + nose + boost exhaust
+        # flicker). The buffer's copy of each of these is SKIPPED above
+        # (dedup by id), so the same missile never appears twice.
+        # Presentation only: no collision, no sim feedback.
+        for m in self.ghost.local_missiles:
+            _draw_world_missile(screen, self.cam,
+                                (m.pos.x, m.pos.y),
+                                (m.vel.x, m.vel.y), m.boost, m.life)
 
         # Targeting reticle (Session 7.2): the client has no enemy list
         # to target (it never runs the sim), so run the SAME lead math
@@ -2286,11 +2321,15 @@ class Game:
         # the lights are the interpolated bullets/missiles plus a reticle
         # light at each lead point (mirrors _build_lights' guard so the
         # light and the reticle appear/disappear together).
-        lights = self._remote_fog_lights(pos, self.ghost.ship)
+        lights = self._remote_fog_lights(pos, self.ghost.ship, local_missile_ids)
         # The player's OWN gun shots glow too (Session 7.3) — mirrors the
         # host's _build_lights, which adds a LightSource per player bullet.
         for b in self.ghost.local_bullets:
             lights.append(LightSource(b.pos, 30, 0.5))
+        # 10.3b: the player's OWN missiles glow too (the buffer's copy of
+        # each was skipped above, so light them from the predicted pos).
+        for m in self.ghost.local_missiles:
+            lights.append(LightSource(m.pos, 30, 0.5))
         for e in proxies:
             p = e.lead_point(self.ghost.ship.pos, BULLET_SPEED,
                              TARGETING_USE_ACCEL)
@@ -2438,7 +2477,7 @@ class Game:
         pygame.draw.line(screen, color, tail, (int(s.x), int(s.y)), 3)
         pygame.draw.circle(screen, color, (int(s.x), int(s.y)), 2)
 
-    def _remote_fog_lights(self, pos, local_ship):
+    def _remote_fog_lights(self, pos, local_ship, local_missile_ids=()):
         """LightSources for the client's fog of war (Session 7.2 —
         predicted_view previously skipped draw_fog entirely, so fire did
         not glow through the dark like on the host). Mirrors
@@ -2448,9 +2487,17 @@ class Game:
         lights are added by the caller (they need the proxy's
         lead_point, which the caller already computes for the reticle).
         `local_ship` is the ghost's ship (the client's light bubble
-        follows the player, not the stale players[0])."""
+        follows the player, not the stale players[0]).
+
+        10.3b: `local_missile_ids` (a set of the ghost's own missile ids)
+        is used to SKIP the buffer's copy of the local player's own
+        missiles — those glow from the ghost's predicted position instead
+        (added by the caller), so the same missile does not light twice."""
         lights = []
-        for (x, y, vx, vy, kind, owner, boost) in pos['bullets']:
+        for (x, y, vx, vy, kind, owner, boost, mid) in pos['bullets']:
+            if kind == 'missile' and mid is not None \
+                    and tuple(mid) in local_missile_ids:
+                continue   # glows from the ghost's predicted pos instead
             if kind == 'player':
                 lights.append(LightSource(pygame.Vector2(x, y), 30, 0.5))
             elif kind == 'enemy':

@@ -499,11 +499,13 @@ def run(res, impairment=None, label="clean", run_s=3.5):
             kinds = set()
             shapes_ok = True
             for b in P.get('bullets', ()):
-                if not (isinstance(b, tuple) and len(b) == 7):
+                # 10.3b: the entry carries the missile id (mid) too —
+                # (x, y, vx, vy, kind, owner, boost, mid).
+                if not (isinstance(b, tuple) and len(b) == 8):
                     shapes_ok = False
                     break
                 kinds.add(b[4])
-            check("buffer bullet entries are (x, y, vx, vy, kind, owner, boost)",
+            check("buffer bullet entries are (x, y, vx, vy, kind, owner, boost, mid)",
                   shapes_ok, "n=%d" % len(P.get('bullets', ())))
             check("buffer carries >=1 enemy bullet (7.2, D3)",
                   'enemy' in kinds, "kinds=%r" % (sorted(kinds),))

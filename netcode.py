@@ -57,9 +57,13 @@ Snapshot layout (see Game.snapshot in game.py):
 """
 import math
 
+import pygame
+
 from .config import (INTERP_DELAY, INTERP_DELAY_MIN, INTERP_DELAY_MAX,
                     ADAPT_K, SNAPSHOT_INTERVAL, TICK, MAX_FRAME_DT,
-                    MAX_BULLETS)
+                    MAX_BULLETS, MAX_MISSILES,
+                    MISSILE_SPEED, MISSILE_ACCEL, MISSILE_BOOST_TIME,
+                    MISSILE_TURN_RATE, MISSILE_LIFE)
 from .ship import Ship
 from .bullets import Bullet
 
@@ -692,7 +696,12 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
          'enemies': [(tag, x, y, angle, vx, vy, id,
                       shield_dump, shield_clock), ...],
          'asteroids': [(x, y), ...],
-         'bullets': [(x, y, vx, vy, kind, owner, boost), ...]}
+         'bullets': [(x, y, vx, vy, kind, owner, boost, mid), ...]}
+
+    Each projectile entry carries `mid` (10.3b): the missile's unique id
+    (player_index, seq) for kind == 'missile', else None. The client uses
+    it to dedup its own ghost missiles against the buffer's copy of the
+    same missile (no double-draw) — see predicted_view.
 
     Ships carry their `dead` flag too (Session 10.1): ship_s[20], taken
     from the CURRENT snapshot (membership follows curr). The remote peer
@@ -848,9 +857,14 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
     if dt is None:
         dt = SNAPSHOT_INTERVAL * TICK
     bullets = []
-    for kind, idx, boost_field in (("player", 2, None),
-                                   ("enemy", 3, None),
-                                   ("missile", 4, 6)):
+    # 10.3b: missiles carry their unique id (player_index, seq) — the
+    # client's dedup key (its own ghost missiles are suppressed against the
+    # buffer's copy of the same id; the other player's missiles are drawn
+    # from the buffer). Bullets carry None (they are matched by position,
+    # not identity — see _match_bullets).
+    for kind, idx, boost_field, id_field in (("player", 2, None, None),
+                                             ("enemy", 3, None, None),
+                                             ("missile", 4, 6, 8)):
         prev_list = prev_s[idx]
         curr_list = curr_s[idx]
         matches = _match_bullets(prev_list, curr_list, dt)
@@ -861,7 +875,8 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
                 x = lerp(pp[0], c[0], a)
                 y = lerp(pp[1], c[1], a)
             boost = c[boost_field] if boost_field is not None else 0.0
-            bullets.append((x, y, c[2], c[3], kind, c[4], boost))
+            mid = c[id_field] if id_field is not None else None
+            bullets.append((x, y, c[2], c[3], kind, c[4], boost, mid))
 
     return {'ships': ships, 'enemies': enemies, 'asteroids': asteroids,
             'bullets': bullets}
@@ -929,7 +944,7 @@ class SnapshotBuffer:
         'enemies': [(tag, x, y, angle, vx, vy, id,
                      shield_dump, shield_clock), ...],
         'asteroids': [(x, y), ...],
-        'bullets': [(x, y, vx, vy, kind, owner, boost), ...]}) or None
+        'bullets': [(x, y, vx, vy, kind, owner, boost, mid), ...]}) or None
         when there is not yet a window to interpolate between (fewer than
         two snapshots, or render_t before the first snapshot).
 
@@ -971,6 +986,81 @@ class SnapshotBuffer:
                 return interp_positions(si, sj, alpha, dt=span)
         # Unreachable: render_t is strictly inside (t0, tN).
         return None
+
+
+class GhostMissile:
+    """A presentation missile the prediction ghost fired (10.3b).
+
+    The client never runs the sim, so without this the player's own
+    missiles appear only when the host's next snapshot arrives (~100 ms
+    later) — and the buffer's copy of the SAME missile would then be drawn
+    a second time (the double-draw). This is the client-side twin of the
+    host's `bullets.Missile`: it carries the SAME unique id the host
+    assigns at launch (`(player_index, seq)` — the ghost's `missile_seq`
+    is resynced to the host's via the ship snapshot on reconcile), so the
+    client can dedup it against the buffer's copy (predicted_view skips a
+    buffer missile whose id matches a ghost missile).
+
+    HOMING is client-side: the ghost has no live AIEnemy list, so the
+    missile steers toward the buffer's enemy PROXY for its target id
+    (re-resolved each step — if the target died, it is gone from the
+    buffer and the missile coasts). The steering math mirrors the host's
+    `Missile.update` (boost ramp, then turn-rate-limited seek toward the
+    lead point) so the predicted path tracks the host's. It is
+    PRESENTATION-ONLY: no collision, no sim feedback — the authoritative
+    missile (host) is what actually hits.
+
+    The target is a `_GhostEnemyProxy` (exposes `.pos`, `.vel`, `.id`);
+    `lead_point` is the same intercept math the host's `AIEnemy.lead_point`
+    uses (constant-velocity lead — the buffer carries no smoothed accel).
+    """
+
+    def __init__(self, pos, vel, mid, target=None):
+        self.pos = pos
+        self.prev_pos = pos.copy()
+        self.vel = vel.copy()
+        self.id = mid                    # (player_index, seq) — the dedup key
+        self.target = target             # _GhostEnemyProxy (or None)
+        self.life = MISSILE_LIFE
+        self.boost = MISSILE_BOOST_TIME
+
+    def update(self, dt, target=None):
+        """Advance one step. `target` is the CURRENT buffer proxy for this
+        missile's target id (re-resolved by the caller each step; None when
+        the target is gone from the buffer — the missile then coasts).
+        Mirrors the host's `Missile.update` (boost ramp, then
+        turn-rate-limited seek toward the lead point). The host gates the
+        seek on `self.target.hp > 0`; the ghost's equivalent is "the target
+        is still in the buffer" — so `self.target` is set to the current
+        proxy (or None) each step, and a None target coasts."""
+        self.prev_pos = self.pos.copy()
+        self.target = target
+        if self.boost > 0:
+            # straight-line boost, ramp to cruise speed (host's Missile)
+            self.boost -= dt
+            self.vel += self.vel.normalize() * MISSILE_ACCEL * dt
+            if self.vel.length() > MISSILE_SPEED:
+                self.vel.scale_to_length(MISSILE_SPEED)
+        elif self.target is not None:
+            # seek: steer toward the live intercept point, turn-rate limited
+            aim = self.target.lead_point(self.pos, self.vel.length())
+            if aim is None:
+                aim = self.target.pos     # fallback: chase current pos
+            desired = aim - self.pos
+            if desired.length() > 1:
+                desired.normalize_ip()
+            cur = self.vel.copy()
+            speed = cur.length()
+            cur.normalize_ip()
+            ang = math.atan2(desired.y, desired.x)
+            cur_ang = math.atan2(cur.y, cur.x)
+            diff = (ang - cur_ang + math.pi) % (2 * math.pi) - math.pi
+            max_turn = MISSILE_TURN_RATE * dt
+            turn = max(-max_turn, min(max_turn, diff))
+            new_ang = cur_ang + turn
+            self.vel = pygame.Vector2(math.cos(new_ang), math.sin(new_ang)) * speed
+        self.pos += self.vel * dt
+        self.life -= dt
 
 
 class PredictedShip:
@@ -1028,8 +1118,17 @@ class PredictedShip:
     given — the ghost charges + fires a beam on the same tick the host
     does, and the fired beams are kept as presentation entries in
     `self.local_beams` (world-space muzzle -> target, aged at the host's
-    0.15 s beam ttl). `missile_target` / `contacts` stay idle (10.3b /
-    10.3c).
+    0.15 s beam ttl). `contacts` stays idle (10.3c).
+
+    10.3b: `missile_target` is now picked from the caller's `enemies`
+    proxies too (the SAME nearest-in-range math the host's
+    `_pick_missile_target` uses), so the ghost locks + launches a missile
+    on the same tick the host does. The LAUNCHED missiles are kept as
+    presentation `GhostMissile`s in `self.local_missiles` (each with the
+    same unique id the host assigns — `(player_index, seq)` — so the
+    client dedups it against the buffer's copy; homing is client-side,
+    steering toward the buffer's enemy proxy for the target id). Call
+    `step_local_missiles` after `step` to advance + cull the list.
     """
 
     # Session 7.6: how much host time of local input to keep for rewind
@@ -1075,6 +1174,16 @@ class PredictedShip:
         # later). Like local_bullets these are presentation only: no
         # collision, no sim feedback.
         self.local_beams = []
+        # 10.3b: the ghost's OWN missiles, as presentation GhostMissiles.
+        # The client never runs the sim, so without this the player's own
+        # missiles appear only when the host's next snapshot arrives
+        # (~100 ms later) — and the buffer's copy of the SAME missile would
+        # then be drawn a second time (the double-draw). Each carries the
+        # SAME unique id the host assigns at launch ((player_index, seq) —
+        # the ghost's missile_seq is resynced to the host's via the ship
+        # snapshot on reconcile), so predicted_view dedups it against the
+        # buffer's copy. Homing is client-side (see GhostMissile).
+        self.local_missiles = []
 
     @property
     def ship(self):
@@ -1186,6 +1295,7 @@ class PredictedShip:
             self.step(TICK, inp, enemies=enemies)
             self.step_local_bullets(TICK)
             self.step_local_beams(TICK)
+            self.step_local_missiles(TICK, enemies)   # 10.3b
 
     def step(self, dt, inp, enemies=None):
         """Advance the ghost ONE fixed step with the LOCAL input.
@@ -1199,9 +1309,8 @@ class PredictedShip:
         presentation `Bullet`s in `self.local_bullets` (capped at
         MAX_BULLETS, mirroring the host's world cap) so the player sees
         their own shots immediately instead of waiting ~100 ms for the
-        host's next snapshot. Missiles are still discarded (10.3b). Call
-        `step_local_bullets` after `step` to advance + cull the list (the
-        game loop does this via `advance`).
+        host's next snapshot. Call `step_local_bullets` after `step` to
+        advance + cull the list (the game loop does this via `advance`).
 
         10.3a: `enemies` is a list of lightweight enemy proxies (objects
         exposing `.pos`) built by the caller from the interpolation
@@ -1223,9 +1332,12 @@ class PredictedShip:
         s = self._ship
         s.tracked = 0
         s.laser_target = self._pick_laser_target(s, enemies)
-        s.missile_target = None
+        # 10.3b: pick the ghost's missile target from the proxies (the SAME
+        # nearest-in-range math the host's _pick_missile_target uses), so
+        # the ghost locks + launches on the same tick the host does.
+        s.missile_target = self._pick_missile_target(s, enemies)
         s.contacts = []
-        shots, beams, _missiles = s.update(dt, inp)
+        shots, beams, missiles = s.update(dt, inp)
         # Keep the ghost's own gun shots (Session 7.3). The host's world
         # cap is MAX_BULLETS total; the ghost's list holds only the local
         # player's shots, so capping it at MAX_BULLETS is a faithful
@@ -1246,6 +1358,22 @@ class PredictedShip:
         for beam in beams:
             self.local_beams.append(
                 [beam.start.copy(), beam.end.copy(), 0.0, BEAM_TTL])
+        # 10.3b: keep the ghost's own LAUNCHED missiles as presentation
+        # GhostMissiles. Each gets the SAME unique id the host assigns at
+        # launch — (player_index, per-ship seq) — and the ghost's
+        # missile_seq is bumped to match (it is resynced to the host's via
+        # the ship snapshot on reconcile, so the ids stay aligned). The
+        # target is the buffer proxy the ghost locked (m.target is a
+        # _GhostEnemyProxy); homing re-resolves it by id each step. The
+        # host's world cap (MAX_MISSILES) is mirrored as a cap on the
+        # ghost's own list (a faithful stand-in — the lock-rebuild cooldown
+        # is the real limiter).
+        for m in missiles:
+            if len(self.local_missiles) < MAX_MISSILES:
+                mid = (self.local_index, s.missile_seq)
+                s.missile_seq += 1
+                self.local_missiles.append(
+                    GhostMissile(m.pos, m.vel, mid, target=m.target))
 
     def _pick_laser_target(self, s, enemies):
         """Nearest enemy proxy within the max laser range; None if no laser
@@ -1258,6 +1386,26 @@ class PredictedShip:
             return None
         max_range = max((w.comp.laser_range for w in s.weapons
                          if w.comp.laser_range > 0), default=0.0)
+        if max_range <= 0:
+            return None
+        best, best_d = None, max_range
+        for e in enemies:
+            d = e.pos.distance_to(s.pos)
+            if d <= best_d:
+                best, best_d = e, d
+        return best
+
+    def _pick_missile_target(self, s, enemies):
+        """Nearest enemy proxy within the max missile lock range; None if no
+        missile is fitted or `enemies` is empty/None. Mirrors the host's
+        `Game._pick_missile_target` (nearest-in-range) so the ghost locks +
+        launches on the same tick the host does, given the same target in
+        the wedge. Reads only `.pos` off each proxy (10.3a shared
+        plumbing)."""
+        if not enemies:
+            return None
+        max_range = max((w.comp.missile_lock_range for w in s.weapons
+                         if w.comp.missile_speed > 0), default=0.0)
         if max_range <= 0:
             return None
         best, best_d = None, max_range
@@ -1288,6 +1436,25 @@ class PredictedShip:
         for b in self.local_bullets:
             b.update(dt)
         self.local_bullets = [b for b in self.local_bullets if b.life > 0]
+
+    def step_local_missiles(self, dt, enemies=None):
+        """Advance the ghost's local missiles by `dt` and cull the dead
+        (10.3b). Mirrors the host's `for m in self.missiles: m.update(dt)`
+        + `self.missiles = [m for m in ... if m.life > 0]` — except the
+        homing target is the buffer's enemy PROXY for the missile's target
+        id (re-resolved each step from `enemies`; None when the target has
+        left the buffer, so the missile coasts). Called by `advance` after
+        each ghost step; tests may call it directly. `dt` is the sim's STEP
+        (passed in, not imported)."""
+        # Map enemy id -> proxy for this step (the buffer's current view).
+        by_id = {e.id: e for e in (enemies or [])}
+        for m in self.local_missiles:
+            # Re-resolve the target by the id the missile locked. m.target
+            # is the proxy it was launched at; its .id is the key.
+            tid = m.target.id if m.target is not None else None
+            m.update(dt, by_id.get(tid))
+        self.local_missiles = [m for m in self.local_missiles
+                               if m.life > 0]
 
     def advance(self, dt, inp, enemies=None):
         """Advance the ghost by real time `dt` (Session 7.1).
@@ -1331,6 +1498,9 @@ class PredictedShip:
             # fired at the moment of death would hang frozen in the air
             # until the respawn.
             self.step_local_beams(min(dt, MAX_FRAME_DT))
+            # 10.3b: a missile in flight at the moment of death coasts +
+            # ages out too (no enemies while dead — it can no longer home).
+            self.step_local_missiles(min(dt, MAX_FRAME_DT))
             return 0
         self._acc += min(dt, MAX_FRAME_DT)
         n = 0
@@ -1338,6 +1508,7 @@ class PredictedShip:
             self.step(TICK, inp, enemies=enemies)
             self.step_local_bullets(TICK)   # Session 7.3: advance + cull
             self.step_local_beams(TICK)     # 10.3a: age + cull
+            self.step_local_missiles(TICK, enemies)   # 10.3b: home + cull
             self._acc -= TICK
             n += 1
         return n

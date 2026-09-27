@@ -380,12 +380,15 @@ def _snap_bullets(s):
     kind, owner, boost). At the snapshot itself (alpha 0/1) this is
     exactly what interp_positions must return for the 'bullets' key."""
     out = []
-    for kind, idx, boost_field in (("player", 2, None),
-                                   ("enemy", 3, None),
-                                   ("missile", 4, 6)):
+    # 10.3b: missile entries carry their unique id (field 8 of the missile
+    # snapshot); bullets carry None.
+    for kind, idx, boost_field, id_field in (("player", 2, None, None),
+                                             ("enemy", 3, None, None),
+                                             ("missile", 4, 6, 8)):
         for b in s[idx]:
             boost = b[boost_field] if boost_field is not None else 0.0
-            out.append((b[0], b[1], b[2], b[3], kind, b[4], boost))
+            mid = b[id_field] if id_field is not None else None
+            out.append((b[0], b[1], b[2], b[3], kind, b[4], boost, mid))
     return out
 
 
@@ -530,9 +533,10 @@ def id_oracle(prev_s, curr_s, alpha, dt=None):
     if dt is None:
         dt = SNAPSHOT_INTERVAL * (1.0 / 60.0)
     bullets = []
-    for kind, idx, boost_field in (("player", 2, None),
-                                   ("enemy", 3, None),
-                                   ("missile", 4, 6)):
+    # 10.3b: missile entries carry their unique id (field 8); bullets None.
+    for kind, idx, boost_field, id_field in (("player", 2, None, None),
+                                             ("enemy", 3, None, None),
+                                             ("missile", 4, 6, 8)):
         prev_list, curr_list = prev_s[idx], curr_s[idx]
         preds = [((p[0] + p[2] * dt, p[1] + p[3] * dt), i)
                  for i, p in enumerate(prev_list)]
@@ -555,7 +559,8 @@ def id_oracle(prev_s, curr_s, alpha, dt=None):
                 y = pp[1] + (c[1] - pp[1]) * a if 0.0 < a < 1.0 \
                     else (pp[1] if a == 0.0 else c[1])
             boost = c[boost_field] if boost_field is not None else 0.0
-            bullets.append((x, y, c[2], c[3], kind, c[4], boost))
+            mid = c[id_field] if id_field is not None else None
+            bullets.append((x, y, c[2], c[3], kind, c[4], boost, mid))
 
     return {
         # 10.1: ships carry the `dead` flag (ship_s[20]) too. 10.2: and

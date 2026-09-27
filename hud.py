@@ -57,3 +57,15 @@ def draw_game_over(screen, big_font, font):
     fs = font.render("press R to restart",
                      True, (200, 210, 225))
     screen.blit(fs, (WIDTH / 2 - fs.get_width() / 2, HEIGHT / 2 + 10))
+
+
+def draw_respawn(screen, big_font, font):
+    """10.1: the per-player death screen (2P). Shown to the DEAD player
+    only — the other player keeps playing. Mirrors draw_game_over's
+    layout, but the prompt is 'press R to respawn' (a per-player
+    respawn, not a full game restart)."""
+    go = big_font.render("SHIP DESTROYED", True, (255, 120, 90))
+    screen.blit(go, (WIDTH / 2 - go.get_width() / 2, HEIGHT / 2 - 40))
+    fs = font.render("press R to respawn",
+                     True, (200, 210, 225))
+    screen.blit(fs, (WIDTH / 2 - fs.get_width() / 2, HEIGHT / 2 + 10))

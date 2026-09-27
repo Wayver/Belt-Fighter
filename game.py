@@ -40,7 +40,7 @@ from .hulls import ENEMY_HULL, MOTE_HULL, enemy_loadout, mote_loadout
 
 from .fog import draw_fog, LightSource
 
-from .hud import draw_hud, draw_game_over
+from .hud import draw_hud, draw_game_over, draw_respawn
 from .camera import Camera
 from .netcode import SnapshotBuffer, PredictedShip
 from .config import (INTERP_DELAY, SNAPSHOT_INTERVAL, ROCK_FILL, ROCK_EDGE,
@@ -1027,6 +1027,9 @@ class Game:
             "compute_supply": p.compute_supply,
             "weapons": [(w.cooldown, w.charge, w.lock_progress)
                         for w in p.weapons],
+            # 10.1: per-player death — draw() shows the dead player the
+            # respawn screen (and skips the corpse's shield ring).
+            "dead": p.dead,
         }
 
     def handle_events(self, command_sink=None):
@@ -1780,7 +1783,9 @@ class Game:
                 standin = self._get_standin(i)
                 rpos, rangle = _draw_local_ship(screen, self.cam, standin,
                                                 pack, model["step_alpha"])
-                if model["protect_timer"] > 0:
+                # 10.1: a dead ship is a frozen wreck — no spawn-protection
+                # ring (it has no shield to protect).
+                if model["protect_timer"] > 0 and not pack["dead"]:
                     sh = self.shields[i]
                     ssx, ssy = self.cam.to_screen(rpos)
                     screen.blit(sh, (ssx - sh.get_width() // 2,
@@ -1805,7 +1810,12 @@ class Game:
                                     local_pack["contacts"])
         draw_hud(screen, self.font, model["enemies"], local_standin)
         if model["game_over"]:
+            # Single player (2P never sets the global flag): full game over.
             draw_game_over(screen, self.big_font, self.font)
+        elif model["players"][self.local_index]["dead"]:
+            # 10.1: per-player death — only the DEAD player sees the
+            # respawn screen; the other player keeps playing (no screen).
+            draw_respawn(screen, self.big_font, self.font)
         if DEBUG_COLLISION:
             local_standin.draw_collision(screen, self.cam)
             for e in model["enemies"]:
@@ -2072,6 +2082,12 @@ class Game:
         # initial spawn (the client never runs the sim), so both would be
         # wrong here.
         draw_hud(screen, self.font, pos['enemies'], self.ghost.ship)
+        # 10.1: per-player death — the dead player sees the respawn screen
+        # (the ghost is frozen while dead, so the world keeps rendering
+        # behind it and the other player's ship is still visible + moving).
+        # The OTHER player does not see it (their ghost is alive).
+        if self.ghost.ship.dead:
+            draw_respawn(screen, self.big_font, self.font)
         return pos
 
     # --- Session 7.2: full remote rendering helpers -------------------------

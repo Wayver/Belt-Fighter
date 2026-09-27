@@ -1182,7 +1182,20 @@ class PredictedShip:
         it (the host applies the latest received input each tick — the
         same rule). Returns the number of fixed steps taken (0 when the
         frame is shorter than one STEP of accumulated time).
+
+        10.1: a DEAD ghost does not advance. The host freezes a dead
+        ship (no movement, no firing — Game._step skips it), so the
+        authoritative snapshot of a dead ship is STATIC. Predicting a
+        static ship with the local input would race ahead and every
+        reconcile yank it back — the reported "freezing and snapping".
+        Freezing the ghost (no advance, no local-bullet steps) matches
+        authority exactly: the snap size is 0 while dead. The accumulator
+        is discarded (not kept) so the first advance after a respawn
+        starts clean from the fresh snapshot.
         """
+        if self._ship.dead:
+            self._acc = 0.0
+            return 0
         self._acc += min(dt, MAX_FRAME_DT)
         n = 0
         while self._acc >= TICK:

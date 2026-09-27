@@ -432,9 +432,19 @@ def run(res, impairment=None, label="clean", run_s=3.5):
         _FIRE_KEYS = _Keys({pygame.K_w: 1, pygame.K_SPACE: 1})
         for _ in range(3):
             client.predicted_view(0.016, _FIRE_KEYS)
-        check("client ghost fires local bullets (7.3)",
-              len(client.ghost.local_bullets) >= 1,
-              "n=%d" % len(client.ghost.local_bullets))
+        # 10.1: a DEAD ghost is frozen (no prediction, no firing) — the
+        # client's ship can now die mid-run (per-player death keeps the
+        # sim running after a death, so the other ship can be destroyed).
+        # The freeze is the CORRECT behavior (test_10_1_death GHOST), so
+        # this fire check applies only while the ghost is alive.
+        if client.ghost.ship.dead:
+            check("client ghost is frozen while dead (10.1)",
+                  len(client.ghost.local_bullets) == 0,
+                  "n=%d (ghost dead)" % len(client.ghost.local_bullets))
+        else:
+            check("client ghost fires local bullets (7.3)",
+                  len(client.ghost.local_bullets) >= 1,
+                  "n=%d" % len(client.ghost.local_bullets))
 
         # Session 6.8: the buffer carries the remote ship's ANGLE as well as
         # its position, so the client can draw the remote hull at its

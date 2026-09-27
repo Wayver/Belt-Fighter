@@ -193,7 +193,91 @@ def main():
     assert g5.players[0].dead is False, "the sim thread must apply the command"
     print("PASS: SIM-THREAD — the 'respawn' command revives the ship")
 
-    print("ALL PASS: 10.1 Steps 1-2 (per-player death + respawn in the sim)")
+    # --- 8. GHOST: a dead ghost does not advance (no prediction -> no
+    #     snapping). The host freezes a dead ship, so the authoritative
+    #     snapshot is static; predicting it with local input would race
+    #     ahead and every reconcile yank it back. The ghost must freeze. ---
+    from .netcode import PredictedShip
+    from .ship import Ship
+    ghost = PredictedShip()
+    ghost.seed(Ship().snapshot())
+    # Baseline: an ALIVE ghost advances under thrust.
+    ghost._acc = 0.0
+    ghost.ship.pos = pygame.Vector2(WIDTH / 2, HEIGHT / 2)
+    ghost.ship.vel = pygame.Vector2(0, 0)
+    thrust = ShipInput(thrust_fwd=1.0)
+    for _ in range(30):
+        ghost.advance(STEP, thrust)
+    alive_moved = ghost.ship.pos.distance_to(
+        pygame.Vector2(WIDTH / 2, HEIGHT / 2))
+    assert alive_moved > 1.0, "alive ghost must advance under thrust"
+    # Now dead: the ghost must NOT advance (no prediction, no snap).
+    ghost.ship.dead = True
+    ghost._acc = 0.0
+    frozen = (ghost.ship.pos.x, ghost.ship.pos.y, ghost.ship.angle)
+    steps = 0
+    for _ in range(60):
+        steps += ghost.advance(STEP, thrust)
+    assert steps == 0, "a dead ghost must take 0 steps"
+    assert (ghost.ship.pos.x, ghost.ship.pos.y, ghost.ship.angle) == frozen, \
+        "a dead ghost must be frozen (no prediction -> no snapping)"
+    # Respawn: dead cleared + a fresh authoritative snapshot -> the ghost
+    # advances again from the new pose.
+    ghost.ship.dead = False
+    ghost.seed(Ship().snapshot())   # fresh authoritative pose
+    ghost._acc = 0.0
+    ghost.ship.pos = pygame.Vector2(WIDTH / 2, HEIGHT / 2)
+    ghost.ship.vel = pygame.Vector2(0, 0)
+    for _ in range(30):
+        ghost.advance(STEP, thrust)
+    assert ghost.ship.pos.distance_to(
+        pygame.Vector2(WIDTH / 2, HEIGHT / 2)) > 1.0, \
+        "a respawned ghost must advance again"
+    print("PASS: GHOST — a dead ghost is frozen (no prediction -> no snap)")
+
+    # --- 9. MODEL + DRAW: the dead flag reaches the render model, and
+    #     draw() shows the respawn screen ONLY to the dead player ---
+    def center_pixels(s):
+        r = s.get_rect()
+        cx, cy = r.w // 2, r.h // 2
+        return pygame.image.tostring(
+            s.subsurface(cx - 120, cy - 60, 240, 120), "RGB")
+    g6 = make_game(screen, font, big_font, light_tex, fog_surf, light_surf,
+                   SEED, players=2)
+    for _ in range(10):
+        g6._step(STEP, IDLE)
+    g6.protect_timer = 0.0
+    # Baseline: both alive -> no screen.
+    g6.players[0].dead = False
+    g6.players[1].dead = False
+    g6.cam.pos = pygame.Vector2(WIDTH / 2, HEIGHT / 2)
+    m_alive = g6.render_model()
+    assert m_alive["players"][0]["dead"] is False
+    g6.draw(0.016, model=m_alive)
+    center_alive = center_pixels(screen)
+    # Local (player 0) dead -> the respawn screen is drawn.
+    g6.players[0].dead = True
+    g6.cam.pos = pygame.Vector2(WIDTH / 2, HEIGHT / 2)
+    m_dead = g6.render_model()
+    assert m_dead["players"][0]["dead"] is True
+    g6.draw(0.016, model=m_dead)
+    center_dead = center_pixels(screen)
+    assert center_dead != center_alive, \
+        "respawn screen must be drawn for the dead local player"
+    # Remote (player 1) dead, local alive -> NO screen (the other player
+    # keeps playing). The center is back to the alive baseline.
+    g6.players[0].dead = False
+    g6.players[1].dead = True
+    g6.cam.pos = pygame.Vector2(WIDTH / 2, HEIGHT / 2)
+    m_remote = g6.render_model()
+    assert m_remote["players"][1]["dead"] is True
+    g6.draw(0.016, model=m_remote)
+    center_remote = center_pixels(screen)
+    assert center_remote == center_alive, \
+        "no screen for the alive local player (the other keeps playing)"
+    print("PASS: MODEL+DRAW — the respawn screen shows only to the dead player")
+
+    print("ALL PASS: 10.1 Steps 1-4 (per-player death + respawn + ghost freeze + screen)")
 
 
 if __name__ == "__main__":

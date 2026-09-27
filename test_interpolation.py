@@ -361,7 +361,9 @@ def snap_positions(s):
     indices 2/3/4 are the player/enemy/missile projectile lists)."""
     return {
         # 10.1: ships carry the `dead` flag (ship_s[20]) too.
-        'ships': [(p[0], p[1], p[4], p[20]) for p in s[0]],
+        # 10.2: ships also carry shield_dump (ship_s[6]) + shield_clock
+        # (ship_s[7]) so the remote ship's impact flash renders.
+        'ships': [(p[0], p[1], p[4], p[20], p[6], p[7]) for p in s[0]],
         'enemies': [(tag, e_s[0][0], e_s[0][1], e_s[0][4],
                      e_s[0][2], e_s[0][3], e_s[2]) for tag, e_s in s[1]],
         'asteroids': [(a_s[1], a_s[2]) for a_s in s[5]],
@@ -454,6 +456,28 @@ def id_oracle(prev_s, curr_s, alpha, dt=None):
                 pp[1] + (cp[1] - pp[1]) * a,
                 pp[2] + da * a)
 
+    def mix_scalar(pp, cp):
+        # 10.2: endpoint-exact scalar lerp (same rules as mix/mix_pose) —
+        # used for the ship's shield_dump / shield_clock.
+        if a == 0.0:
+            return cp if pp is None else pp
+        if a == 1.0:
+            return cp
+        if pp is None:
+            return cp
+        return pp + (cp - pp) * a
+
+    def mix_ship(pp, c):
+        # 10.2: full ships entry (x, y, angle, dead, s_dump, s_clock).
+        # pp = prev (x, y, angle, s_dump, s_clock) or None; c = the curr
+        # ship snapshot. Pose via mix_pose, dead from curr (membership
+        # follows curr), shield state via mix_scalar.
+        pose = mix_pose((pp[0], pp[1], pp[2]) if pp is not None else None,
+                        (c[0], c[1], c[4]))
+        return (pose[0], pose[1], pose[2], c[20],
+                mix_scalar(None if pp is None else pp[3], c[6]),
+                mix_scalar(None if pp is None else pp[4], c[7]))
+
     prev_e = {}
     for _tag, p in prev_s[1]:
         es = p[0]
@@ -486,8 +510,10 @@ def id_oracle(prev_s, curr_s, alpha, dt=None):
                         t[0][2], t[0][3], _eid(t)))
     # Player ships are matched by INDEX (Session 6.1) — ships don't turn
     # over, so slot i of curr_s[0] is the same ship as slot i of prev_s[0].
-    # Pose = (x, y, raw angle) (Session 6.8).
-    prev_ships = {i: (p[0], p[1], p[4]) for i, p in enumerate(prev_s[0])}
+    # Pose = (x, y, raw angle) (Session 6.8). 10.2: the prev ship also
+    # carries (shield_dump, shield_clock) = (p[6], p[7]).
+    prev_ships = {i: (p[0], p[1], p[4], p[6], p[7])
+                  for i, p in enumerate(prev_s[0])}
 
     # Projectiles: predicted-position matching, written independently of
     # netcode._match_bullets (same rule, different code — so a bug in
@@ -523,9 +549,10 @@ def id_oracle(prev_s, curr_s, alpha, dt=None):
             bullets.append((x, y, c[2], c[3], kind, c[4], boost))
 
     return {
-        # 10.1: ships carry the `dead` flag (ship_s[20]) too — appended to
-        # the (x, y, angle) pose mix_pose returns.
-        'ships': [mix_pose(prev_ships.get(i), (c[0], c[1], c[4])) + (c[20],)
+        # 10.1: ships carry the `dead` flag (ship_s[20]) too. 10.2: and
+        # shield_dump (ship_s[6]) + shield_clock (ship_s[7]) — mix_ship
+        # builds the full (x, y, angle, dead, s_dump, s_clock) entry.
+        'ships': [mix_ship(prev_ships.get(i), c)
                   for i, c in enumerate(curr_s[0])],
         'enemies': enemies,
         'asteroids': [mix(prev_r.get(_akey(t)), (t[1], t[2]))

@@ -19,11 +19,12 @@ id) so interpolation survives entity turnover — see `interp_positions`
 for the membership rules.
 
 Player ships carry their ANGLE too (Session 6.8): the buffer returns
-(x, y, angle, dead) per ship, with the angle lerp'd the same way
-`Ship.sync_render` does (the wrapped delta, via `lerp_angle`), so the
-remote peer can draw the remote hull at its interpolated orientation
-instead of a dot. The `dead` flag (Session 10.1) lets the remote peer
-skip a dead ship (it disappears until it respawns) and spawn a
+(x, y, angle, dead, shield_dump, shield_clock) per ship, with the angle
+lerp'd the same way `Ship.sync_render` does (the wrapped delta, via
+`lerp_angle`), so the remote peer can draw the remote hull at its
+interpolated orientation instead of a dot. The `dead` flag (Session
+10.1) lets the remote peer skip a dead ship (it disappears until it
+respawns) and spawn a
 client-side explosion on the alive->dead transition.
 
 Session 7.2 (full remote rendering): enemies carry their ANGLE, TAG,
@@ -681,7 +682,7 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
     is clamped (never extrapolate into the future). Returns a plain dict —
     no pygame objects, no sim state touched:
 
-        {'ships': [(x, y, angle, dead), ...],
+        {'ships': [(x, y, angle, dead, shield_dump, shield_clock), ...],
          'enemies': [(tag, x, y, angle, vx, vy, id), ...],
          'asteroids': [(x, y), ...],
          'bullets': [(x, y, vx, vy, kind, owner, boost), ...]}
@@ -690,6 +691,16 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
     from the CURRENT snapshot (membership follows curr). The remote peer
     uses it to skip drawing a dead ship (it disappears until it respawns)
     and to spawn a client-side explosion on the alive->dead transition.
+
+    Ships also carry their shield-impact state (Session 10.2):
+    shield_dump (ship_s[6]) and shield_clock (ship_s[7]), LERP'd between
+    the two snapshots like the pose. These drive the shield-impact flash
+    (Ship._draw_shield: the blue->white glow that appears when the shield
+    is struck). The client's own ship (the ghost) already shows its flash
+    (a real Ship, restored on reconcile); the REMOTE ship is drawn via
+    Ship.draw too, so feeding it the buffer's shield state makes its
+    impact flash render identically to the host's. No wire change — both
+    fields are already in the ship snapshot.
 
     Ships carry their angle (Session 6.8): ship_s[4] is the RAW unbounded
     angle (see Ship.snapshot), so it is lerp'd with `lerp_angle` — the
@@ -756,18 +767,24 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
     # on the alive->dead transition. It is taken from the CURRENT snapshot
     # (membership follows curr) — a dead ship's pose is static, so only the
     # flag, not the pose, changes at the death.
-    prev_ships = {i: (p[0], p[1], p[4]) for i, p in enumerate(prev_s[0])}
+    # The prev ship carries (x, y, angle, shield_dump, shield_clock) — the
+    # shield state (10.2) is lerp'd with the pose so the remote ship's
+    # impact flash fades smoothly across the window.
+    prev_ships = {i: (p[0], p[1], p[4], p[6], p[7])
+                  for i, p in enumerate(prev_s[0])}
     ships = []
     for i, c in enumerate(curr_s[0]):
-        cp = (c[0], c[1], c[4])
+        cp = (c[0], c[1], c[4], c[6], c[7])
         pp = prev_ships.get(i)
         if pp is None:
-            ships.append((cp[0], cp[1], cp[2], c[20]))
+            ships.append((cp[0], cp[1], cp[2], c[20], cp[3], cp[4]))
         else:
             ships.append((lerp(pp[0], cp[0], a),
                           lerp(pp[1], cp[1], a),
                           lerp_angle(pp[2], cp[2], a),
-                          c[20]))
+                          c[20],
+                          lerp(pp[3], cp[3], a),
+                          lerp(pp[4], cp[4], a)))
 
     # Enemies (Session 7.2): carry (tag, x, y, angle, vx, vy). The angle
     # is lerp'd with lerp_angle (the same wrapped-delta rule as player
@@ -895,7 +912,7 @@ class SnapshotBuffer:
         """Interpolated positions at render time `render_t`.
 
         Returns the same dict shape as `interp_positions`
-        ({'ships': [(x, y, angle, dead), ...],
+        ({'ships': [(x, y, angle, dead, shield_dump, shield_clock), ...],
         'enemies': [(tag, x, y, angle, vx, vy, id), ...],
         'asteroids': [(x, y), ...],
         'bullets': [(x, y, vx, vy, kind, owner, boost), ...]}) or None

@@ -1902,10 +1902,14 @@ class Game:
         # Session 6.8: each is drawn as its REAL hull at the interpolated
         # (pos, angle) — the buffer lerps the angle with lerp_angle —
         # instead of a dot. 10.1: the entry is (x, y, angle, dead); a dead
-        # ship is not drawn (it disappears until it respawns).
-        for i, (x, y, ang, dead) in enumerate(pos['ships']):
+        # ship is not drawn (it disappears until it respawns). 10.2: the
+        # entry also carries (shield_dump, shield_clock) — fed to the ship
+        # so its impact flash renders (mirrors predicted_view).
+        for i, (x, y, ang, dead, s_dump, s_clock) in enumerate(pos['ships']):
             if dead:
                 continue
+            self.players[i].shield_dump = s_dump
+            self.players[i].shield_clock = s_clock
             self.players[i].draw(screen, self.cam,
                                  pygame.Vector2(x, y), ang)
 
@@ -2051,7 +2055,14 @@ class Game:
         # the alive->dead transition the client spawns its OWN explosion
         # burst (the client never runs the sim, so it never sees the
         # host's authoritative `burst()`).
-        for i, (x, y, ang, dead) in enumerate(pos['ships']):
+        # 10.2: the entry also carries the remote ship's shield-impact
+        # state (shield_dump, shield_clock — lerp'd across the window).
+        # The remote ship is drawn via Ship.draw, which renders the
+        # shield-impact flash (Ship._draw_shield) from those two fields —
+        # so feeding them here makes the remote ship's blue->white impact
+        # flash render the same way the host's does (the client's own
+        # ship already shows its flash via the ghost).
+        for i, (x, y, ang, dead, s_dump, s_clock) in enumerate(pos['ships']):
             if i == self.local_index:
                 continue
             if dead:
@@ -2060,6 +2071,8 @@ class Game:
                 self.players[i].dead = True
                 continue
             self.players[i].dead = False
+            self.players[i].shield_dump = s_dump
+            self.players[i].shield_clock = s_clock
             self.players[i].draw(screen, self.cam,
                                  pygame.Vector2(x, y), ang)
 

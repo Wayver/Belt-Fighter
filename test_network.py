@@ -465,10 +465,12 @@ def run(res, impairment=None, label="clean", run_s=3.5):
             # 10.1: the buffer's ships entry is (x, y, angle, dead) — the
             # dead flag lets the client skip a dead ship + spawn a
             # client-side explosion on the alive->dead transition.
-            check("buffer ships entry is (x, y, angle, dead)",
-                  isinstance(entry, tuple) and len(entry) == 4,
+            # 10.2: it also carries (shield_dump, shield_clock) so the
+            # remote ship's shield-impact flash renders.
+            check("buffer ships entry is (x, y, angle, dead, s_dump, s_clock)",
+                  isinstance(entry, tuple) and len(entry) == 6,
                   "got %r" % (entry,))
-            if isinstance(entry, tuple) and len(entry) == 4:
+            if isinstance(entry, tuple) and len(entry) == 6:
                 da = abs((entry[2] - host.players[0].angle + math.pi)
                          % (2 * math.pi) - math.pi)
                 check("buffer ship angle tracks the authoritative angle (6.8)",

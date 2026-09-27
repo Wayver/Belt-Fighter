@@ -65,7 +65,7 @@ __all__ = [
     "Connection", "Host", "connect",
     "do_handshake_client", "do_handshake_host",
     "NetWorker",
-    "T_JOIN", "T_WELCOME", "T_INPUT", "T_SNAP",
+    "T_JOIN", "T_WELCOME", "T_INPUT", "T_SNAP", "T_RESPAWN",
 ]
 
 # 4-byte big-endian unsigned length prefix.
@@ -78,6 +78,11 @@ T_JOIN = "join"
 T_WELCOME = "welcome"
 T_INPUT = "input"
 T_SNAP = "snap"
+# 10.1: the client asks the host to respawn ITS ship (player 1) after a
+# per-player death. The host applies it on the sim thread (respawn_player
+# is a no-op unless that ship is actually dead, so a spammy client is
+# harmless).
+T_RESPAWN = "respawn"
 
 
 # --- framing: pure byte functions (no socket) -----------------------------

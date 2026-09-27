@@ -141,7 +141,59 @@ def main():
     assert g3.game_over is True, "single player death must still end the game"
     print("PASS: SP-UNCHANGED — single player death still sets game_over")
 
-    print("ALL PASS: 10.1 Step 1 (per-player death in the sim)")
+    # --- 6. RESPAWN: respawn_player(i) revives ONE ship, leaves the rest ---
+    g4 = make_game(screen, font, big_font, light_tex, fog_surf, light_surf,
+                   SEED, players=2)
+    g4.players[1].pos = pygame.Vector2(WIDTH / 2 + 300, HEIGHT / 2)
+    g4.protect_timer = 0.0
+    q0, q1 = g4.players
+    q0.shield_charge = 1.0
+    g4._handle_ship_hit(q0, q0.pos)   # absorb
+    g4._handle_ship_hit(q0, q0.pos)   # lethal
+    assert q0.dead is True
+    # Record the world + the other player before the respawn.
+    p1_before = pose(q1)
+    rocks_before = tuple(sorted((round(a.pos.x, 3), round(a.pos.y, 3), a.size)
+                                for a in g4.asteroids))
+    enemies_before = len(g4.enemies)
+    g4.respawn_player(0)
+    assert q0.dead is False, "respawn must clear the dead flag"
+    assert round(q0.pos.x, 3) == WIDTH / 2 and round(q0.pos.y, 3) == HEIGHT / 2
+    assert q0.shield_charge == q0.shield_comp.shield_max_charge
+    assert g4.protect_timer == SPAWN_PROTECT
+    assert pose(q1) == p1_before, "respawn must not touch the other player"
+    rocks_after = tuple(sorted((round(a.pos.x, 3), round(a.pos.y, 3), a.size)
+                               for a in g4.asteroids))
+    assert rocks_after == rocks_before, "respawn must not touch the world"
+    assert len(g4.enemies) == enemies_before
+    # No-op on a live ship (a stray R is harmless).
+    p1_live = pose(q1)
+    g4.respawn_player(1)
+    assert pose(q1) == p1_live and q1.dead is False
+    print("PASS: RESPAWN — one ship revives, the world + other player untouched")
+
+    # --- 7. SIM-THREAD: the 'respawn' command routes to respawn_player ---
+    from .sim_thread import SimThread
+    g5 = make_game(screen, font, big_font, light_tex, fog_surf, light_surf,
+                   SEED, players=2)
+    g5.players[0].shield_charge = 1.0
+    g5._handle_ship_hit(g5.players[0], g5.players[0].pos)
+    g5._handle_ship_hit(g5.players[0], g5.players[0].pos)
+    assert g5.players[0].dead is True
+    st = SimThread(g5, worker=None)
+    st.start()
+    st.command("respawn", 0)
+    # The sim thread applies commands at the top of its next iteration
+    # (~1 ms); poll for it.
+    import time
+    deadline = time.monotonic() + 2.0
+    while g5.players[0].dead and time.monotonic() < deadline:
+        time.sleep(0.005)
+    st.stop()
+    assert g5.players[0].dead is False, "the sim thread must apply the command"
+    print("PASS: SIM-THREAD — the 'respawn' command revives the ship")
+
+    print("ALL PASS: 10.1 Steps 1-2 (per-player death + respawn in the sim)")
 
 
 if __name__ == "__main__":

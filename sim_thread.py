@@ -122,13 +122,14 @@ class SimThread:
         input sampling."""
         self._latest_input = inp
 
-    def command(self, name):
+    def command(self, name, arg=None):
         """Enqueue one sim command (render thread). `name` is one of
-        'targeting' (T), 'sensor' (V), 'scan' (G), 'reset' (R/F). The
-        sim thread applies it at the top of its next iteration, before
-        stepping. QUIT/ESC and F3 never come here — they stay on the
-        render thread (exit + render diagnostic)."""
-        self._commands.put(name)
+        'targeting' (T), 'sensor' (V), 'scan' (G), 'reset' (R/F), or
+        'respawn' (10.1, R while the local player is dead — `arg` is the
+        player index). The sim thread applies it at the top of its next
+        iteration, before stepping. QUIT/ESC and F3 never come here —
+        they stay on the render thread (exit + render diagnostic)."""
+        self._commands.put((name, arg))
 
     def start(self):
         """Launch the sim thread. Call once, after the Game is fully
@@ -151,13 +152,15 @@ class SimThread:
             self._thread = None
 
     # -- sim thread ---------------------------------------------------------
-    def _apply_command(self, name):
+    def _apply_command(self, cmd):
         """Apply one render-thread command to the sim (sim thread only).
 
+        `cmd` is a (name, arg) pair (arg is None for all but 'respawn').
         Mirrors the KEYDOWN branches of Game.handle_events EXACTLY
         (same game_over gating) — only the thread moved. `self.ship`
         is players[0] (the host's own ship), so the mapping is
         1:1 with the old in-loop code."""
+        name, arg = cmd
         g = self._game
         if name == "targeting" and not g.game_over:
             g.ship.targeting_on = not g.ship.targeting_on
@@ -169,6 +172,11 @@ class SimThread:
             g.ship.fire_scan()
         elif name == "reset" and g.test_mode:
             g.reset()
+        elif name == "respawn":
+            # 10.1: per-player death — respawn the local player's ship
+            # (a no-op unless it is actually dead, so a stray R is
+            # harmless). The world + the other player are untouched.
+            g.respawn_player(arg)
 
     def _run(self):
         g = self._game

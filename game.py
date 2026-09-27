@@ -598,6 +598,10 @@ class Game:
         self.debug_net = False
         self.last_snap_px = 0.0
         self.snap_count = 0
+        # 10.1: the client's R key (per-player death) sets this; the client
+        # loop (run_client) drains it and sends a T_RESPAWN to the host.
+        # Inert on the host (it routes R to the sim thread instead).
+        self._respawn_requested = False
         self.reset()
 
     @property
@@ -1049,11 +1053,30 @@ class Game:
                         command_sink("targeting")
                     else:
                         self.ship.targeting_on = not self.ship.targeting_on
-                elif event.key == pygame.K_r and self.game_over:
-                    if command_sink is not None:
-                        command_sink("reset")
-                    else:
-                        self.reset()
+                elif event.key == pygame.K_r:
+                    if self.game_over:
+                        # Single player (2P never sets the global flag):
+                        # R is a full game reset.
+                        if command_sink is not None:
+                            command_sink("reset")
+                        else:
+                            self.reset()
+                    elif len(self.players) == 2:
+                        # 10.1: per-player death — the LOCAL player
+                        # respawns with R (like single player), leaving the
+                        # other player + world untouched. The host routes it
+                        # to the sim thread (command_sink); the client sets a
+                        # flag the run_client loop drains into a T_RESPAWN.
+                        if command_sink is not None:
+                            # Host: route to the sim thread (it no-ops
+                            # unless the ship is actually dead).
+                            command_sink("respawn", self.local_index)
+                        else:
+                            # Client: flag it; run_client drains it into a
+                            # T_RESPAWN. The host's respawn_player is a
+                            # no-op unless the ship is dead, so pressing R
+                            # while alive is harmless.
+                            self._respawn_requested = True
                 elif event.key == pygame.K_v and not self.game_over:
                     if command_sink is not None:
                         command_sink("sensor")

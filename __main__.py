@@ -30,7 +30,7 @@ from .net import (Host, connect, do_handshake_host, do_handshake_client,
                   serialize_snapshot, deserialize_snapshot,
                   serialize_input, deserialize_input,
                   NetWorker,
-                  T_INPUT, T_SNAP)
+                  T_INPUT, T_SNAP, T_RESPAWN)
 from .netcode import (PredictedShip, HostTimeEstimator, LatencyTracker,
                       RenderPoint)
 from .ship import Ship
@@ -324,6 +324,11 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
             for m in worker.poll():
                 if m.get("type") == T_INPUT:
                     game.set_remote_input(deserialize_input(m["inp"]))
+                elif m.get("type") == T_RESPAWN:
+                    # 10.1: the client's dead player asks to respawn.
+                    # The client is player 1; the sim thread applies it
+                    # (a no-op unless that ship is actually dead).
+                    sim_thread.command("respawn", 1)
             # Session 8.3: the worker owns the socket now — read
             # worker.closed (the worker mirrors conn.closed) and never
             # touch conn.* here. The worker also does the drain_send()
@@ -683,6 +688,13 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
         # LATEST received input each tick). Session 8.2: queued to the
         # worker (it flushes to the socket off the render thread).
         worker.send({"type": T_INPUT, "inp": serialize_input(inp)})
+        # 10.1: per-player death — R while the local ship is dead set
+        # game._respawn_requested in handle_events; send the respawn
+        # request to the host (it respawns player 1 — us — leaving the
+        # host's ship + world untouched).
+        if game._respawn_requested:
+            game._respawn_requested = False
+            worker.send({"type": T_RESPAWN})
         # Session 7.6: record the input in the ghost's rewind buffer,
         # stamped with the client's estimate of the host's sim clock at
         # this moment (the 7.1 HostTimeEstimator — the same clock the

@@ -215,9 +215,12 @@ def run(res, impairment=None, label="clean", run_s=3.5):
     # captures real reconciles. Per-run: reset at the top of run().
     snap_disps = []
     _orig_rewind = PredictedShip.reconcile_rewind
-    def _tracking_rewind(self, ship_s, snap_time, now):
+    def _tracking_rewind(self, ship_s, snap_time, now, enemies=None):
         before = (self.ship.pos.x, self.ship.pos.y)
-        _orig_rewind(self, ship_s, snap_time, now)
+        # 10.3a: forward the enemy proxies (the ghost's laser target is
+        # picked from them during the replay) — the wrapper must accept +
+        # pass through the new kwarg or the reconcile crashes.
+        _orig_rewind(self, ship_s, snap_time, now, enemies=enemies)
         after = (self.ship.pos.x, self.ship.pos.y)
         snap_disps.append(math.hypot(after[0] - before[0],
                                      after[1] - before[1]))

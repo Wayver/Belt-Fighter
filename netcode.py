@@ -63,6 +63,12 @@ from .config import (INTERP_DELAY, INTERP_DELAY_MIN, INTERP_DELAY_MAX,
 from .ship import Ship
 from .bullets import Bullet
 
+# 10.3a: the ghost's beam visuals age out at the host's beam ttl
+# (Game._step: `self.beams = [b for b in self.beams if b[4] < b[5]]`
+# with b[5] = 0.15). Mirrored here so the client's local beams fade on
+# the same clock as the host's.
+BEAM_TTL = 0.15
+
 __all__ = ["interp_positions", "lerp", "lerp_angle", "SnapshotBuffer",
            "PredictedShip", "HostTimeEstimator", "LatencyTracker",
            "RenderPoint"]
@@ -1016,6 +1022,14 @@ class PredictedShip:
     charge/lock power draw (which can flip the brownout latch). That power
     draw is exactly the drift the ghost is allowed to have — it is bounded
     by the test, not eliminated.
+
+    10.3a exception: `laser_target` is now picked from the caller's
+    `enemies` proxies (the interpolation buffer's enemy entries) when
+    given — the ghost charges + fires a beam on the same tick the host
+    does, and the fired beams are kept as presentation entries in
+    `self.local_beams` (world-space muzzle -> target, aged at the host's
+    0.15 s beam ttl). `missile_target` / `contacts` stay idle (10.3b /
+    10.3c).
     """
 
     # Session 7.6: how much host time of local input to keep for rewind
@@ -1054,6 +1068,13 @@ class PredictedShip:
         # ghost's own bullets as the local player's by construction).
         self.local_index = local_index
         self.local_bullets = []
+        # 10.3a: the ghost's OWN laser discharges, as presentation entries
+        # [start, end, age, ttl] in WORLD space (muzzle -> target). The
+        # client never runs the sim, so without this the player's own beam
+        # appears only when the host's next snapshot arrives (~100 ms
+        # later). Like local_bullets these are presentation only: no
+        # collision, no sim feedback.
+        self.local_beams = []
 
     @property
     def ship(self):
@@ -1103,13 +1124,20 @@ class PredictedShip:
         while self._input_buffer and self._input_buffer[0][0] < cutoff:
             self._input_buffer.pop(0)
 
-    def reconcile_rewind(self, ship_s, snap_time, now):
+    def reconcile_rewind(self, ship_s, snap_time, now, enemies=None):
         """Dead-reckoning reconcile (Session 7.6) — replaces the v1 full
         snap. Apply the authoritative ship snapshot taken at sim time
         `snap_time`, then REPLAY the local inputs the host applied between
         `snap_time` and `now`, so the ghost ends up at exactly
         `authority @ snap_time + local inputs since snap_time` — the
         100 ms of prediction is REBUILT, not snapped (pinned #4).
+
+        10.3a: `enemies` (a list of lightweight enemy proxies, see
+        `step`) is fed to each replayed step so the replayed laser
+        charge/lock state matches the host's (the host's replayed ticks
+        saw the live enemies in the wedge). The caller passes the
+        buffer's enemy proxies at the snapshot's render point; a None
+        (tests) replays with no targets — the pre-10.3a behavior.
 
         The replay mirrors the host's own tick loop: for each sim tick T
         from snap_time to now (step STEP), the host applies the LATEST
@@ -1155,10 +1183,11 @@ class PredictedShip:
             while j + 1 < len(buf) and buf[j + 1][0] <= t + 1e-9:
                 j += 1
             inp = buf[j][1] if j >= 0 else buf[0][1]
-            self.step(TICK, inp)
+            self.step(TICK, inp, enemies=enemies)
             self.step_local_bullets(TICK)
+            self.step_local_beams(TICK)
 
-    def step(self, dt, inp):
+    def step(self, dt, inp, enemies=None):
         """Advance the ghost ONE fixed step with the LOCAL input.
 
         `dt` is passed by the caller (the sim's STEP) because netcode.py
@@ -1170,10 +1199,22 @@ class PredictedShip:
         presentation `Bullet`s in `self.local_bullets` (capped at
         MAX_BULLETS, mirroring the host's world cap) so the player sees
         their own shots immediately instead of waiting ~100 ms for the
-        host's next snapshot. Beams and missiles are still discarded
-        (out of 7.3 scope — deferred). Call `step_local_bullets` after
-        `step` to advance + cull the list (the game loop does this via
-        `advance`).
+        host's next snapshot. Missiles are still discarded (10.3b). Call
+        `step_local_bullets` after `step` to advance + cull the list (the
+        game loop does this via `advance`).
+
+        10.3a: `enemies` is a list of lightweight enemy proxies (objects
+        exposing `.pos`) built by the caller from the interpolation
+        buffer's enemy entries. When given, the ghost's laser target is
+        picked from them (the SAME nearest-in-range math the host's
+        `_pick_laser_target` uses) so the ghost charges + fires a beam on
+        the same tick the host does. The BEAMS `s.update()` returns are
+        kept as presentation entries in `self.local_beams` (world-space
+        muzzle -> target), so the player sees their own beam immediately
+        instead of waiting ~100 ms for the host's next snapshot. Call
+        `step_local_beams` after `step` to age + cull the list. When
+        `enemies` is None (tests, or before the buffer has a window) the
+        laser target stays None — the pre-10.3a behavior.
 
         The game loop does NOT call this directly — it calls `advance`,
         which decides how many fixed steps a real frame warrants. Tests
@@ -1181,10 +1222,10 @@ class PredictedShip:
         """
         s = self._ship
         s.tracked = 0
-        s.laser_target = None
+        s.laser_target = self._pick_laser_target(s, enemies)
         s.missile_target = None
         s.contacts = []
-        shots, _beams, _missiles = s.update(dt, inp)
+        shots, beams, _missiles = s.update(dt, inp)
         # Keep the ghost's own gun shots (Session 7.3). The host's world
         # cap is MAX_BULLETS total; the ghost's list holds only the local
         # player's shots, so capping it at MAX_BULLETS is a faithful
@@ -1194,6 +1235,49 @@ class PredictedShip:
             if len(self.local_bullets) < MAX_BULLETS:
                 self.local_bullets.append(
                     Bullet(shot.pos, shot.vel, owner=shot.owner))
+        # 10.3a: keep the ghost's own laser discharges as presentation
+        # entries [start, end, age, ttl] in WORLD space. The host re-anchors
+        # its beams via a hull-local start + target_id because the RenderModel
+        # stores a hull-local start; the ghost's Beam already carries the
+        # world-space muzzle (beam.start) and target pos (beam.end), so the
+        # client draws it directly (no re-anchoring). A LIST (not tuple) so
+        # step_local_beams can age `b[2]` in place (mirrors the host's
+        # `self.beams` list-of-lists).
+        for beam in beams:
+            self.local_beams.append(
+                [beam.start.copy(), beam.end.copy(), 0.0, BEAM_TTL])
+
+    def _pick_laser_target(self, s, enemies):
+        """Nearest enemy proxy within the max laser range; None if no laser
+        is fitted or `enemies` is empty/None. Mirrors the host's
+        `Game._pick_laser_target` (nearest-in-range) so the ghost charges +
+        fires on the same tick the host does, given the same target in the
+        wedge. Reads only `.pos` off each proxy — the buffer's enemy
+        proxies expose that (10.3a shared plumbing)."""
+        if not enemies:
+            return None
+        max_range = max((w.comp.laser_range for w in s.weapons
+                         if w.comp.laser_range > 0), default=0.0)
+        if max_range <= 0:
+            return None
+        best, best_d = None, max_range
+        for e in enemies:
+            d = e.pos.distance_to(s.pos)
+            if d <= best_d:
+                best, best_d = e, d
+        return best
+
+    def step_local_beams(self, dt):
+        """Age the ghost's local beams by `dt` and cull the expired
+        (10.3a). Each entry is [start, end, age, ttl] (a list — age is
+        mutated in place). Mirrors the host's `for b in self.beams:
+        b[4] += dt` + `self.beams = [b for b in self.beams if b[4] <
+        b[5]]`. Called by `advance` after each ghost step; tests may
+        call it directly. `dt` is the sim's STEP (passed in, not
+        imported)."""
+        for b in self.local_beams:
+            b[2] += dt
+        self.local_beams = [b for b in self.local_beams if b[2] < b[3]]
 
     def step_local_bullets(self, dt):
         """Advance the ghost's local bullets by `dt` and cull the dead
@@ -1205,7 +1289,7 @@ class PredictedShip:
             b.update(dt)
         self.local_bullets = [b for b in self.local_bullets if b.life > 0]
 
-    def advance(self, dt, inp):
+    def advance(self, dt, inp, enemies=None):
         """Advance the ghost by real time `dt` (Session 7.1).
 
         Feeds `dt` into the fixed-step accumulator and steps the ghost
@@ -1222,6 +1306,13 @@ class PredictedShip:
         same rule). Returns the number of fixed steps taken (0 when the
         frame is shorter than one STEP of accumulated time).
 
+        10.3a: `enemies` (a list of lightweight enemy proxies from the
+        interpolation buffer, see `step`) is fed to every step this call
+        takes, so the ghost's laser target tracks the buffer's enemies
+        and the ghost fires a beam on the same tick the host does. The
+        ghost's local beams are aged + culled each step (mirrors the
+        host's beam ttl).
+
         10.1: a DEAD ghost does not advance. The host freezes a dead
         ship (no movement, no firing — Game._step skips it), so the
         authoritative snapshot of a dead ship is STATIC. Predicting a
@@ -1234,12 +1325,19 @@ class PredictedShip:
         """
         if self._ship.dead:
             self._acc = 0.0
+            # 10.3a: a beam is a 0.15 s flash — age + cull it even while
+            # the ghost is dead, mirroring the host (Game._step ages
+            # self.beams outside the game_over guard). Without this a beam
+            # fired at the moment of death would hang frozen in the air
+            # until the respawn.
+            self.step_local_beams(min(dt, MAX_FRAME_DT))
             return 0
         self._acc += min(dt, MAX_FRAME_DT)
         n = 0
         while self._acc >= TICK:
-            self.step(TICK, inp)
+            self.step(TICK, inp, enemies=enemies)
             self.step_local_bullets(TICK)   # Session 7.3: advance + cull
+            self.step_local_beams(TICK)     # 10.3a: age + cull
             self._acc -= TICK
             n += 1
         return n

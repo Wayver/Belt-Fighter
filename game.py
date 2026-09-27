@@ -107,6 +107,85 @@ class _RemoteEnemyProxy:
         return e0 + v * T + 0.5 * a * (T * T)
 
 
+class _GhostEnemyProxy:
+    """Lightweight enemy proxy for the prediction ghost's weapon targeting
+    (10.3a shared plumbing).
+
+    The ghost is a real Ship stepped with the local input, but the client
+    never runs the sim — it has no live AIEnemy list to target. The
+    interpolation buffer's enemy entries DO carry each enemy's
+    interpolated (pos, vel, angle, id, shield state), so predicted_view
+    builds one of these per buffer enemy each frame and feeds the list to
+    `ghost.advance` -> `step`. The ghost's laser target is picked from
+    them with the SAME nearest-in-range math the host's
+    `_pick_laser_target` uses, so the ghost charges + fires a beam on the
+    same tick the host does (the ghost's weapon state — charge/lock/
+    cooldown — is already synced via apply_snapshot on reconcile).
+
+    It exposes only what the ship's weapon math reads: `.pos` (the
+    interpolated world pos — `Ship._in_wedge` / `_laser_in_wedge` /
+    `_pick_laser_target` all read `t.pos`), `.id` (10.3b/c: matching a
+    specific enemy across frames), and a `.ship` stand-in whose
+    `power_used` / `power_idle_total` come from the buffer's enemy
+    signature fields (10.3c: the sensor-contact signature is
+    `power_used - power_idle_total`, computable client-side from the
+    snapshot). It is a plain object — never stepped, never fed to the
+    sim, and it does not touch the AIEnemy id counter (the same
+    construction reason as _RemoteEnemyProxy).
+    """
+
+    def __init__(self, pos, vel, angle, eid, power_used, power_idle_total):
+        self.pos = pos
+        self.vel = vel
+        self.angle = angle
+        self.id = eid
+        self._ship = _GhostEnemyShip(power_used, power_idle_total)
+
+    @property
+    def ship(self):
+        return self._ship
+
+    def lead_point(self, shooter_pos, bullet_speed, use_accel=True):
+        """Intercept solution — the same math as AIEnemy.lead_point /
+        _RemoteEnemyProxy.lead_point, using this proxy's pos/vel and a
+        zero accel (the buffer does not carry the enemy's smoothed
+        accel — a constant-velocity lead, the right order of accuracy
+        for a reticle). 10.3a: the targeting reticle reuses these
+        proxies (it used to build its own via _targeting_proxies), so
+        the proxy must expose lead_point too."""
+        e0 = self.pos
+        v = self.vel
+        d0 = (e0 - shooter_pos).length()
+        if d0 < 1:
+            return None
+        T = d0 / bullet_speed
+        for _ in range(6):
+            eT = e0 + v * T
+            T_new = (eT - shooter_pos).length() / bullet_speed
+            if T_new > TARGETING_MAX_LEAD:
+                return None
+            if abs(T_new - T) < 1e-3:
+                T = T_new
+                break
+            T = T_new
+        return e0 + v * T
+
+
+class _GhostEnemyShip:
+    """The `.ship` stand-in a _GhostEnemyProxy exposes (10.3a).
+
+    Only the sensor-contact signature fields matter: `power_used` and
+    `power_idle_total` (the host's `_update_contacts` reads
+    `e.ship.power_used - e.ship.power_idle_total`). Both come from the
+    buffer's enemy entry (the enemy's Ship snapshot fields 18/19 —
+    power_used / power_factor... see _ghost_enemy_proxies). Never
+    stepped, never fed to the sim."""
+
+    def __init__(self, power_used, power_idle_total):
+        self.power_used = power_used
+        self.power_idle_total = power_idle_total
+
+
 # --- Session 9.x M2a: model-driven WORLD render helpers -------------------
 #
 # The 9.x goal is for the render to stop reading live mutable sim state
@@ -1963,6 +2042,27 @@ class Game:
         if not self.ghost.seeded:
             self.ghost.seed(local_s)
         else:
+            # 10.3a: the rewind replay steps the ghost with the local
+            # inputs the host applied since the snapshot — and the host's
+            # replayed ticks saw the live enemies in the wedge, so the
+            # replay must see the buffer's enemies too (the laser target
+            # is picked from them each replayed step). Build the proxies
+            # from the buffer at the CURRENT render point (the newest
+            # window — the closest the client has to the host's live
+            # enemy list at the snapshot's time). None (no window yet)
+            # replays with no targets — the pre-10.3a behavior.
+            enemies = None
+            # render_point is only set on a real client Game (run_client /
+            # the 10.x tests); a bare Game (test_interpolation's part e)
+            # has none, so the replay runs with no targets — the
+            # pre-10.3a behavior.
+            rp = getattr(self, "render_point", None)
+            if rp is not None:
+                rp_now = rp.now()
+                if rp_now is not None:
+                    pos = self.snap_buf.positions_at(rp_now)
+                    if pos is not None:
+                        enemies = self._ghost_enemy_proxies(pos)
             # Session 7.8: measure the ghost's displacement ACROSS the
             # reconcile (the "snap size") for the net debug overlay + log.
             # With dead-reckoning rewind + identical input this is ~0; a
@@ -1970,7 +2070,8 @@ class Game:
             # flight input / clock error).
             _bx, _by = self.ghost.ship.pos.x, self.ghost.ship.pos.y
             self.ghost.reconcile_rewind(
-                local_s, sim_time, sim_time if now is None else now)
+                local_s, sim_time, sim_time if now is None else now,
+                enemies=enemies)
             self.last_snap_px = math.hypot(
                 self.ghost.ship.pos.x - _bx, self.ghost.ship.pos.y - _by)
             self.snap_count += 1
@@ -2023,20 +2124,15 @@ class Game:
         if host_time is not None:
             self.sim_time = host_time
 
-        inp = ShipInput.from_keys(keys)
-        self.ghost.advance(dt, inp)
-        # 10.1: advance + cull the client-side death bursts (presentation).
-        self._step_death_bursts(dt)
-
-        screen = self.screen
-        self.cam.update(dt, self.ghost.ship.pos, self.ghost.ship.vel,
-                        self.ghost.ship.dampening)
-        screen.fill(BG)
-        for x, y, r in self.stars:
-            sx = (x - self.cam.pos.x * 0.2) % WIDTH
-            sy = (y - self.cam.pos.y * 0.2) % HEIGHT
-            pygame.draw.circle(screen, STAR_COLOR, (sx, sy), r)
-
+        # 10.3a: the render point + buffer window are computed BEFORE the
+        # ghost advances, so the ghost can see the buffer's enemies while
+        # it steps (its laser target is picked from them — the ghost must
+        # fire a beam on the same tick the host does). Before 10.3a the
+        # advance ran first and the ghost stepped blind (no targets). The
+        # rp/pos early-returns move above the advance: the ghost now
+        # advances only when there is a render window. Behavior is
+        # unchanged — the waiting frames (no snapshot / no window) already
+        # returned None before the advance could run.
         # Session 7.5b: the render point is anchored on the buffer's
         # newest ARRIVED snapshot (newest stamp - adaptive delay, chased
         # at a bounded per-frame rate — netcode.RenderPoint), not on the
@@ -2052,6 +2148,27 @@ class Game:
             # the point is before the first snapshot): not enough data
             # to interpolate the remote entities.
             return None
+
+        # 10.3a: lightweight enemy proxies from the buffer's enemy entries
+        # (pos + vel + angle + id + shield state). Fed to the ghost's
+        # advance (laser target) and reused below for the targeting
+        # reticle (replaces the separate _targeting_proxies build — same
+        # proxies, one build per frame).
+        ghost_enemies = self._ghost_enemy_proxies(pos)
+
+        inp = ShipInput.from_keys(keys)
+        self.ghost.advance(dt, inp, enemies=ghost_enemies)
+        # 10.1: advance + cull the client-side death bursts (presentation).
+        self._step_death_bursts(dt)
+
+        screen = self.screen
+        self.cam.update(dt, self.ghost.ship.pos, self.ghost.ship.vel,
+                        self.ghost.ship.dampening)
+        screen.fill(BG)
+        for x, y, r in self.stars:
+            sx = (x - self.cam.pos.x * 0.2) % WIDTH
+            sy = (y - self.cam.pos.y * 0.2) % HEIGHT
+            pygame.draw.circle(screen, STAR_COLOR, (sx, sy), r)
 
         for (x, y) in pos['asteroids']:
             self._draw_remote_rock(screen, x, y)
@@ -2104,6 +2221,25 @@ class Game:
             self.players[i].draw(screen, self.cam,
                                  pygame.Vector2(x, y), ang)
 
+        # 10.3a: the player's OWN laser beams — the ghost's predicted beams,
+        # drawn BEFORE the local ship (mirrors the host's draw() order:
+        # beams, then ships). Each entry is (start, end, age, ttl) in
+        # WORLD space (muzzle -> target), so it is drawn directly — no
+        # re-anchoring (the host re-anchors via a hull-local start only
+        # because the RenderModel stores a hull-local start; the ghost's
+        # Beam already carries the world-space muzzle). Each entry is
+        # [start, end, age, ttl]. The end is the
+        # buffer enemy's pos at fire time, so the beam lands where the
+        # host's beam lands (the buffer's enemy pos ~ the host's at that
+        # instant). Same visual as the host's beam (LASER_COLOR line,
+        # width 2, fading over the ttl). Presentation only: no
+        # collision, no sim feedback.
+        for (start, end, age, ttl) in self.ghost.local_beams:
+            fade = 1.0 - age / ttl
+            c = tuple(int(ch * fade) for ch in LASER_COLOR)
+            pygame.draw.line(screen, c, self.cam.to_screen(start),
+                             self.cam.to_screen(end), 2)
+
         # The LOCAL ship, from the ghost (its own flame_mags render).
         # 10.1: the ghost is FROZEN while dead (advance() takes 0 steps),
         # so it does not snap. It is NOT drawn while dead (it disappears
@@ -2125,19 +2261,20 @@ class Game:
         # ~100 ms later when the host's next snapshot arrives. Drawn the
         # same way the host draws the local player's bullets (a
         # BULLET_COLOR dot at the bullet's position). Presentation only:
-        # no collision, no sim feedback. (Missiles/beams are deferred.)
+        # no collision, no sim feedback. (Beams are drawn above, 10.3a;
+        # missiles are 10.3b.)
         for b in self.ghost.local_bullets:
             s = self.cam.to_screen(b.pos)
             pygame.draw.circle(screen, BULLET_COLOR, (int(s.x), int(s.y)), 3)
 
         # Targeting reticle (Session 7.2): the client has no enemy list
-        # to target (it never runs the sim), so build lightweight proxies
-        # from the buffer's enemy entries (pos + vel from the
-        # interpolated data) and run the SAME lead math the host uses.
-        # The reticle leads from the GHOST (where the player is), not
-        # from the stale players[0]. The proxies are also the fog's
-        # reticle-light sources (below), so build them once.
-        proxies = (self._targeting_proxies(pos)
+        # to target (it never runs the sim), so run the SAME lead math
+        # the host uses against the buffer's enemy proxies. The reticle
+        # leads from the GHOST (where the player is), not from the stale
+        # players[0]. 10.3a: the proxies are the SAME ones built above
+        # for the ghost's laser target (one build per frame — they are
+        # also the fog's reticle-light sources below).
+        proxies = (ghost_enemies
                    if TARGETING_ASSIST and self.ghost.ship.targeting_on
                    else [])
         for e in proxies:
@@ -2375,6 +2512,38 @@ class Game:
                                      (p.pos.x, p.pos.y),
                                      (p.vel.x, p.vel.y),
                                      p.color, p.life, p.max_life)
+
+    def _ghost_enemy_proxies(self, pos):
+        """Lightweight enemy proxies from the buffer's enemy entries for
+        the prediction ghost's weapon targeting (10.3a shared plumbing).
+
+        Each buffer enemy entry is (tag, x, y, angle, vx, vy, id,
+        shield_dump, shield_clock) (10.2b). One _GhostEnemyProxy per
+        entry, built fresh each frame — presentation only, never stepped,
+        never fed to the sim. The proxy exposes `.pos` (the ghost's laser
+        target math reads only that — `Ship._in_wedge` /
+        `_pick_laser_target`), `.id` (10.3b/c: track a specific enemy
+        across frames), and a `.ship` stand-in with the power fields the
+        sensor-contact signature needs (10.3c).
+
+        The power fields are NOT in the buffer today: the enemy's Ship
+        snapshot carries power_factor (field 17) and the weapons tuple
+        (field 18), but NOT power_used / power_idle_total — the host's
+        `_update_contacts` reads `e.ship.power_used -
+        e.ship.power_idle_total` off the LIVE enemy, and that value is
+        not serialized. 10.3a (laser) needs only `.pos`, so the power
+        fields are 0.0 placeholders; 10.3c (sensor contacts) must
+        resolve this — either the signature is derivable from the
+        snapshot's power_factor + weapons tuple (client-side recompute)
+        or it needs a wire field (a plan change). See the 10.x plan note.
+        """
+        proxies = []
+        for (tag, x, y, ang, vx, vy, eid, _s_dump, _s_clock) \
+                in pos['enemies']:
+            proxies.append(_GhostEnemyProxy(
+                pygame.Vector2(x, y), pygame.Vector2(vx, vy),
+                ang, eid, 0.0, 0.0))
+        return proxies
 
     def _targeting_proxies(self, pos):
         """Lightweight targeting proxies from the buffer's enemy entries

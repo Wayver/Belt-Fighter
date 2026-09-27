@@ -687,6 +687,43 @@ class Game:
         spawn_enemy(self.enemies, self.ship, rng=self.rng)
         spawn_enemy(self.enemies, self.ship, rng=self.rng)
 
+    def respawn_player(self, i):
+        """Respawn ONE player's ship (Session 10.1, per-player death).
+
+        The dead ship comes back at center, idle, with a fresh shield and
+        weapons — the same per-ship reset `reset()` applies to every ship —
+        plus the SPAWN_PROTECT timer (the world is cleared of projectiles
+        so the respawn is not instant-killed, mirroring `reset`). The
+        WORLD (asteroids, enemies, the other player's ship) is UNTOUCHED:
+        this is a per-player respawn, not a game reset. No-op if the ship
+        is not dead (a live player pressing R does nothing).
+
+        The caller (the sim thread, via the 'respawn' command) must not
+        call this while `game_over` in single player — single player uses
+        the full `reset()` instead (the R key routes there)."""
+        p = self.players[i]
+        if not p.dead:
+            return
+        p.pos = pygame.Vector2(WIDTH / 2, HEIGHT / 2)
+        p.vel = pygame.Vector2(0, 0)
+        p.angle = -math.pi / 2
+        p.prev_pos = p.pos.copy()
+        p.prev_angle = p.angle
+        p.dead = False
+        p.reset_shield()
+        p.targeting_on = False
+        p.tracked = 0
+        p.reset_missiles()
+        p.reset_lasers()
+        p.reset_sensors()
+        # Clear the world's projectiles so the respawn is not
+        # instant-killed (mirrors reset(); presentation + hazard state).
+        self.bullets.clear()
+        self.enemy_bullets.clear()
+        self.beams.clear()
+        self.missiles.clear()
+        self.protect_timer = SPAWN_PROTECT
+
     # --- networking: whole-sim snapshot (see Ship.snapshot for the
     # ship-level classification) ---
     #
@@ -1079,6 +1116,13 @@ class Game:
             # is a 1-ship list, so this loop runs once with the local input —
             # bit-identical to the old single-ship path.
             for i, p in enumerate(self.players):
+                # 10.1: a dead ship is FROZEN — no movement, no firing, no
+                # targeting. It stays in the world (still drawn) but is no
+                # longer a collision target or an enemy target (see
+                # _collisions / _nearest_player). The OTHER player's ship
+                # keeps stepping, so a death is per-player, not global.
+                if p.dead:
+                    continue
                 p_inp = inp if i == 0 else self.remote_input
                 # Per-ship targeting (Session 6.2b): each player gets its own
                 # tracked count / laser target / missile target / sensor
@@ -1120,7 +1164,11 @@ class Game:
             
             self.protect_timer -= dt
             if not self.test_mode:
-                update_field(self.asteroids, [p.pos for p in self.players],
+                # 10.1: dead ships are frozen — pass only the ALIVE ships'
+                # positions to the field so it doesn't reflow around a
+                # corpse (the host's live code feeds every live ship).
+                update_field(self.asteroids,
+                             [p.pos for p in self.players if not p.dead],
                              dt, rng=self.rng)
 
         # Engine loop: on while the ship is alive and any fitted thruster
@@ -1177,8 +1225,15 @@ class Game:
 
     def _nearest_player(self, pos):
         """The player ship nearest to `pos` (Session 6.2a). Enemies target
-        the nearest player; with one player this is that player."""
-        return min(self.players,
+        the nearest player; with one player this is that player.
+        10.1: dead ships are not targeted — they are frozen, so an enemy
+        would waste its shots on a corpse. All players dead (2P, both
+        dead) falls back to the nearest ship so the enemies keep moving
+        instead of erroring."""
+        alive = [p for p in self.players if not p.dead]
+        if not alive:
+            alive = self.players
+        return min(alive,
                    key=lambda p: p.pos.distance_squared_to(pos))
 
     
@@ -1463,7 +1518,14 @@ class Game:
             # Throttled: 3 enemies can hit ~20/s; the ping is 0.3 s long.
             self._sfx_throttled("shield_hit", SFX_SHIELD_HIT_MIN_INTERVAL)
             return True
-        self.game_over = True
+        # 10.1: per-player death. The ship is marked dead (frozen — see
+        # _step); the game_over flag is set ONLY in single player (where
+        # one dead ship ends the game, as before). In 2P the OTHER player
+        # keeps playing — the dead player respawns with R (see
+        # respawn_player).
+        ship.dead = True
+        if len(self.players) == 1:
+            self.game_over = True
         burst(self.particles, ship.pos, 30, big=True, rng=self.rng)
         self._sfx("explosion")
         self._sfx("game_over")
@@ -1578,6 +1640,8 @@ class Game:
                 if b.life <= 0:
                     continue
                 for p in self.players:
+                    if p.dead:
+                        continue   # 10.1: a frozen corpse takes no hits
                     if p.shield_on:
                         if p.shield_contains(b.pos):
                             b.life = 0.0
@@ -1599,6 +1663,8 @@ class Game:
         # EACH player ship vs enemy (ram) — SAT on both hull polygons
         if self.protect_timer <= 0 and not self.game_over:
             for p in self.players:
+                if p.dead:
+                    continue   # 10.1: a frozen corpse takes no hits
                 for e in self.enemies:
                     if p.collision_overlaps_ship(e.ship):
                         if not self._handle_ship_hit(p, e.pos):
@@ -1609,6 +1675,8 @@ class Game:
         # EACH player ship vs asteroid — swept hull polygon vs circle
         if self.protect_timer <= 0 and not self.game_over:
             for p in self.players:
+                if p.dead:
+                    continue   # 10.1: a frozen corpse takes no hits
                 for a in self.asteroids:
                     if p.collision_swept_overlaps_circle(a.pos, a.collision_radius):
                         if not self._handle_ship_hit(p, a.pos):

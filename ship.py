@@ -177,6 +177,7 @@ class Ship:
         self.arcs = [] # presentation only: brownout lightning (pts, age, ttl)
         self.arc_clock = 0.0
         self.dampening = False
+        self.dead = False   # 10.1: per-player death (a dead ship is frozen)
         self.prev_pos = self.pos.copy()
         self.prev_angle = self.angle
         # exact collision shape: convex hull of the hull polygon, precomputed
@@ -385,6 +386,7 @@ class Ship:
             tuple((w.cooldown, w.charge, w.lock_progress)
                   for w in self.weapons),
             self.id,
+            self.dead,   # 10.1: per-player death
         )
 
     def sync_render(self, alpha):
@@ -400,7 +402,8 @@ class Ship:
          sensor_on,
          scan_cd, scan_reveal, scan_dump, scan_pulse,
          brownout, power_factor,
-         weapons, ship_id) = s
+         weapons, ship_id,
+         dead) = s   # 10.1: per-player death
         self.pos = pygame.Vector2(px, py)
         self.vel = pygame.Vector2(vx, vy)
         self.angle = a
@@ -422,6 +425,7 @@ class Ship:
             w.charge = charge
             w.lock_progress = lock_progress
         self.id = ship_id
+        self.dead = dead   # 10.1: per-player death
 
     # --- simulation: per-thruster pipeline ---
 

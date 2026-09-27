@@ -360,7 +360,8 @@ def snap_positions(s):
     angle, ship_s[4]; Session 7.2: enemies carry angle/tag/vel, and
     indices 2/3/4 are the player/enemy/missile projectile lists)."""
     return {
-        'ships': [(p[0], p[1], p[4]) for p in s[0]],
+        # 10.1: ships carry the `dead` flag (ship_s[20]) too.
+        'ships': [(p[0], p[1], p[4], p[20]) for p in s[0]],
         'enemies': [(tag, e_s[0][0], e_s[0][1], e_s[0][4],
                      e_s[0][2], e_s[0][3], e_s[2]) for tag, e_s in s[1]],
         'asteroids': [(a_s[1], a_s[2]) for a_s in s[5]],
@@ -522,7 +523,9 @@ def id_oracle(prev_s, curr_s, alpha, dt=None):
             bullets.append((x, y, c[2], c[3], kind, c[4], boost))
 
     return {
-        'ships': [mix_pose(prev_ships.get(i), (c[0], c[1], c[4]))
+        # 10.1: ships carry the `dead` flag (ship_s[20]) too — appended to
+        # the (x, y, angle) pose mix_pose returns.
+        'ships': [mix_pose(prev_ships.get(i), (c[0], c[1], c[4])) + (c[20],)
                   for i, c in enumerate(curr_s[0])],
         'enemies': enemies,
         'asteroids': [mix(prev_r.get(_akey(t)), (t[1], t[2]))
@@ -946,6 +949,14 @@ def main():
     g2 = PredictedShip()
     g1.seed(a.snapshot()[0][0])
     g2.seed(a.snapshot()[0][0])
+    # 10.1: the shared game's ship is DEAD by this point (the scripted
+    # input kills it during WARMUP->WARMUP+K), and 10.1's advance()
+    # freezes a dead ghost (0 steps). This check is about the ghost's
+    # FIXED-STEP ACCUMULATOR, not death, so seed an ALIVE ghost: clear
+    # the dead flag on both (the reference g2 is stepped via step(),
+    # which has no dead guard, but keep them symmetric and explicit).
+    g1.ship.dead = False
+    g2.ship.dead = False
     inp = ShipInput.from_keys(script_input(0))
     n_steps = 0
     for dt in frame_dts:
@@ -972,6 +983,9 @@ def main():
     # steps at most ~MAX_FRAME_DT/STEP times for it.
     g3 = PredictedShip()
     g3.seed(a.snapshot()[0][0])
+    # 10.1: seed an ALIVE ghost (the shared game's ship is dead by this
+    # point) so this actually exercises the dt clamp, not the dead-guard.
+    g3.ship.dead = False
     before = (g3.ship.pos.x, g3.ship.pos.y)
     n_hiccup = g3.advance(0.5, inp)
     after = (g3.ship.pos.x, g3.ship.pos.y)
@@ -1590,6 +1604,23 @@ def main():
     continuous = True
     outrun = False          # point past the newest snapshot (7.1 mode)
     hold_worst = 0.0        # |rp - anchor| on the converged hold window
+    # Session 7.10 (catch-up) updated the continuity bound. The 7.5b bound
+    # (STEP * 1.5) assumed the render point chases at <= 1x real time, but
+    # 7.10 added a BOUNDED catch-up: when the point is behind its target by
+    # more than ~5 frames it fast-forwards by CATCHUP * gap per frame (0.2)
+    # to close a large gap (a snapshot burst after a wire stall) in ~5
+    # frames instead of ~10. That is a DESIGNED, bounded fast-forward —
+    # not a teleport — so the per-frame advance bound must reflect it:
+    #   advance <= dt + CATCHUP * gap + delay_step
+    # where gap <= (INTERP_DELAY_MAX - INTERP_DELAY_MIN) (the delay's full
+    # range is the largest the target can jump) and delay_step is the
+    # LatencyTracker's per-frame delay movement. This stays tight (a real
+    # teleport, e.g. a jump to a far-future snapshot, still fails) while
+    # admitting the documented catch-up. (INTERP_DELAY_MAX/MIN are already
+    # imported at module scope.)
+    cont_bound = (STEP + RenderPoint.CATCHUP
+                  * (INTERP_DELAY_MAX - INTERP_DELAY_MIN)
+                  + LatencyTracker.MAX_STEP)
     ai = 0
     for i in range(490):                      # 8.17 s at 60 fps
         t = i / 60.0
@@ -1606,7 +1637,7 @@ def main():
         track2.append((t, rp))
         if len(track2) >= 2:
             adv = track2[-1][1] - track2[-2][1]
-            if adv > STEP * 1.5 + 1e-12:
+            if adv > cont_bound + 1e-12:
                 continuous = False
         newest = buf_k2.newest_time()
         if rp > newest + 1e-12:
@@ -1635,7 +1666,8 @@ def main():
     if (continuous and not outrun and hold_worst < 1e-9 and resumed
             and len(track2) > 400):
         print(f"PASS: render point stall — 250 ms stall + 10 ms burst: "
-              f"point continuous (<= STEP x 1.5 per frame), never "
+              f"point continuous (<= {cont_bound:.3f}s/frame, the 7.10 "
+              f"catch-up bound), never "
               f"outruns the newest snapshot, holds the last window "
               f"(worst {hold_worst:.1e} from the static anchor on the "
               f"no-arrival gap), resumed after the burst (advanced "

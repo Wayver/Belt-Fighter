@@ -462,16 +462,22 @@ def run(res, impairment=None, label="clean", run_s=3.5):
                   "no window/ship to inspect")
         else:
             entry = P['ships'][0]
-            check("buffer ships entry is (x, y, angle)",
-                  isinstance(entry, tuple) and len(entry) == 3,
+            # 10.1: the buffer's ships entry is (x, y, angle, dead) — the
+            # dead flag lets the client skip a dead ship + spawn a
+            # client-side explosion on the alive->dead transition.
+            check("buffer ships entry is (x, y, angle, dead)",
+                  isinstance(entry, tuple) and len(entry) == 4,
                   "got %r" % (entry,))
-            if isinstance(entry, tuple) and len(entry) == 3:
+            if isinstance(entry, tuple) and len(entry) == 4:
                 da = abs((entry[2] - host.players[0].angle + math.pi)
                          % (2 * math.pi) - math.pi)
                 check("buffer ship angle tracks the authoritative angle (6.8)",
                       da < 0.05,
                       "client=%.3f host=%.3f (d=%.4f rad)"
                       % (entry[2], host.players[0].angle, da))
+                check("buffer ships carry the dead flag (10.1)",
+                      isinstance(entry[3], bool),
+                      "dead=%r" % (entry[3],))
 
         # Session 7.2: the buffer carries what the client needs to draw
         # REAL remote enemies (tag, angle, vel, id — the D4 defect) and

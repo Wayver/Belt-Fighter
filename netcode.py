@@ -19,10 +19,12 @@ id) so interpolation survives entity turnover — see `interp_positions`
 for the membership rules.
 
 Player ships carry their ANGLE too (Session 6.8): the buffer returns
-(x, y, angle) per ship, with the angle lerp'd the same way
+(x, y, angle, dead) per ship, with the angle lerp'd the same way
 `Ship.sync_render` does (the wrapped delta, via `lerp_angle`), so the
 remote peer can draw the remote hull at its interpolated orientation
-instead of a dot.
+instead of a dot. The `dead` flag (Session 10.1) lets the remote peer
+skip a dead ship (it disappears until it respawns) and spawn a
+client-side explosion on the alive->dead transition.
 
 Session 7.2 (full remote rendering): enemies carry their ANGLE, TAG,
 VELOCITY, and ID too — (tag, x, y, angle, vx, vy, id) — so the remote
@@ -679,10 +681,15 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
     is clamped (never extrapolate into the future). Returns a plain dict —
     no pygame objects, no sim state touched:
 
-        {'ships': [(x, y, angle), ...],
+        {'ships': [(x, y, angle, dead), ...],
          'enemies': [(tag, x, y, angle, vx, vy, id), ...],
          'asteroids': [(x, y), ...],
          'bullets': [(x, y, vx, vy, kind, owner, boost), ...]}
+
+    Ships carry their `dead` flag too (Session 10.1): ship_s[20], taken
+    from the CURRENT snapshot (membership follows curr). The remote peer
+    uses it to skip drawing a dead ship (it disappears until it respawns)
+    and to spawn a client-side explosion on the alive->dead transition.
 
     Ships carry their angle (Session 6.8): ship_s[4] is the RAW unbounded
     angle (see Ship.snapshot), so it is lerp'd with `lerp_angle` — the
@@ -743,17 +750,24 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
     # prev_s[0] (shouldn't happen — ships don't turn over) pops in at its
     # curr pose, same rule as new enemies/asteroids. The angle is lerp'd
     # with lerp_angle (wrapped delta), not a plain lerp — see docstring.
+    # 10.1: the per-ship `dead` flag (ship_s[20]) is carried through the
+    # buffer so the remote peer can (a) skip drawing a dead ship (it
+    # "disappears" until it respawns) and (b) spawn a client-side explosion
+    # on the alive->dead transition. It is taken from the CURRENT snapshot
+    # (membership follows curr) — a dead ship's pose is static, so only the
+    # flag, not the pose, changes at the death.
     prev_ships = {i: (p[0], p[1], p[4]) for i, p in enumerate(prev_s[0])}
     ships = []
     for i, c in enumerate(curr_s[0]):
         cp = (c[0], c[1], c[4])
         pp = prev_ships.get(i)
         if pp is None:
-            ships.append(cp)
+            ships.append((cp[0], cp[1], cp[2], c[20]))
         else:
             ships.append((lerp(pp[0], cp[0], a),
                           lerp(pp[1], cp[1], a),
-                          lerp_angle(pp[2], cp[2], a)))
+                          lerp_angle(pp[2], cp[2], a),
+                          c[20]))
 
     # Enemies (Session 7.2): carry (tag, x, y, angle, vx, vy). The angle
     # is lerp'd with lerp_angle (the same wrapped-delta rule as player
@@ -881,7 +895,7 @@ class SnapshotBuffer:
         """Interpolated positions at render time `render_t`.
 
         Returns the same dict shape as `interp_positions`
-        ({'ships': [(x, y, angle), ...],
+        ({'ships': [(x, y, angle, dead), ...],
         'enemies': [(tag, x, y, angle, vx, vy, id), ...],
         'asteroids': [(x, y), ...],
         'bullets': [(x, y, vx, vy, kind, owner, boost), ...]}) or None

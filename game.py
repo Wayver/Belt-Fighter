@@ -25,7 +25,7 @@ from .config import (WIDTH, HEIGHT, SPAWN_PROTECT, MAX_BULLETS,
                     SCAN_DUMP_DECAY, DEBUG_COLLISION,
                     MISSILE_COLOR, MAX_MISSILES,
                     SFX_LASER_MIN_INTERVAL, SFX_ENEMY_LASER_MIN_INTERVAL,
-                    SFX_SHIELD_HIT_MIN_INTERVAL)
+                    SFX_SHIELD_HIT_MIN_INTERVAL, PARTICLE_COLORS)
 
 from .bullets import Bullet, EnemyBullet, Missile, MissileShot
 
@@ -602,6 +602,18 @@ class Game:
         # loop (run_client) drains it and sends a T_RESPAWN to the host.
         # Inert on the host (it routes R to the sim thread instead).
         self._respawn_requested = False
+        # 10.1: client-side death EXPLOSIONS. The client never runs the sim,
+        # so it never sees the host's `burst()` (the authoritative explosion
+        # particles). When a ship flips alive->dead in the buffer (the local
+        # ghost, or a remote ship), the client spawns its OWN presentation
+        # burst at the death pose so the ship "explodes" the way it does in
+        # single player, then disappears (the dead ship is not drawn).
+        # {(ship_index): [Particle, ...]} — presentation only, never synced.
+        self._death_bursts = {}
+        # 10.1: tracks the LOCAL ghost's dead state across frames so
+        # predicted_view can detect the alive->dead transition (to spawn
+        # the client-side explosion burst exactly once).
+        self._local_was_dead = False
         self.reset()
 
     @property
@@ -1780,6 +1792,12 @@ class Game:
         # loop is gated the same way.)
         if not model["game_over"]:
             for i, pack in enumerate(model["players"]):
+                # 10.1: a dead ship DISAPPEARS until it respawns (it is not
+                # drawn). The host already has the authoritative explosion
+                # particles (burst() in _handle_ship_hit), so it needs no
+                # client-side burst here.
+                if pack["dead"]:
+                    continue
                 standin = self._get_standin(i)
                 rpos, rangle = _draw_local_ship(screen, self.cam, standin,
                                                 pack, model["step_alpha"])
@@ -1882,8 +1900,11 @@ class Game:
         # All player ships (Session 6.1): the buffer's 'ships' list, by index.
         # Session 6.8: each is drawn as its REAL hull at the interpolated
         # (pos, angle) — the buffer lerps the angle with lerp_angle —
-        # instead of a dot.
-        for i, (x, y, ang) in enumerate(pos['ships']):
+        # instead of a dot. 10.1: the entry is (x, y, angle, dead); a dead
+        # ship is not drawn (it disappears until it respawns).
+        for i, (x, y, ang, dead) in enumerate(pos['ships']):
+            if dead:
+                continue
             self.players[i].draw(screen, self.cam,
                                  pygame.Vector2(x, y), ang)
 
@@ -1975,6 +1996,8 @@ class Game:
 
         inp = ShipInput.from_keys(keys)
         self.ghost.advance(dt, inp)
+        # 10.1: advance + cull the client-side death bursts (presentation).
+        self._step_death_bursts(dt)
 
         screen = self.screen
         self.cam.update(dt, self.ghost.ship.pos, self.ghost.ship.vel,
@@ -2022,15 +2045,37 @@ class Game:
         # lerp_angle, Session 6.8) — the remote peer knows the remote
         # hull from the join/welcome handshake, so self.players[i] IS
         # the remote ship's hull/loadout.
-        for i, (x, y, ang) in enumerate(pos['ships']):
+        # 10.1: the buffer entry is (x, y, angle, dead). A DEAD remote
+        # ship is NOT drawn (it disappears until it respawns) — and on
+        # the alive->dead transition the client spawns its OWN explosion
+        # burst (the client never runs the sim, so it never sees the
+        # host's authoritative `burst()`).
+        for i, (x, y, ang, dead) in enumerate(pos['ships']):
             if i == self.local_index:
                 continue
+            if dead:
+                if not self.players[i].dead:
+                    self._death_burst(i, pygame.Vector2(x, y))
+                self.players[i].dead = True
+                continue
+            self.players[i].dead = False
             self.players[i].draw(screen, self.cam,
                                  pygame.Vector2(x, y), ang)
 
         # The LOCAL ship, from the ghost (its own flame_mags render).
-        self.ghost.ship.draw(screen, self.cam,
-                             self.ghost.ship.pos, self.ghost.ship.angle)
+        # 10.1: the ghost is FROZEN while dead (advance() takes 0 steps),
+        # so it does not snap. It is NOT drawn while dead (it disappears
+        # until it respawns) — and on the alive->dead transition the
+        # client spawns its OWN explosion burst at the death pose.
+        if self.ghost.ship.dead:
+            if not self._local_was_dead:
+                self._death_burst(self.local_index,
+                                  pygame.Vector2(self.ghost.ship.pos))
+            self._local_was_dead = True
+        else:
+            self._local_was_dead = False
+            self.ghost.ship.draw(screen, self.cam,
+                                 self.ghost.ship.pos, self.ghost.ship.angle)
 
         # The player's OWN gun shots (Session 7.3): the ghost's predicted
         # bullets, drawn immediately at their predicted positions so the
@@ -2075,6 +2120,12 @@ class Game:
                 lights.append(LightSource(p, 50, 0.6))
         draw_fog(screen, self.ghost.ship, self.cam, self.light_tex,
                  self.fog_surf, self.light_surf, lights)
+
+        # 10.1: the client-side death explosions, drawn AFTER the fog so
+        # they are visible (the host draws its authoritative particles
+        # before the fog, but the client's fog would otherwise hide a
+        # burst behind the local light bubble).
+        self._draw_death_bursts(screen, self.cam)
 
         # HUD: the LOCAL (ghost) ship's power/shield/velocity, and the real
         # (interpolated) enemy count from the buffer. self.ship is players[0]
@@ -2219,6 +2270,60 @@ class Game:
             else:   # missile
                 lights.append(LightSource(pygame.Vector2(x, y), 30, 0.5))
         return lights
+
+    # --- 10.1: client-side death explosions --------------------------------
+    #
+    # The client never runs the sim, so it never sees the host's `burst()`
+    # (the authoritative explosion particles). When a ship flips alive->dead
+    # in the buffer (the local ghost, or a remote ship), the client spawns
+    # its OWN presentation burst at the death pose so the ship "explodes"
+    # the way it does in single player, then disappears (the dead ship is
+    # not drawn until it respawns). These are pure presentation: they are
+    # stepped/drawn only in predicted_view and never fed back into the sim.
+
+    def _death_burst(self, index, pos):
+        """Spawn a client-side explosion burst for ship `index` at world
+        `pos` (a Vector2). Mirrors the host's death `burst(..., big=True)`
+        (particles.py) so the client's explosion looks like the host's.
+        Only the LOCAL peer (the client) calls this — the host already has
+        the authoritative particles."""
+        from .particles import Particle
+        rng = random
+        n = 30
+        for _ in range(n):
+            a = rng.uniform(0, 2 * math.pi)
+            speed = rng.uniform(40, 160) * 1.5
+            vel = pygame.Vector2(math.cos(a) * speed, math.sin(a) * speed)
+            self._death_bursts.setdefault(index, []).append(
+                Particle(pos, vel, rng.choice(PARTICLE_COLORS),
+                         rng.uniform(0.4, 0.9)))
+
+    def _step_death_bursts(self, dt):
+        """Advance + cull the client-side death bursts (presentation only).
+        Called once per frame from predicted_view."""
+        if not self._death_bursts:
+            return
+        for index in list(self._death_bursts):
+            parts = self._death_bursts[index]
+            for p in parts:
+                p.update(dt)
+            parts = [p for p in parts if p.life > 0]
+            if parts:
+                self._death_bursts[index] = parts
+            else:
+                del self._death_bursts[index]
+
+    def _draw_death_bursts(self, screen, cam):
+        """Draw the client-side death bursts (mirrors _draw_world_particle).
+        Called from predicted_view AFTER the fog so the explosion is visible
+        (the host draws its particles before the fog, but the client's fog
+        would otherwise hide a burst behind the local light bubble)."""
+        for parts in self._death_bursts.values():
+            for p in parts:
+                _draw_world_particle(screen, cam,
+                                     (p.pos.x, p.pos.y),
+                                     (p.vel.x, p.vel.y),
+                                     p.color, p.life, p.max_life)
 
     def _targeting_proxies(self, pos):
         """Lightweight targeting proxies from the buffer's enemy entries

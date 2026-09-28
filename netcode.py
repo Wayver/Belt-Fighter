@@ -66,6 +66,7 @@ from .config import (INTERP_DELAY, INTERP_DELAY_MIN, INTERP_DELAY_MAX,
                     MISSILE_TURN_RATE, MISSILE_LIFE)
 from .ship import Ship
 from .bullets import Bullet
+from . import missile_telemetry as _mtel
 
 # 10.3a: the ghost's beam visuals age out at the host's beam ttl
 # (Game._step: `self.beams = [b for b in self.beams if b[4] < b[5]]`
@@ -927,6 +928,19 @@ class SnapshotBuffer:
             return None
         return self._snaps[-1][0]
 
+    def latest_snapshot(self):
+        """The newest snapshot in the buffer (None when empty).
+
+        10.3b fix: the ghost's handback decision needs the missile list
+        of the NEWEST snapshot — the one that actually carries a just-
+        launched missile — not just its missile_seq. The seq alone is
+        necessary but not sufficient: a missile the host launched after
+        the newest snapshot is provably NOT in the buffer yet, even
+        though its seq is below any future snapshot's seq."""
+        if not self._snaps:
+            return None
+        return self._snaps[-1][1]
+
     def push(self, sim_time, snap):
         """Record a snapshot taken at `sim_time`. Out-of-order arrivals are
         dropped (the remote render only ever moves forward in sim time)."""
@@ -1370,7 +1384,8 @@ class PredictedShip:
         # is the real limiter).
         for m in missiles:
             if len(self.local_missiles) < MAX_MISSILES:
-                mid = (self.local_index, s.missile_seq)
+                seq_before = s.missile_seq
+                mid = (self.local_index, seq_before)
                 s.missile_seq += 1
                 # 10.3b fix: the reconcile REWIND (reconcile_rewind) re-runs
                 # the fire tick after apply_snapshot has RESET missile_seq
@@ -1385,10 +1400,27 @@ class PredictedShip:
                 # the target and orbit it. Skip the re-fire when the id is
                 # already in flight (the prediction's copy is the fresher
                 # one — it has already integrated the host's flight).
-                if any(tuple(g.id) == mid for g in self.local_missiles):
+                guard = any(tuple(g.id) == mid for g in self.local_missiles)
+                if guard:
+                    # TELEMETRY (10.3b): a re-fire was SUPPRESSED. If the
+                    # suppressed id differs from the in-flight id, the seq
+                    # resync drifted — capture it.
+                    _mtel.log("FIRE", f_mid=_mtel.fmt_ids([mid]),
+                              f_seq_before=seq_before,
+                              f_seq_after=s.missile_seq, f_guard=1,
+                              f_local_ids=_mtel.fmt_ids(
+                                  (tuple(g.id) for g in self.local_missiles)))
                     continue
                 self.local_missiles.append(
                     GhostMissile(m.pos, m.vel, mid, target=m.target))
+                # TELEMETRY (10.3b): a GhostMissile was CREATED. This is the
+                # id the ghost will dedup + handback on. seq_before/after show
+                # the counter move; f_local_ids is the full in-flight set.
+                _mtel.log("FIRE", f_mid=_mtel.fmt_ids([mid]),
+                          f_seq_before=seq_before,
+                          f_seq_after=s.missile_seq, f_guard=0,
+                          f_local_ids=_mtel.fmt_ids(
+                              (tuple(g.id) for g in self.local_missiles)))
 
     def _pick_laser_target(self, s, enemies):
         """Nearest enemy proxy within the max laser range; None if no laser
@@ -1471,32 +1503,71 @@ class PredictedShip:
         self.local_missiles = [m for m in self.local_missiles
                                if m.life > 0]
 
-    def handback_missiles(self, host_seq):
+    def handback_missiles(self, host_seq, latest_missiles=None):
         """Hand the ghost's OWN missiles back to the buffer once the
-        snapshot that carries them has arrived (10.3b fix).
+        buffer's copy of each is VISIBLE (10.3b fix).
 
-        `host_seq` is the authoritative `missile_seq` from the snapshot
-        just received (ship snapshot field 21) — the number of missiles
-        the host had launched as of that snapshot. A ghost missile with
-        `seq < host_seq` was launched BEFORE the snapshot, so the buffer
-        carries the host's copy of it from now on: cull the ghost's copy
-        (the buffer's copy is drawn instead — and it is the one that
-        actually hits, because only the host's authoritative missile has
-        collision; the ghost's copy is presentation-only and would
-        otherwise pass through the target and orbit it for the rest of
-        MISSILE_LIFE). A ghost missile with `seq >= host_seq` was
-        launched AFTER the snapshot — the buffer does not carry it yet,
-        so keep it (it will be handed back by the NEXT snapshot).
+        A ghost missile is culled only when BOTH hold:
+          * `seq < host_seq` — the snapshot's authoritative
+            `missile_seq` (ship snapshot field 21) counts the missiles
+            the host had launched as of the snapshot, so a lower seq was
+            launched BEFORE the snapshot (the seq comparison is exact and
+            phase-free: it does not depend on the reconcile replay span
+            the way an age cutoff would); AND
+          * the buffer's NEWEST snapshot actually carries a missile with
+            this id (`latest_missiles` — the newest snapshot's missile
+            list, each entry's id at field 8; None when the buffer is
+            empty).
 
-        The seq comparison is exact and phase-free: it does not depend on
-        the reconcile replay span (how far `now` is ahead of the
-        snapshot) the way an age cutoff would. (If the host's copy had
-        already expired by the snapshot, the ghost's copy — same age —
-        would be dead too, so culling it is a no-op.)"""
-        self.local_missiles = [
-            m for m in self.local_missiles
-            if not (m.id is not None and m.id[0] == self.local_index
-                    and m.id[1] < host_seq)]
+        Why the second condition (the "disappears, then reappears" fix):
+        the snapshot that arrives right after a launch is the PRE-fire
+        one — the host snapshots every SNAPSHOT_INTERVAL ticks, so the
+        first snapshot to carry the missile arrives up to one interval
+        (~100 ms) later. The seq alone says "cull" the moment ANY
+        snapshot reports a higher seq, but the buffer's copy only becomes
+        drawable when the CARRYING snapshot enters the buffer — and the
+        render point (newest stamp - INTERP_DELAY) reaches it only
+        ~INTERP_DELAY after that. Culling on seq alone deleted the ghost
+        copy while the buffer's copy was still ~100-200 ms in the
+        future: the missile VANISHED, then REAPPEARED at the position
+        the carrying snapshot recorded (a "new nearby location"). With
+        the id check the ghost copy stays until the buffer's copy is
+        actually in the newest snapshot — the render then shows the
+        buffer's copy (the one that actually hits: only the host's
+        authoritative missile has collision; the ghost's copy is
+        presentation-only and would otherwise pass through the target
+        and orbit it for the rest of MISSILE_LIFE) from the very frame
+        the ghost copy stops drawing, so the missile appears continuous.
+
+        (If the host's copy had already expired by the snapshot, the
+        ghost's copy — same age — would be dead too, so culling it is a
+        no-op.)"""
+        if latest_missiles is None:
+            ids = None
+        else:
+            ids = {tuple(m[8]) for m in latest_missiles if m[8] is not None}
+        before = [tuple(m.id) for m in self.local_missiles
+                  if m.id is not None]
+        kept = []
+        culled = []
+        for m in self.local_missiles:
+            cull = (m.id is not None and m.id[0] == self.local_index
+                    and m.id[1] < host_seq
+                    and (ids is None or tuple(m.id) in ids))
+            if cull:
+                culled.append(tuple(m.id))
+            else:
+                kept.append(m)
+        self.local_missiles = kept
+        # TELEMETRY (10.3b): the handback decision. If a ghost missile was
+        # KEPT even though the buffer already carries its id (or vice
+        # versa), the dedup/handback pair is out of sync — that is the
+        # double-draw. h_culled lists the ids just removed.
+        _mtel.log("HANDBACK", h_host_seq=host_seq,
+                  h_buf_ids=_mtel.fmt_ids(sorted(ids)) if ids else "",
+                  h_before=_mtel.fmt_ids(before),
+                  h_after=_mtel.fmt_ids(tuple(m.id) for m in kept),
+                  h_culled=_mtel.fmt_ids(culled))
 
     def advance(self, dt, inp, enemies=None):
         """Advance the ghost by real time `dt` (Session 7.1).

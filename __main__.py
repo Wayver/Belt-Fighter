@@ -37,6 +37,7 @@ from .ship import Ship
 from .sim_thread import SimThread
 from .sound import SoundBank
 from .intent import ShipInput
+from . import missile_telemetry
 
 
 class _HostRenderClock:
@@ -675,6 +676,9 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
                 game._dbg_dt_max = raw_dt
             if raw_dt > 0.05:
                 game._dbg_hiccups += 1
+        # 10.3b missile telemetry: rides the same F3 toggle as the net
+        # debug overlay (client only — the ghost never runs on the host).
+        missile_telemetry.set_enabled(game.debug_net)
         now = pygame.time.get_ticks() / 1000.0
         if not game.handle_events():
             break
@@ -766,6 +770,8 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
     if game._dbg_log_f is not None:
         game._dbg_log_f.close()
         game._dbg_log_f = None
+    # 10.3b: flush + close the missile telemetry CSV on every exit path.
+    missile_telemetry.close()
     # Session 8.2: stop the worker (join its thread) BEFORE closing the
     # connection — the worker owns the socket, and closing a socket a worker
     # still owns crashes that worker with EBADF (the 8.1 gotcha). stop() is

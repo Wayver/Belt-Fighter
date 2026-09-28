@@ -43,6 +43,7 @@ from .fog import draw_fog, LightSource
 from .hud import draw_hud, draw_game_over, draw_respawn
 from .camera import Camera
 from .netcode import SnapshotBuffer, PredictedShip
+from . import missile_telemetry as _mtel
 from .config import (INTERP_DELAY, SNAPSHOT_INTERVAL, ROCK_FILL, ROCK_EDGE,
                     ENEMY_FILL, ENEMY_EDGE, ENEMY_FLAME,
                     SHIP_COLOR, SHIP_EDGE)
@@ -2077,25 +2078,55 @@ class Game:
             # large value = the prediction diverged from authority (in-
             # flight input / clock error).
             _bx, _by = self.ghost.ship.pos.x, self.ghost.ship.pos.y
+            # TELEMETRY (10.3b): capture the ghost's missile_seq BEFORE the
+            # rewind replay (the replay re-runs the fire tick and can bump it
+            # again) and the snapshot's authoritative seq (local_s[21]) —
+            # the two values that must agree for the ids to line up.
+            _seq_before = self.ghost.ship.missile_seq
+            _local_before = [tuple(m.id) for m in self.ghost.local_missiles
+                             if m.id is not None]
             self.ghost.reconcile_rewind(
                 local_s, sim_time, sim_time if now is None else now,
                 enemies=enemies)
             self.last_snap_px = math.hypot(
                 self.ghost.ship.pos.x - _bx, self.ghost.ship.pos.y - _by)
             self.snap_count += 1
+            _mtel.log("RECONCILE", sim_t=sim_time, r_snap_t=sim_time,
+                      r_snap_seq=local_s[21], r_seq_before=_seq_before,
+                      r_seq_after=self.ghost.ship.missile_seq,
+                      r_buf_ids=_mtel.fmt_ids(
+                          tuple(m[8]) for m in snap[4]
+                          if m[8] is not None),
+                      r_local_before=_mtel.fmt_ids(_local_before),
+                      r_local_after=_mtel.fmt_ids(
+                          tuple(m.id) for m in self.ghost.local_missiles
+                          if m.id is not None))
             # 10.3b fix: hand the ghost's OWN missiles back to the BUFFER
-            # once the snapshot that carries them has arrived. The
-            # snapshot's authoritative missile_seq (ship field 21) is the
-            # exact count of missiles the host had launched as of the
-            # snapshot, so a ghost missile with seq < host_seq is provably
-            # in the buffer from now on — cull the ghost's copy (the
-            # buffer's copy is drawn instead, and it is the one that
-            # actually hits: only the host's authoritative missile has
-            # collision; the ghost's copy is presentation-only and would
-            # otherwise pass through the target and orbit it for the rest
-            # of MISSILE_LIFE). seq >= host_seq was launched after the
-            # snapshot — keep it (handed back by the next snapshot).
-            self.ghost.handback_missiles(local_s[21])
+            # once the buffer's copy of each is VISIBLE. Two conditions:
+            # (a) seq < the snapshot's authoritative missile_seq (ship
+            # field 21 — the exact count of missiles the host had
+            # launched as of the snapshot), and (b) the buffer's NEWEST
+            # snapshot actually carries a missile with that id. The seq
+            # alone is not enough: the snapshot that arrives right after
+            # a launch is the PRE-fire one (the host snapshots every
+            # SNAPSHOT_INTERVAL ticks), so the first snapshot to carry
+            # the missile arrives up to ~100 ms later — and the render
+            # point (newest stamp - INTERP_DELAY) reaches it only
+            # ~INTERP_DELAY after THAT. Culling on seq alone deleted the
+            # ghost copy while the buffer's copy was still ~100-200 ms in
+            # the future: the missile vanished, then reappeared at the
+            # position the carrying snapshot recorded. Keeping the ghost
+            # copy until the buffer's copy is in the newest snapshot
+            # makes the handoff seamless — the buffer's copy (the one
+            # that actually hits: only the host's authoritative missile
+            # has collision; the ghost's copy is presentation-only and
+            # would otherwise pass through the target and orbit it for
+            # the rest of MISSILE_LIFE) draws from the very frame the
+            # ghost copy stops.
+            _latest = self.snap_buf.latest_snapshot()
+            self.ghost.handback_missiles(
+                local_s[21],
+                latest_missiles=_latest[4] if _latest is not None else None)
 
     def predicted_view(self, dt, keys, host_time=None):
         """Draw the frame with the LOCAL ship taken from the prediction
@@ -2219,11 +2250,25 @@ class Game:
         # arrives via JSON, where the tuple is a LIST. tuple() normalizes
         # both sides so the set membership is type-robust.
         local_missile_ids = {tuple(m.id) for m in self.ghost.local_missiles}
+        # TELEMETRY (10.3b): the DEDUP ground truth — which buffer missiles
+        # were DRAWN vs SKIPPED this frame, against the ghost's in-flight
+        # ids. If a buffer missile with a ghost-owned id is DRAWN (not
+        # skipped), the dedup failed -> the double-draw. log_dedup only
+        # writes a row when the (ghost, drawn, skipped) triple CHANGES, so a
+        # sustained flight logs a handful of transition rows, not 60 Hz.
+        _buf_drawn = []
+        _buf_skipped = []
         for (x, y, vx, vy, kind, owner, boost, mid) in pos['bullets']:
             if kind == 'missile' and mid is not None \
                     and tuple(mid) in local_missile_ids:
+                _buf_skipped.append(tuple(mid))
                 continue   # drawn from the ghost (predicted) instead
+            if kind == 'missile' and mid is not None:
+                _buf_drawn.append(tuple(mid))
             self._draw_remote_bullet(screen, x, y, vx, vy, kind, boost)
+        if local_missile_ids or _buf_drawn or _buf_skipped:
+            _mtel.log_dedup(self.sim_time, local_missile_ids,
+                            _buf_drawn, _buf_skipped)
         # Remote ships (Session 6.6, hulls drawn in 6.8): every player
         # EXCEPT the local one, from the buffer by index (Session 6.1:
         # ships matched by index). The local ship is the ghost, drawn

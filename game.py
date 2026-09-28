@@ -2083,6 +2083,19 @@ class Game:
             self.last_snap_px = math.hypot(
                 self.ghost.ship.pos.x - _bx, self.ghost.ship.pos.y - _by)
             self.snap_count += 1
+            # 10.3b fix: hand the ghost's OWN missiles back to the BUFFER
+            # once the snapshot that carries them has arrived. The
+            # snapshot's authoritative missile_seq (ship field 21) is the
+            # exact count of missiles the host had launched as of the
+            # snapshot, so a ghost missile with seq < host_seq is provably
+            # in the buffer from now on — cull the ghost's copy (the
+            # buffer's copy is drawn instead, and it is the one that
+            # actually hits: only the host's authoritative missile has
+            # collision; the ghost's copy is presentation-only and would
+            # otherwise pass through the target and orbit it for the rest
+            # of MISSILE_LIFE). seq >= host_seq was launched after the
+            # snapshot — keep it (handed back by the next snapshot).
+            self.ghost.handback_missiles(local_s[21])
 
     def predicted_view(self, dt, keys, host_time=None):
         """Draw the frame with the LOCAL ship taken from the prediction

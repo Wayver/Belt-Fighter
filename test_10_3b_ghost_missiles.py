@@ -247,6 +247,94 @@ def main():
     g.latency = LatencyTracker()
     g.render_point = RenderPoint(g.latency)
 
+    # --- 7. RECONCILE-DEDUP: the reconcile REWIND re-runs the fire tick
+    #     (apply_snapshot resets missile_seq to the host's pre-fire value,
+    #     then the replay re-fires). The ghost must NOT hold two missiles
+    #     of one id — the prediction's in-flight copy stays, the replay's
+    #     re-fire is skipped (same id). This is the live-test "two
+    #     missiles" bug: without the dedup guard the rewind duplicates the
+    #     in-flight missile, and because the buffer's copy is suppressed by
+    #     the id-dedup, BOTH visible ones are collision-less ghost missiles
+    #     that pass through the target and orbit it. ---
+    ghost7 = make_ghost()
+    ghost7.seed(make_seed_ship_s())
+    proxy7 = _GhostEnemyProxy(pygame.Vector2(100.0, 0.0), pygame.Vector2(0, 0),
+                              0.0, 1, 0.0, 0.0)
+    # The prediction fires at host time TICK (advance's step) — one ghost
+    # missile, id (1,0). Stamp the inputs for the replay too (the rewind
+    # replays from the input buffer, not from advance's args).
+    ghost7.record_input(0.0, ShipInput())
+    ghost7.advance(TICK, ShipInput(), enemies=[proxy7])
+    ghost7.record_input(TICK, ShipInput(missile_fire=True))
+    ghost7.advance(TICK, ShipInput(missile_fire=True), enemies=[proxy7])
+    assert len(ghost7.local_missiles) == 1, \
+        "the prediction must fire exactly one missile: %r" \
+        % (ghost7.local_missiles,)
+    assert ghost7.local_missiles[0].id == (LOCAL_INDEX, 0)
+    # The host's snapshot: taken at S=0 (PRE-fire — missile_seq=0, lock
+    # 1.0, because the snapshot reflects the state after the tick that
+    # ended at 0, which is before the fire tick at TICK). The rewind
+    # replays [0, 2*TICK], which INCLUDES the fire tick at TICK — so the
+    # replay re-fires the same missile the prediction already fired.
+    host7 = Ship(hull=MISSILE_HULL, loadout=LOADOUT)
+    host7.pos = pygame.Vector2(0.0, 0.0)
+    host7.vel = pygame.Vector2(0.0, 0.0)
+    host7.angle = 0.0
+    host7.missile_seq = 0
+    for w in host7.weapons:
+        if w.comp.missile_speed > 0:
+            w.lock_progress = 1.0
+    snap7 = host7.snapshot()
+    assert snap7[21] == 0, \
+        "the snapshot must be pre-fire (missile_seq 0): %r" % snap7[21]
+    ghost7.reconcile_rewind(snap7, 0.0, 2 * TICK, enemies=[proxy7])
+    ids7 = [tuple(m.id) for m in ghost7.local_missiles]
+    assert ids7.count((LOCAL_INDEX, 0)) == 1, \
+        "the rewind re-fire must NOT duplicate the in-flight missile " \
+        "(one id, one missile): %r" % ids7
+    assert ghost7.ship.missile_seq == 1, \
+        "the resynced seq must be the post-fire value: %r" \
+        % ghost7.ship.missile_seq
+    print("PASS: RECONCILE-DEDUP — the rewind re-fire does not duplicate "
+          "the in-flight ghost missile (ids %r, seq %d)"
+          % (ids7, ghost7.ship.missile_seq))
+
+    # --- 8. HANDBACK: once the snapshot that carries a ghost missile has
+    #     arrived, the missile is handed back to the buffer (culled from
+    #     the ghost). The snapshot's authoritative missile_seq (ship field
+    #     21) is the exact count of missiles the host had launched as of
+    #     the snapshot, so a ghost missile with seq < host_seq is provably
+    #     in the buffer — cull it (the buffer's copy is the one that
+    #     actually hits, because only the host's authoritative missile has
+    #     collision). seq >= host_seq was launched after the snapshot —
+    #     keep it (handed back by the next snapshot). The seq comparison
+    #     is exact and phase-free (no dependence on the replay span). ---
+    ghost8 = make_ghost()
+    m0 = GhostMissile(pygame.Vector2(100.0, 0.0),
+                      pygame.Vector2(460.0, 0.0), (LOCAL_INDEX, 0))
+    m1 = GhostMissile(pygame.Vector2(110.0, 0.0),
+                      pygame.Vector2(460.0, 0.0), (LOCAL_INDEX, 1))
+    ghost8.local_missiles = [m0, m1]
+    # host_seq=1: the snapshot carries missile 0 only -> cull m0, keep m1.
+    ghost8.handback_missiles(1)
+    assert [m.id for m in ghost8.local_missiles] == [(LOCAL_INDEX, 1)], \
+        "seq < host_seq must be handed back; seq >= host_seq kept: %r" \
+        % [m.id for m in ghost8.local_missiles]
+    # host_seq=2: the snapshot carries both -> cull both.
+    ghost8.handback_missiles(2)
+    assert ghost8.local_missiles == [], \
+        "both missiles are in the buffer now: %r" \
+        % ghost8.local_missiles
+    # host_seq=0: the snapshot carries none (pre-fire) -> keep both.
+    ghost8.local_missiles = [m0, m1]
+    ghost8.handback_missiles(0)
+    assert len(ghost8.local_missiles) == 2, \
+        "a pre-fire snapshot (host_seq 0) must cull nothing: %r" \
+        % ghost8.local_missiles
+    print("PASS: HANDBACK — ghost missiles with seq < the snapshot's "
+          "authoritative missile_seq are handed back to the buffer; "
+          "seq >= host_seq are kept")
+
     # A snapshot whose buffer carries TWO missiles: the CLIENT's own
     # (id (1,0)) at (100,0) and the HOST's (id (0,0)) at (150,50) — both
     # within the on-screen area (the camera is centered on the ghost at the

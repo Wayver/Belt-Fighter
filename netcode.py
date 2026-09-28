@@ -1372,6 +1372,21 @@ class PredictedShip:
             if len(self.local_missiles) < MAX_MISSILES:
                 mid = (self.local_index, s.missile_seq)
                 s.missile_seq += 1
+                # 10.3b fix: the reconcile REWIND (reconcile_rewind) re-runs
+                # the fire tick after apply_snapshot has RESET missile_seq
+                # to the host's pre-fire value — so the replay re-fires the
+                # SAME missile with the SAME id the prediction already
+                # emitted in advance(). Without this guard the ghost would
+                # hold two GhostMissiles of one id (the in-flight one + a
+                # fresh one at the muzzle): the player sees "two missiles"
+                # (one right behind the other) and, because the buffer's
+                # copy is suppressed by the id-dedup, BOTH of the visible
+                # ones are collision-less ghost missiles that pass through
+                # the target and orbit it. Skip the re-fire when the id is
+                # already in flight (the prediction's copy is the fresher
+                # one — it has already integrated the host's flight).
+                if any(tuple(g.id) == mid for g in self.local_missiles):
+                    continue
                 self.local_missiles.append(
                     GhostMissile(m.pos, m.vel, mid, target=m.target))
 
@@ -1455,6 +1470,33 @@ class PredictedShip:
             m.update(dt, by_id.get(tid))
         self.local_missiles = [m for m in self.local_missiles
                                if m.life > 0]
+
+    def handback_missiles(self, host_seq):
+        """Hand the ghost's OWN missiles back to the buffer once the
+        snapshot that carries them has arrived (10.3b fix).
+
+        `host_seq` is the authoritative `missile_seq` from the snapshot
+        just received (ship snapshot field 21) — the number of missiles
+        the host had launched as of that snapshot. A ghost missile with
+        `seq < host_seq` was launched BEFORE the snapshot, so the buffer
+        carries the host's copy of it from now on: cull the ghost's copy
+        (the buffer's copy is drawn instead — and it is the one that
+        actually hits, because only the host's authoritative missile has
+        collision; the ghost's copy is presentation-only and would
+        otherwise pass through the target and orbit it for the rest of
+        MISSILE_LIFE). A ghost missile with `seq >= host_seq` was
+        launched AFTER the snapshot — the buffer does not carry it yet,
+        so keep it (it will be handed back by the NEXT snapshot).
+
+        The seq comparison is exact and phase-free: it does not depend on
+        the reconcile replay span (how far `now` is ahead of the
+        snapshot) the way an age cutoff would. (If the host's copy had
+        already expired by the snapshot, the ghost's copy — same age —
+        would be dead too, so culling it is a no-op.)"""
+        self.local_missiles = [
+            m for m in self.local_missiles
+            if not (m.id is not None and m.id[0] == self.local_index
+                    and m.id[1] < host_seq)]
 
     def advance(self, dt, inp, enemies=None):
         """Advance the ghost by real time `dt` (Session 7.1).

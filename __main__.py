@@ -600,7 +600,19 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
     # client's own hull/loadout), not the default-hull placeholder Game
     # builds. Rebuild it with the client's fit (same seam the host uses for
     # its ship, but the ghost is a private presentation object).
-    game.ghost = PredictedShip(hull=menu.hull, loadout=menu.loadout)
+    #
+    # 10.3b bug fix: `local_index` MUST be passed. The default is 0 (the
+    # host), but the client is player 1 — and the ghost stamps its own
+    # missiles with (local_index, seq) as the dedup key. With the default
+    # 0 the ghost's ids were (0, seq) while the host's authoritative copy
+    # of the SAME missile was (1, seq): the id-dedup never matched, so the
+    # buffer's copy was never suppressed (a second missile) AND the
+    # handback id-check never matched, so the ghost's copy was never
+    # culled (it flew through the target for the full MISSILE_LIFE). The
+    # "two missiles from one fire" bug. Pass game.local_index (1) so the
+    # ghost's ids match the host's.
+    game.ghost = PredictedShip(hull=menu.hull, loadout=menu.loadout,
+                               local_index=game.local_index)
     # The client's estimate of the host's sim clock (Session 7.1). The
     # client never runs the sim, so it has no sim clock of its own — the
     # estimator derives one from the snapshots: each is stamped with the

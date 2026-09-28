@@ -192,6 +192,21 @@ MAX_MISSILES = 3
 MISSILE_LOCK_RANGE = 900.0 # matches TARGETING_RANGE
 MISSILE_COLOR = (255, 140, 60)
 
+# 10.3d: the decoupled render offset (the handback visual_offset). When the
+# ghost's missile is handed back to the buffer, the buffer's copy is drawn
+# at the interpolated position (INTERP_DELAY seconds behind the ghost's
+# predicted position), which causes a visible backward jump. The fix: at
+# handback time, compute visual_offset = ghost_pos - buffer_pos and add it
+# to the buffer's missile rendering. Each frame, the offset decays by this
+# factor (at 60 FPS; frame-rate independent via decay^(dt*60)), so the
+# missile smoothly converges to the buffer's position without ever moving
+# backward. 0.85 halves the offset in ~4 frames and decays it to <1% in
+# ~15 frames (the user's spec: "decays to zero over a few frames").
+MISSILE_HANDOFF_DECAY = 0.85
+# The offset is removed when its magnitude drops below this threshold (px),
+# to avoid floating-point noise (a 0.1 px offset is invisible).
+MISSILE_HANDOFF_OFFSET_EPS = 0.5
+
 # --- sound ---
 SFX_MASTER_VOLUME = 0.8   # 0..1 master gain for all SFX
 SFX_LASER_MIN_INTERVAL = 0.12        # min s between laser blips (gun fires ~100/s)

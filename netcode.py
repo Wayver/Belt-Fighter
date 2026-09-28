@@ -1541,7 +1541,16 @@ class PredictedShip:
 
         (If the host's copy had already expired by the snapshot, the
         ghost's copy — same age — would be dead too, so culling it is a
-        no-op.)"""
+        no-op.)
+
+        10.3d: RETURNS a dict {mid: (gx, gy)} — the GHOST's position at
+        cull time for each culled missile. The caller (Game) computes the
+        decoupled render offset as `ghost_pos - interp_pos` (the buffer's
+        INTERPOLATED position at the render point — what is actually
+        drawn), stores it, and adds it to the buffer's missile rendering,
+        decaying each frame (MISSILE_HANDOFF_DECAY) so the missile
+        converges to the buffer's position smoothly instead of jumping
+        backward. An empty dict when nothing was culled."""
         if latest_missiles is None:
             ids = None
         else:
@@ -1557,6 +1566,21 @@ class PredictedShip:
                     buf_pos[tuple(e[8])] = (e[0], e[1])
         kept = []
         culled = []
+        # 10.3d: the decoupled render offset (the handback fix). For each
+        # culled missile, record the GHOST's position at cull time. The
+        # caller (Game.predicted_view) computes the visual offset as
+        # ghost_pos - interp_pos (the buffer's INTERPOLATED position at
+        # the render point — what is actually drawn), stores it, and adds
+        # it to the buffer's missile rendering, decaying it each frame
+        # (MISSILE_HANDOFF_DECAY) so the missile converges to the
+        # buffer's position smoothly without a backward jump. Returning
+        # the ghost position (not the offset) lets the caller compute the
+        # offset against the exact interpolated position at the render
+        # point, which is more accurate than the latest snapshot's
+        # position (the render point is INTERP_DELAY seconds behind the
+        # newest snapshot, so the interpolated position is ~46 px behind
+        # the latest for a 460 px/s missile).
+        handoff_ghost_pos = {}
         # TELEMETRY (10.3b): the handback decision. If a ghost missile was
         # KEPT even though the buffer already carries its id (or vice
         # versa), the dedup/handback pair is out of sync — that is the
@@ -1572,13 +1596,18 @@ class PredictedShip:
                     and m.id[1] < host_seq
                     and (ids is None or tuple(m.id) in ids))
             if cull:
-                culled.append(tuple(m.id))
-                bp = buf_pos.get(tuple(m.id))
+                mid = tuple(m.id)
+                culled.append(mid)
+                bp = buf_pos.get(mid)
                 if bp is not None:
                     jump_parts.append(
-                        "%s:%.1f" % (_mtel.fmt_ids([tuple(m.id)]),
+                        "%s:%.1f" % (_mtel.fmt_ids([mid]),
                                      math.hypot(m.pos.x - bp[0],
                                                 m.pos.y - bp[1])))
+                # 10.3d: record the ghost's position at cull time. The
+                # caller computes the offset against the interpolated
+                # position (see predicted_view).
+                handoff_ghost_pos[mid] = (m.pos.x, m.pos.y)
             else:
                 kept.append(m)
         self.local_missiles = kept
@@ -1588,6 +1617,7 @@ class PredictedShip:
                   h_after=_mtel.fmt_ids(tuple(m.id) for m in kept),
                   h_culled=_mtel.fmt_ids(culled),
                   h_jump="|".join(jump_parts))
+        return handoff_ghost_pos
 
     def advance(self, dt, inp, enemies=None):
         """Advance the ghost by real time `dt` (Session 7.1).

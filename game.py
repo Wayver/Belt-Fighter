@@ -46,7 +46,8 @@ from .netcode import SnapshotBuffer, PredictedShip
 from . import missile_telemetry as _mtel
 from .config import (INTERP_DELAY, SNAPSHOT_INTERVAL, ROCK_FILL, ROCK_EDGE,
                     ENEMY_FILL, ENEMY_EDGE, ENEMY_FLAME,
-                    SHIP_COLOR, SHIP_EDGE)
+                    SHIP_COLOR, SHIP_EDGE,
+                    MISSILE_HANDOFF_DECAY, MISSILE_HANDOFF_OFFSET_EPS)
 
 STEP = 1 / 60   # fixed simulation timestep
 
@@ -707,6 +708,26 @@ class Game:
         # predicted_view can detect the alive->dead transition (to spawn
         # the client-side explosion burst exactly once).
         self._local_was_dead = False
+        # 10.3d: the decoupled render offset (the handback fix). At handback, the
+        # buffer's copy of a ghost missile is INTERP_DELAY seconds BEHIND
+        # the ghost's predicted position, so drawing it at its
+        # interpolated position makes the missile JUMP BACKWARD. The fix:
+        # add (ghost_pos - interp_pos) to the buffer's missile rendering
+        # and decay it each frame (MISSILE_HANDOFF_DECAY) so the missile
+        # converges to the buffer's position smoothly, moving forward the
+        # whole time. Two dicts:
+        #   _missile_handoff_ghost_pos: {mid: (gx, gy)} — the ghost's
+        #     position at cull time, set by push_snapshot (from
+        #     ghost.handback_missiles' return value). Consumed by
+        #     predicted_view on the FIRST buffer draw of the missile,
+        #     where the offset is computed against the interpolated
+        #     position (what is actually drawn).
+        #   _missile_handoff_offsets: {mid: (dx, dy)} — the computed
+        #     offset, set by predicted_view (first draw) and decayed each
+        #     frame. Applied to the buffer's missile rendering + fog
+        #     light. Client-only (the host never runs the ghost).
+        self._missile_handoff_ghost_pos = {}
+        self._missile_handoff_offsets = {}
         self.reset()
 
     @property
@@ -787,6 +808,11 @@ class Game:
         self.protect_timer = SPAWN_PROTECT
         self.acc = 0.0
         self.cam.pos = self.ship.pos.copy()
+        # 10.3d: a full reset clears the world's missiles — any pending
+        # handoff offsets + ghost positions are stale (their buffer
+        # copies are gone).
+        self._missile_handoff_offsets.clear()
+        self._missile_handoff_ghost_pos.clear()
         self._sfx_thruster(False)   # never carry the engine loop across a reset
         if self.test_mode:
             self._setup_test_scene()
@@ -2124,9 +2150,18 @@ class Game:
             # the rest of MISSILE_LIFE) draws from the very frame the
             # ghost copy stops.
             _latest = self.snap_buf.latest_snapshot()
-            self.ghost.handback_missiles(
+            # 10.3d: capture the ghost's position at cull time for each
+            # handed-back missile. handback_missiles returns {mid: (gx,
+            # gy)} — the ghost's position when it was culled. predicted_view
+            # computes the decoupled render offset (ghost_pos - interp_pos)
+            # on the FIRST frame the buffer's copy is drawn, then decays it
+            # each frame (MISSILE_HANDOFF_DECAY) so the missile converges
+            # to the buffer's position smoothly without a backward jump.
+            _ghost_pos = self.ghost.handback_missiles(
                 local_s[21],
                 latest_missiles=_latest[4] if _latest is not None else None)
+            if _ghost_pos:
+                self._missile_handoff_ghost_pos.update(_ghost_pos)
 
     def predicted_view(self, dt, keys, host_time=None):
         """Draw the frame with the LOCAL ship taken from the prediction
@@ -2250,6 +2285,38 @@ class Game:
         # arrives via JSON, where the tuple is a LIST. tuple() normalizes
         # both sides so the set membership is type-robust.
         local_missile_ids = {tuple(m.id) for m in self.ghost.local_missiles}
+        # 10.3d: the decoupled render offset (the handback fix). For each
+        # missile whose ghost copy was just culled (handed back to the
+        # buffer), the buffer's copy is INTERP_DELAY seconds BEHIND the
+        # ghost's predicted position. Drawing it at its interpolated
+        # position would make the missile JUMP BACKWARD. The fix: on the
+        # FIRST frame the buffer's copy is drawn, compute the offset as
+        # (ghost_pos - interp_pos) and add it to the rendering. Each
+        # subsequent frame, decay the offset by MISSILE_HANDOFF_DECAY
+        # (frame-rate independent: decay^(dt*60)), so the missile
+        # converges to the buffer's position smoothly, moving forward the
+        # whole time (the offset shrinks slower than the missile
+        # advances). The offset is removed when its magnitude drops below
+        # MISSILE_HANDOFF_OFFSET_EPS (invisible).
+        #
+        # _missile_handoff_ghost_pos: {mid: (gx, gy)} — set by
+        # push_snapshot (from ghost.handback_missiles). Consumed here on
+        # the first buffer draw of the missile.
+        # _missile_handoff_offsets: {mid: (dx, dy)} — the computed offset,
+        # decayed each frame.
+        _hgo = self._missile_handoff_offsets
+        _hgpos = self._missile_handoff_ghost_pos
+        # Decay existing offsets (frame-rate independent).
+        if _hgo:
+            _decay = MISSILE_HANDOFF_DECAY ** (dt * 60.0)
+            for _mid in list(_hgo):
+                _dx, _dy = _hgo[_mid]
+                _dx *= _decay
+                _dy *= _decay
+                if math.hypot(_dx, _dy) < MISSILE_HANDOFF_OFFSET_EPS:
+                    del _hgo[_mid]
+                else:
+                    _hgo[_mid] = (_dx, _dy)
         # TELEMETRY (10.3b): the DEDUP ground truth — which buffer missiles
         # were DRAWN vs SKIPPED this frame, against the ghost's in-flight
         # ids. If a buffer missile with a ghost-owned id is DRAWN (not
@@ -2264,7 +2331,22 @@ class Game:
                 _buf_skipped.append(tuple(mid))
                 continue   # drawn from the ghost (predicted) instead
             if kind == 'missile' and mid is not None:
-                _buf_drawn.append(tuple(mid))
+                _mid_t = tuple(mid)
+                _buf_drawn.append(_mid_t)
+                # 10.3d: apply the decoupled render offset. On the FIRST
+                # frame the buffer's copy is drawn, compute the offset
+                # from the ghost's cull-time position (stored by
+                # push_snapshot) minus the interpolated position (what is
+                # actually drawn). Subsequent frames use the stored
+                # (decaying) offset.
+                if _mid_t in _hgpos:
+                    _gx, _gy = _hgpos.pop(_mid_t)
+                    _hgo[_mid_t] = (_gx - x, _gy - y)
+                    x += _hgo[_mid_t][0]
+                    y += _hgo[_mid_t][1]
+                elif _mid_t in _hgo:
+                    x += _hgo[_mid_t][0]
+                    y += _hgo[_mid_t][1]
             self._draw_remote_bullet(screen, x, y, vx, vy, kind, boost)
         if local_missile_ids or _buf_drawn or _buf_skipped:
             _mtel.log_dedup(self.sim_time, local_missile_ids,
@@ -2379,7 +2461,8 @@ class Game:
         # the lights are the interpolated bullets/missiles plus a reticle
         # light at each lead point (mirrors _build_lights' guard so the
         # light and the reticle appear/disappear together).
-        lights = self._remote_fog_lights(pos, self.ghost.ship, local_missile_ids)
+        lights = self._remote_fog_lights(pos, self.ghost.ship, local_missile_ids,
+                                 handoff_offsets=self._missile_handoff_offsets)
         # The player's OWN gun shots glow too (Session 7.3) — mirrors the
         # host's _build_lights, which adds a LightSource per player bullet.
         for b in self.ghost.local_bullets:
@@ -2535,7 +2618,8 @@ class Game:
         pygame.draw.line(screen, color, tail, (int(s.x), int(s.y)), 3)
         pygame.draw.circle(screen, color, (int(s.x), int(s.y)), 2)
 
-    def _remote_fog_lights(self, pos, local_ship, local_missile_ids=()):
+    def _remote_fog_lights(self, pos, local_ship, local_missile_ids=(),
+                       handoff_offsets=None):
         """LightSources for the client's fog of war (Session 7.2 —
         predicted_view previously skipped draw_fog entirely, so fire did
         not glow through the dark like on the host). Mirrors
@@ -2550,12 +2634,25 @@ class Game:
         10.3b: `local_missile_ids` (a set of the ghost's own missile ids)
         is used to SKIP the buffer's copy of the local player's own
         missiles — those glow from the ghost's predicted position instead
-        (added by the caller), so the same missile does not light twice."""
+        (added by the caller), so the same missile does not light twice.
+
+        10.3d: `handoff_offsets` ({mid: (dx, dy)}) is the decoupled render
+        offset for missiles just handed back to the buffer. The fog light
+        is placed at the same offset position as the missile sprite, so
+        the glow follows the missile smoothly during the handback
+        transition."""
         lights = []
         for (x, y, vx, vy, kind, owner, boost, mid) in pos['bullets']:
             if kind == 'missile' and mid is not None \
                     and tuple(mid) in local_missile_ids:
                 continue   # glows from the ghost's predicted pos instead
+            # 10.3d: apply the handoff offset to the fog light (same
+            # position as the missile sprite).
+            if kind == 'missile' and mid is not None and handoff_offsets:
+                _off = handoff_offsets.get(tuple(mid))
+                if _off is not None:
+                    x += _off[0]
+                    y += _off[1]
             if kind == 'player':
                 lights.append(LightSource(pygame.Vector2(x, y), 30, 0.5))
             elif kind == 'enemy':

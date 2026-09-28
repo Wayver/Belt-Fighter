@@ -174,6 +174,14 @@ TARGETING_COMPUTE_PER_TARGET = 4.0 # extra compute per tracked enemy
 
 # --- homing missile ---
 MISSILE_SPEED = 460.0      # cruise: below bullet (860), way above enemy (25)
+MISSILE_LAUNCH_SPEED = 150.0  # 10.3c: muzzle speed (the boost ramp in
+                              # Missile.update accelerates this up to
+                              # MISSILE_SPEED over MISSILE_BOOST_TIME).
+                              # Launching slow (not at cruise) shrinks the
+                              # ghost->buffer handback discontinuity: the
+                              # missile is still ramping (slow) when the
+                              # buffer's copy takes over, so the position
+                              # jump (speed x interp-delay) is smaller.
 MISSILE_ACCEL = 900.0      # boost ramp
 MISSILE_BOOST_TIME = 0.35  # s of straight flight before seeking starts
 MISSILE_TURN_RATE = 3.0    # rad/s — THE evasion knob

@@ -52,7 +52,7 @@ _COLS = (
     "r_snap_t", "r_snap_seq", "r_seq_before", "r_seq_after",
     "r_buf_ids", "r_local_before", "r_local_after",
     # HANDBACK (ghost missiles handed back to the buffer)
-    "h_host_seq", "h_buf_ids", "h_before", "h_after", "h_culled",
+    "h_host_seq", "h_buf_ids", "h_before", "h_after", "h_culled", "h_jump",
     # DEDUP (a frame's predicted_view draw decision)
     "d_ghost_ids", "d_buf_drawn", "d_buf_skipped",
 )

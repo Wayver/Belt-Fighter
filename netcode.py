@@ -1548,26 +1548,46 @@ class PredictedShip:
             ids = {tuple(m[8]) for m in latest_missiles if m[8] is not None}
         before = [tuple(m.id) for m in self.local_missiles
                   if m.id is not None]
+        # Buffer copy position per id (the newest snapshot's missile list —
+        # each entry is (px, py, vx, vy, owner, life, boost, target_id, mid)).
+        buf_pos = {}
+        if latest_missiles is not None:
+            for e in latest_missiles:
+                if e[8] is not None:
+                    buf_pos[tuple(e[8])] = (e[0], e[1])
         kept = []
         culled = []
+        # TELEMETRY (10.3b): the handback decision. If a ghost missile was
+        # KEPT even though the buffer already carries its id (or vice
+        # versa), the dedup/handback pair is out of sync — that is the
+        # double-draw. h_culled lists the ids just removed. h_jump is the
+        # DISCONTINUITY: for each culled missile, the distance (px) between
+        # the ghost's position (last frame drawn) and the buffer's copy
+        # position (first frame drawn) — the visible jump the player sees
+        # when the handback happens. This is the number the slow-launch
+        # (10.3c) change is meant to shrink.
+        jump_parts = []
         for m in self.local_missiles:
             cull = (m.id is not None and m.id[0] == self.local_index
                     and m.id[1] < host_seq
                     and (ids is None or tuple(m.id) in ids))
             if cull:
                 culled.append(tuple(m.id))
+                bp = buf_pos.get(tuple(m.id))
+                if bp is not None:
+                    jump_parts.append(
+                        "%s:%.1f" % (_mtel.fmt_ids([tuple(m.id)]),
+                                     math.hypot(m.pos.x - bp[0],
+                                                m.pos.y - bp[1])))
             else:
                 kept.append(m)
         self.local_missiles = kept
-        # TELEMETRY (10.3b): the handback decision. If a ghost missile was
-        # KEPT even though the buffer already carries its id (or vice
-        # versa), the dedup/handback pair is out of sync — that is the
-        # double-draw. h_culled lists the ids just removed.
         _mtel.log("HANDBACK", h_host_seq=host_seq,
                   h_buf_ids=_mtel.fmt_ids(sorted(ids)) if ids else "",
                   h_before=_mtel.fmt_ids(before),
                   h_after=_mtel.fmt_ids(tuple(m.id) for m in kept),
-                  h_culled=_mtel.fmt_ids(culled))
+                  h_culled=_mtel.fmt_ids(culled),
+                  h_jump="|".join(jump_parts))
 
     def advance(self, dt, inp, enemies=None):
         """Advance the ghost by real time `dt` (Session 7.1).

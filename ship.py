@@ -43,7 +43,7 @@ from .config import (WIDTH, HEIGHT, ROT_SPEED, MAX_SPEED,
                      TARGETING_COMPUTE_PER_TARGET, LASER_DUMP_DECAY, LASER_COLOR,
                      SHIELD_IMPACT_TTL, SHIELD_IMPACT_SPREAD, SHIELD_IMPACT_SPREAD_TIME,
                      SHIELD_IMPACT_STEPS, SENSOR_COLOR, SENSOR_SCAN_COLOR, SCAN_DUMP_DECAY,
-                     HULL_COLLISION_INSET, MISSILE_COLOR)
+                     HULL_COLLISION_INSET, MISSILE_COLOR, MISSILE_LAUNCH_SPEED)
 
 from .hulls import DEFAULT_HULL, default_loadout, Slot, ComponentType
 
@@ -827,7 +827,15 @@ class Ship:
             if inp.missile_fire:
                 fwd, right = self.axes()
                 ox, oy = w.slot.orientation
-                vel = (fwd * ox + right * oy) * w.comp.missile_speed
+                # 10.3c: launch at MISSILE_LAUNCH_SPEED (not cruise). The
+                # boost ramp in Missile.update accelerates it up to
+                # MISSILE_SPEED over MISSILE_BOOST_TIME. Launching slow
+                # shrinks the ghost->buffer handback discontinuity: the
+                # missile is still ramping (slow) when the buffer's copy
+                # takes over, so the position jump (speed x interp-delay)
+                # is smaller. (Before 10.3c it launched at full cruise —
+                # the boost phase only delayed seeking, never speed.)
+                vel = (fwd * ox + right * oy) * MISSILE_LAUNCH_SPEED
                 missiles.append(MissileShot(self.to_world(*w.slot.position),
                                             vel, self.id, t))
                 self.missile_dump += w.comp.missile_launch_dump

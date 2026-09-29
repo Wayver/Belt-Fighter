@@ -1037,6 +1037,15 @@ class GhostMissile:
         self.target = target             # _GhostEnemyProxy (or None)
         self.life = MISSILE_LIFE
         self.boost = MISSILE_BOOST_TIME
+        # 10.3e: set by handback_missiles once the buffer's copy is in the
+        # NEWEST snapshot. The missile is NOT culled then — the buffer's
+        # copy only becomes VISIBLE when the render point reaches the
+        # carrying snapshot (~INTERP_DELAY later). Until then the ghost
+        # keeps drawing it (no gap). predicted_view hands it off (removes
+        # it + seeds the decoupled render offset) on the frame the buffer
+        # copy is visible. Cleared implicitly when the missile leaves
+        # local_missiles (handed off or life-culled).
+        self.pending = False
 
     def update(self, dt, target=None):
         """Advance one step. `target` is the CURRENT buffer proxy for this
@@ -1504,10 +1513,10 @@ class PredictedShip:
                                if m.life > 0]
 
     def handback_missiles(self, host_seq, latest_missiles=None):
-        """Hand the ghost's OWN missiles back to the buffer once the
-        buffer's copy of each is VISIBLE (10.3b fix).
+        """Mark the ghost's OWN missiles as handed back to the buffer
+        (10.3b fix, refined in 10.3e).
 
-        A ghost missile is culled only when BOTH hold:
+        A ghost missile is marked `pending` (NOT culled) once BOTH hold:
           * `seq < host_seq` — the snapshot's authoritative
             `missile_seq` (ship snapshot field 21) counts the missiles
             the host had launched as of the snapshot, so a lower seq was
@@ -1523,34 +1532,35 @@ class PredictedShip:
         the snapshot that arrives right after a launch is the PRE-fire
         one — the host snapshots every SNAPSHOT_INTERVAL ticks, so the
         first snapshot to carry the missile arrives up to one interval
-        (~100 ms) later. The seq alone says "cull" the moment ANY
+        (~100 ms) later. The seq alone says "hand back" the moment ANY
         snapshot reports a higher seq, but the buffer's copy only becomes
         drawable when the CARRYING snapshot enters the buffer — and the
         render point (newest stamp - INTERP_DELAY) reaches it only
-        ~INTERP_DELAY after that. Culling on seq alone deleted the ghost
-        copy while the buffer's copy was still ~100-200 ms in the
-        future: the missile VANISHED, then REAPPEARED at the position
-        the carrying snapshot recorded (a "new nearby location"). With
-        the id check the ghost copy stays until the buffer's copy is
-        actually in the newest snapshot — the render then shows the
-        buffer's copy (the one that actually hits: only the host's
-        authoritative missile has collision; the ghost's copy is
-        presentation-only and would otherwise pass through the target
-        and orbit it for the rest of MISSILE_LIFE) from the very frame
-        the ghost copy stops drawing, so the missile appears continuous.
+        ~INTERP_DELAY after that.
+
+        10.3e (the "blink" fix): the 10.3b/10.3d behavior CULLED the ghost
+        copy here, at snapshot arrival. But the buffer's copy is not
+        VISIBLE until the render point reaches the carrying snapshot
+        (~INTERP_DELAY later), so the missile was drawn by NEITHER the
+        ghost nor the buffer for 6-15 frames — a visible blink. Now the
+        ghost copy is kept (marked `pending`) and the ghost KEEPS DRAWING
+        it; predicted_view hands it off on the frame the buffer copy is
+        actually visible — removing it from local_missiles (so the buffer
+        copy is no longer dedup-skipped) and seeding the decoupled render
+        offset from the ghost's position AT THAT MOMENT (ghost_pos -
+        interp_pos), which the 10.3d decay then smooths to the buffer's
+        position. The missile is drawn continuously, by the ghost until
+        the buffer copy appears and by the buffer (offset-corrected)
+        after.
 
         (If the host's copy had already expired by the snapshot, the
-        ghost's copy — same age — would be dead too, so culling it is a
-        no-op.)
+        ghost's copy — same age — would be dead too, so the pending mark
+        is a no-op: the missile is life-culled by step_local_missiles
+        before the buffer copy is ever visible.)
 
-        10.3d: RETURNS a dict {mid: (gx, gy)} — the GHOST's position at
-        cull time for each culled missile. The caller (Game) computes the
-        decoupled render offset as `ghost_pos - interp_pos` (the buffer's
-        INTERPOLATED position at the render point — what is actually
-        drawn), stores it, and adds it to the buffer's missile rendering,
-        decaying each frame (MISSILE_HANDOFF_DECAY) so the missile
-        converges to the buffer's position smoothly instead of jumping
-        backward. An empty dict when nothing was culled."""
+        RETURNS an empty dict (the 10.3d ghost-position return is no
+        longer used — the offset is seeded by predicted_view at the
+        handoff frame, not at snapshot arrival)."""
         if latest_missiles is None:
             ids = None
         else:
@@ -1564,60 +1574,54 @@ class PredictedShip:
             for e in latest_missiles:
                 if e[8] is not None:
                     buf_pos[tuple(e[8])] = (e[0], e[1])
-        kept = []
-        culled = []
-        # 10.3d: the decoupled render offset (the handback fix). For each
-        # culled missile, record the GHOST's position at cull time. The
-        # caller (Game.predicted_view) computes the visual offset as
-        # ghost_pos - interp_pos (the buffer's INTERPOLATED position at
-        # the render point — what is actually drawn), stores it, and adds
-        # it to the buffer's missile rendering, decaying it each frame
-        # (MISSILE_HANDOFF_DECAY) so the missile converges to the
-        # buffer's position smoothly without a backward jump. Returning
-        # the ghost position (not the offset) lets the caller compute the
-        # offset against the exact interpolated position at the render
-        # point, which is more accurate than the latest snapshot's
-        # position (the render point is INTERP_DELAY seconds behind the
-        # newest snapshot, so the interpolated position is ~46 px behind
-        # the latest for a 460 px/s missile).
-        handoff_ghost_pos = {}
-        # TELEMETRY (10.3b): the handback decision. If a ghost missile was
-        # KEPT even though the buffer already carries its id (or vice
-        # versa), the dedup/handback pair is out of sync — that is the
-        # double-draw. h_culled lists the ids just removed. h_jump is the
-        # DISCONTINUITY: for each culled missile, the distance (px) between
-        # the ghost's position (last frame drawn) and the buffer's copy
-        # position (first frame drawn) — the visible jump the player sees
-        # when the handback happens. This is the number the slow-launch
-        # (10.3c) change is meant to shrink.
+        # 10.3e: the ghost missile is NOT culled here. It is marked
+        # `pending` and KEPT in local_missiles so the ghost keeps DRAWING
+        # it. The buffer's copy only becomes VISIBLE when the render point
+        # reaches the carrying snapshot (~INTERP_DELAY after this
+        # snapshot), so culling here (the 10.3b/10.3d behavior) left a
+        # 6-15 frame gap where the missile was drawn by NEITHER the ghost
+        # nor the buffer — the "blink". predicted_view hands it off on the
+        # frame the buffer copy is visible: it removes the pending missile
+        # from local_missiles (so the buffer copy is no longer dedup-skipped)
+        # and seeds the decoupled render offset from the ghost's position
+        # AT THAT MOMENT (ghost_pos - interp_pos), which the existing
+        # 10.3d decay then smooths to the buffer's position.
+        #
+        # Safe against the reconcile re-fire: a pending missile has
+        # seq < host_seq, i.e. it was launched BEFORE this snapshot, so
+        # its fire tick is not in the rewind replay span [snap_time, now]
+        # — apply_snapshot's seq reset + replay cannot re-fire it (the
+        # 10.3b guard would catch a duplicate anyway).
+        #
+        # TELEMETRY (10.3b): h_pending lists the ids just marked pending
+        # (the handback decision). h_jump is the distance (px) between the
+        # ghost's position and the buffer's NEWEST-snapshot copy position
+        # — the offset 10.3d's decay smooths out (informational; the
+        # handoff now happens ~INTERP_DELAY later, at the render point).
+        pending = []
         jump_parts = []
         for m in self.local_missiles:
-            cull = (m.id is not None and m.id[0] == self.local_index
-                    and m.id[1] < host_seq
-                    and (ids is None or tuple(m.id) in ids))
-            if cull:
+            ready = (m.id is not None and m.id[0] == self.local_index
+                     and m.id[1] < host_seq
+                     and (ids is None or tuple(m.id) in ids))
+            if ready and not m.pending:
+                m.pending = True
                 mid = tuple(m.id)
-                culled.append(mid)
+                pending.append(mid)
                 bp = buf_pos.get(mid)
                 if bp is not None:
                     jump_parts.append(
                         "%s:%.1f" % (_mtel.fmt_ids([mid]),
                                      math.hypot(m.pos.x - bp[0],
                                                 m.pos.y - bp[1])))
-                # 10.3d: record the ghost's position at cull time. The
-                # caller computes the offset against the interpolated
-                # position (see predicted_view).
-                handoff_ghost_pos[mid] = (m.pos.x, m.pos.y)
-            else:
-                kept.append(m)
-        self.local_missiles = kept
         _mtel.log("HANDBACK", h_host_seq=host_seq,
                   h_buf_ids=_mtel.fmt_ids(sorted(ids)) if ids else "",
                   h_before=_mtel.fmt_ids(before),
-                  h_after=_mtel.fmt_ids(tuple(m.id) for m in kept),
-                  h_culled=_mtel.fmt_ids(culled),
+                  h_after=_mtel.fmt_ids(
+                      tuple(m.id) for m in self.local_missiles),
+                  h_culled=_mtel.fmt_ids(pending),
                   h_jump="|".join(jump_parts))
-        return handoff_ghost_pos
+        return {}
 
     def advance(self, dt, inp, enemies=None):
         """Advance the ghost by real time `dt` (Session 7.1).

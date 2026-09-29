@@ -300,40 +300,61 @@ def main():
           % (ids7, ghost7.ship.missile_seq))
 
     # --- 8. HANDBACK: once the snapshot that carries a ghost missile has
-    #     arrived, the missile is handed back to the buffer (culled from
-    #     the ghost). The snapshot's authoritative missile_seq (ship field
-    #     21) is the exact count of missiles the host had launched as of
-    #     the snapshot, so a ghost missile with seq < host_seq is provably
-    #     in the buffer — cull it (the buffer's copy is the one that
-    #     actually hits, because only the host's authoritative missile has
-    #     collision). seq >= host_seq was launched after the snapshot —
-    #     keep it (handed back by the next snapshot). The seq comparison
-    #     is exact and phase-free (no dependence on the replay span). ---
+    #     arrived, the missile is marked PENDING (handed back to the
+    #     buffer) — but NOT culled (10.3e). The snapshot's authoritative
+    #     missile_seq (ship field 21) is the exact count of missiles the
+    #     host had launched as of the snapshot, so a ghost missile with
+    #     seq < host_seq is provably in the buffer — mark it pending.
+    #     seq >= host_seq was launched after the snapshot — not pending
+    #     (handed back by the next snapshot). The seq comparison is exact
+    #     and phase-free (no dependence on the replay span).
+    #
+    #     10.3e: the ghost KEEPS DRAWING a pending missile until the
+    #     buffer's copy is VISIBLE (the render point reaches the carrying
+    #     snapshot, ~INTERP_DELAY later) — predicted_view then removes it
+    #     and seeds the decoupled render offset. Culling at snapshot
+    #     arrival (the pre-10.3e behavior) left a 6-15 frame gap where
+    #     the missile was drawn by neither the ghost nor the buffer (the
+    #     "blink"). So handback_missiles now marks, not culls: the
+    #     pending missile stays in local_missiles (and is dedup-skipped
+    #     from the buffer) until predicted_view hands it off. ---
     ghost8 = make_ghost()
     m0 = GhostMissile(pygame.Vector2(100.0, 0.0),
                       pygame.Vector2(460.0, 0.0), (LOCAL_INDEX, 0))
     m1 = GhostMissile(pygame.Vector2(110.0, 0.0),
                       pygame.Vector2(460.0, 0.0), (LOCAL_INDEX, 1))
     ghost8.local_missiles = [m0, m1]
-    # host_seq=1: the snapshot carries missile 0 only -> cull m0, keep m1.
+    # host_seq=1: the snapshot carries missile 0 only -> m0 pending, m1
+    # not. BOTH stay in local_missiles (no cull).
     ghost8.handback_missiles(1)
-    assert [m.id for m in ghost8.local_missiles] == [(LOCAL_INDEX, 1)], \
-        "seq < host_seq must be handed back; seq >= host_seq kept: %r" \
-        % [m.id for m in ghost8.local_missiles]
-    # host_seq=2: the snapshot carries both -> cull both.
+    assert [m.id for m in ghost8.local_missiles] == \
+        [(LOCAL_INDEX, 0), (LOCAL_INDEX, 1)], \
+        "pending missiles are KEPT (not culled) until the buffer's copy " \
+        "is visible: %r" % [m.id for m in ghost8.local_missiles]
+    assert m0.pending and not m1.pending, \
+        "seq < host_seq must be marked pending; seq >= host_seq not: " \
+        "m0.pending=%r m1.pending=%r" % (m0.pending, m1.pending)
+    # host_seq=2: the snapshot carries both -> m1 also pending. Both stay.
     ghost8.handback_missiles(2)
-    assert ghost8.local_missiles == [], \
-        "both missiles are in the buffer now: %r" \
-        % ghost8.local_missiles
-    # host_seq=0: the snapshot carries none (pre-fire) -> keep both.
-    ghost8.local_missiles = [m0, m1]
-    ghost8.handback_missiles(0)
+    assert m0.pending and m1.pending, \
+        "both missiles are in the buffer now: m0.pending=%r m1.pending=%r" \
+        % (m0.pending, m1.pending)
     assert len(ghost8.local_missiles) == 2, \
-        "a pre-fire snapshot (host_seq 0) must cull nothing: %r" \
+        "pending missiles stay in local_missiles: %r" \
+        % ghost8.local_missiles
+    # host_seq=0: the snapshot carries none (pre-fire) -> nothing pending.
+    ghost8.local_missiles = [m0, m1]
+    m0.pending = m1.pending = False
+    ghost8.handback_missiles(0)
+    assert not m0.pending and not m1.pending, \
+        "a pre-fire snapshot (host_seq 0) must mark nothing pending: " \
+        "m0.pending=%r m1.pending=%r" % (m0.pending, m1.pending)
+    assert len(ghost8.local_missiles) == 2, \
+        "a pre-fire snapshot must cull nothing: %r" \
         % ghost8.local_missiles
     print("PASS: HANDBACK — ghost missiles with seq < the snapshot's "
-          "authoritative missile_seq are handed back to the buffer; "
-          "seq >= host_seq are kept")
+          "authoritative missile_seq are marked pending (kept, not "
+          "culled); seq >= host_seq are not pending")
 
     # A snapshot whose buffer carries TWO missiles: the CLIENT's own
     # (id (1,0)) at (100,0) and the HOST's (id (0,0)) at (150,50) — both

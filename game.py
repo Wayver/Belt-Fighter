@@ -708,20 +708,24 @@ class Game:
         # predicted_view can detect the alive->dead transition (to spawn
         # the client-side explosion burst exactly once).
         self._local_was_dead = False
-        # 10.3d: the decoupled render offset (the handback fix). At handback, the
-        # buffer's copy of a ghost missile is INTERP_DELAY seconds BEHIND
-        # the ghost's predicted position, so drawing it at its
-        # interpolated position makes the missile JUMP BACKWARD. The fix:
-        # add (ghost_pos - interp_pos) to the buffer's missile rendering
-        # and decay it each frame (MISSILE_HANDOFF_DECAY) so the missile
-        # converges to the buffer's position smoothly, moving forward the
-        # whole time. Two dicts:
+        # 10.3d/10.3e: the decoupled render offset (the handback fix). At
+        # handback, the buffer's copy of a ghost missile is INTERP_DELAY
+        # seconds BEHIND the ghost's predicted position, so drawing it at
+        # its interpolated position makes the missile JUMP BACKWARD. The
+        # fix: add (ghost_pos - interp_pos) to the buffer's missile
+        # rendering and decay it each frame (MISSILE_HANDOFF_DECAY) so the
+        # missile converges to the buffer's position smoothly, moving
+        # forward the whole time. 10.3e: the handoff happens on the frame
+        # the buffer's copy is VISIBLE (not at snapshot arrival — that
+        # left a 6-15 frame gap where the missile was drawn by neither
+        # the ghost nor the buffer, the "blink"), so the ghost's position
+        # is captured at THAT moment, not at cull time. Two dicts:
         #   _missile_handoff_ghost_pos: {mid: (gx, gy)} — the ghost's
-        #     position at cull time, set by push_snapshot (from
-        #     ghost.handback_missiles' return value). Consumed by
-        #     predicted_view on the FIRST buffer draw of the missile,
-        #     where the offset is computed against the interpolated
-        #     position (what is actually drawn).
+        #     position at the handoff frame, set by predicted_view when it
+        #     hands a pending ghost missile off to the buffer. Consumed by
+        #     the bullet draw loop on the FIRST buffer draw of the
+        #     missile, where the offset is computed against the
+        #     interpolated position (what is actually drawn).
         #   _missile_handoff_offsets: {mid: (dx, dy)} — the computed
         #     offset, set by predicted_view (first draw) and decayed each
         #     frame. Applied to the buffer's missile rendering + fog
@@ -2150,18 +2154,20 @@ class Game:
             # the rest of MISSILE_LIFE) draws from the very frame the
             # ghost copy stops.
             _latest = self.snap_buf.latest_snapshot()
-            # 10.3d: capture the ghost's position at cull time for each
-            # handed-back missile. handback_missiles returns {mid: (gx,
-            # gy)} — the ghost's position when it was culled. predicted_view
-            # computes the decoupled render offset (ghost_pos - interp_pos)
-            # on the FIRST frame the buffer's copy is drawn, then decays it
-            # each frame (MISSILE_HANDOFF_DECAY) so the missile converges
-            # to the buffer's position smoothly without a backward jump.
-            _ghost_pos = self.ghost.handback_missiles(
+            # 10.3e: handback_missiles MARKS the ghost's missiles pending
+            # (the buffer's newest snapshot carries them) but does NOT
+            # cull them — the ghost keeps drawing them until the buffer's
+            # copy is VISIBLE (the render point reaches the carrying
+            # snapshot, ~INTERP_DELAY later). predicted_view performs the
+            # actual handoff on that frame: it removes the pending missile
+            # from ghost.local_missiles (so the buffer copy is no longer
+            # dedup-skipped) and seeds the decoupled render offset from
+            # the ghost's position at that moment (ghost_pos - interp_pos),
+            # which the 10.3d decay then smooths to the buffer's position.
+            # The missile is drawn continuously — no blink.
+            self.ghost.handback_missiles(
                 local_s[21],
                 latest_missiles=_latest[4] if _latest is not None else None)
-            if _ghost_pos:
-                self._missile_handoff_ghost_pos.update(_ghost_pos)
 
     def predicted_view(self, dt, keys, host_time=None):
         """Draw the frame with the LOCAL ship taken from the prediction
@@ -2284,13 +2290,48 @@ class Game:
         # carry it as a tuple (created client-side); the buffer's copy
         # arrives via JSON, where the tuple is a LIST. tuple() normalizes
         # both sides so the set membership is type-robust.
+        # 10.3e: hand off PENDING ghost missiles to the buffer NOW — on the
+        # frame the buffer's copy is VISIBLE in this frame's window.
+        # handback_missiles (push_snapshot) marks a ghost missile pending
+        # once the buffer's NEWEST snapshot carries it, but the buffer's
+        # copy is only DRAWN once the render point reaches the carrying
+        # snapshot (~INTERP_DELAY later). Culling at snapshot arrival
+        # (10.3b/10.3d) left a 6-15 frame gap where the missile was drawn
+        # by NEITHER the ghost nor the buffer — the "blink". So the ghost
+        # keeps drawing the pending missile until this moment; here, for
+        # each pending missile whose buffer copy is in pos['bullets'],
+        # remove it from ghost.local_missiles (so the buffer copy is no
+        # longer dedup-skipped below) and record the ghost's position AT
+        # THIS MOMENT — the offset is then computed against the
+        # interpolated position on the first buffer draw (the 10.3d path).
+        # A pending missile whose buffer copy is not visible yet stays in
+        # local_missiles (the ghost keeps drawing it). This must run
+        # BEFORE local_missile_ids is built, so a handed-off missile is
+        # not skipped this frame.
+        _pending = [m for m in self.ghost.local_missiles if m.pending]
+        if _pending:
+            _visible = {tuple(b[7]) for b in pos['bullets']
+                        if b[7] is not None}
+            _hgo = self._missile_handoff_offsets
+            _hgpos = self._missile_handoff_ghost_pos
+            _kept = []
+            for m in self.ghost.local_missiles:
+                if m.pending and tuple(m.id) in _visible:
+                    _hgpos[tuple(m.id)] = (m.pos.x, m.pos.y)
+                    _mtel.log("HANDBACK", h_host_seq="",
+                              h_buf_ids="", h_before="", h_after="",
+                              h_culled=_mtel.fmt_ids([tuple(m.id)]),
+                              h_jump="")
+                else:
+                    _kept.append(m)
+            self.ghost.local_missiles = _kept
         local_missile_ids = {tuple(m.id) for m in self.ghost.local_missiles}
         # 10.3d: the decoupled render offset (the handback fix). For each
-        # missile whose ghost copy was just culled (handed back to the
-        # buffer), the buffer's copy is INTERP_DELAY seconds BEHIND the
-        # ghost's predicted position. Drawing it at its interpolated
-        # position would make the missile JUMP BACKWARD. The fix: on the
-        # FIRST frame the buffer's copy is drawn, compute the offset as
+        # missile whose ghost copy was just handed off (above), the
+        # buffer's copy is INTERP_DELAY seconds BEHIND the ghost's
+        # predicted position. Drawing it at its interpolated position
+        # would make the missile JUMP BACKWARD. The fix: on the FIRST
+        # frame the buffer's copy is drawn, compute the offset as
         # (ghost_pos - interp_pos) and add it to the rendering. Each
         # subsequent frame, decay the offset by MISSILE_HANDOFF_DECAY
         # (frame-rate independent: decay^(dt*60)), so the missile
@@ -2299,9 +2340,10 @@ class Game:
         # advances). The offset is removed when its magnitude drops below
         # MISSILE_HANDOFF_OFFSET_EPS (invisible).
         #
-        # _missile_handoff_ghost_pos: {mid: (gx, gy)} — set by
-        # push_snapshot (from ghost.handback_missiles). Consumed here on
-        # the first buffer draw of the missile.
+        # _missile_handoff_ghost_pos: {mid: (gx, gy)} — set by the
+        # 10.3e handoff above (the ghost's position at the handoff frame).
+        # Consumed in the bullet draw loop on the first buffer draw of
+        # the missile.
         # _missile_handoff_offsets: {mid: (dx, dy)} — the computed offset,
         # decayed each frame.
         _hgo = self._missile_handoff_offsets

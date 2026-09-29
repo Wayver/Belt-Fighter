@@ -180,20 +180,21 @@ def main():
     g, = (make_client(screen, font, big_font, light_tex, fog_surf,
                       light_surf),)
 
-    # --- 1. BUFFER-CARRIES: the enemy entry is a 9-tuple with the shield
-    #     state at [7] (dump) and [8] (clock). ---
+    # --- 1. BUFFER-CARRIES: the enemy entry is a 10-tuple with the shield
+    #     state at [7] (dump) and [8] (clock). 10.3c grew it to a 10-tuple
+    #     (+ power_used at [9]) — the shape assert tracks that. ---
     prev = make_snap(0.0, 0.0)
     curr = make_snap(25.0, 0.05)
     P = interp_positions(prev, curr, 1.0, dt=0.1)
     entry = P['enemies'][ENEMY_IDX]
-    assert isinstance(entry, tuple) and len(entry) == 9, \
-        "enemy entry must be a 9-tuple, got %r" % (entry,)
+    assert isinstance(entry, tuple) and len(entry) == 10, \
+        "enemy entry must be a 10-tuple, got %r" % (entry,)
     # At alpha=1 the entry sits exactly on curr (endpoint-exact): the
     # target enemy's dump/clock are curr's (25.0, 0.05).
     assert entry[7] == 25.0 and entry[8] == 0.05, \
         "shield_dump/clock must be at [7]/[8], endpoint-exact: %r" % (entry,)
     print("PASS: BUFFER-CARRIES — enemy entry is "
-          "(tag,x,y,angle,vx,vy,id,dump,clock)")
+          "(tag,x,y,angle,vx,vy,id,dump,clock,power_used)")
 
     # --- 2. LERP: interp_positions lerps the enemy's shield state between
     #     two snapshots (midpoint), endpoint-exact at alpha 0/1. ---

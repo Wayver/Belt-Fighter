@@ -2049,8 +2049,9 @@ class Game:
             self._draw_remote_rock(screen, x, y)
         # Remote enemies as their REAL hulls (Session 7.2, the D4 fix) —
         # the buffer carries (tag, x, y, angle, vx, vy, id, shield_dump,
-        # shield_clock) (10.2b).
-        for (tag, x, y, ang, vx, vy, _eid, s_dump, s_clock) in pos['enemies']:
+        # shield_clock, power_used) (10.2b + 10.3c).
+        for (tag, x, y, ang, vx, vy, _eid, s_dump, s_clock, _p_used) \
+                in pos['enemies']:
             self._draw_remote_enemy_hull(screen, tag, x, y, ang,
                                          s_dump, s_clock)
         # Remote projectiles (Session 7.2, the D3 fix). 10.3b: the entry
@@ -2285,13 +2286,14 @@ class Game:
             self._draw_remote_rock(screen, x, y)
         # Remote enemies as their REAL hulls (Session 7.2, the D4 fix):
         # the buffer carries (tag, x, y, angle, vx, vy, id, shield_dump,
-        # shield_clock) (10.2b); the angle is lerp'd with lerp_angle (the
-        # same wrapped-delta rule as player ships, 6.8) and the hull is
-        # fixed on both peers by construction, so the stand-in per tag
-        # draws it faithfully. The shield state feeds the stand-in so the
-        # enemy's shield-impact flash renders (mirrors the host's model
-        # path, 10.2b).
-        for (tag, x, y, ang, vx, vy, _eid, s_dump, s_clock) in pos['enemies']:
+        # shield_clock, power_used) (10.2b + 10.3c); the angle is lerp'd
+        # with lerp_angle (the same wrapped-delta rule as player ships,
+        # 6.8) and the hull is fixed on both peers by construction, so the
+        # stand-in per tag draws it faithfully. The shield state feeds the
+        # stand-in so the enemy's shield-impact flash renders (mirrors the
+        # host's model path, 10.2b).
+        for (tag, x, y, ang, vx, vy, _eid, s_dump, s_clock, _p_used) \
+                in pos['enemies']:
             self._draw_remote_enemy_hull(screen, tag, x, y, ang,
                                          s_dump, s_clock)
         # Remote projectiles (Session 7.2, the D3 fix): every bullet and
@@ -2863,23 +2865,32 @@ class Game:
         across frames), and a `.ship` stand-in with the power fields the
         sensor-contact signature needs (10.3c).
 
-        The power fields are NOT in the buffer today: the enemy's Ship
-        snapshot carries power_factor (field 17) and the weapons tuple
-        (field 18), but NOT power_used / power_idle_total — the host's
-        `_update_contacts` reads `e.ship.power_used -
-        e.ship.power_idle_total` off the LIVE enemy, and that value is
-        not serialized. 10.3a (laser) needs only `.pos`, so the power
-        fields are 0.0 placeholders; 10.3c (sensor contacts) must
-        resolve this — either the signature is derivable from the
-        snapshot's power_factor + weapons tuple (client-side recompute)
-        or it needs a wire field (a plan change). See the 10.x plan note.
+        10.3c: the power fields ARE in the buffer now. `power_used` is
+        carried on the enemy entry (ship_s[22], lerp'd across the window
+        — see interp_positions); `power_idle_total` is a LOADOUT CONSTANT
+        the client derives from the tag's stand-in ship (the enemy
+        hull+loadout is fixed on both peers — the same stand-in
+        `_build_remote_enemy_standins` builds for the remote render). The
+        host's `_update_contacts` reads `e.ship.power_used -
+        e.ship.power_idle_total`; the ghost's `_update_contacts` reads the
+        same off these proxies, so the signature matches.
         """
+        standins = self._get_remote_enemies()
         proxies = []
-        for (tag, x, y, ang, vx, vy, eid, _s_dump, _s_clock) \
+        for (tag, x, y, ang, vx, vy, eid, _s_dump, _s_clock, power_used) \
                 in pos['enemies']:
+            e = standins.get(tag)
+            # power_idle_total is a loadout constant (sum of the fitted
+            # components' power_idle). The stand-in's ship is built with
+            # the EXACT same loadout the host uses, so its
+            # power_idle_total is the right value. Fall back to 0.0 for an
+            # unknown tag (e.g. 'test') — its signature then reads
+            # power_used, which is fine (test targets are never in a 2P
+            # snapshot).
+            idle = e.ship.power_idle_total if e is not None else 0.0
             proxies.append(_GhostEnemyProxy(
                 pygame.Vector2(x, y), pygame.Vector2(vx, vy),
-                ang, eid, 0.0, 0.0))
+                ang, eid, power_used, idle))
         return proxies
 
     def _targeting_proxies(self, pos):
@@ -2895,10 +2906,11 @@ class Game:
         they are presentation, never stepped, never fed to the sim."""
         proxies = []
         standins = self._get_remote_enemies()
-        # 10.2b: the buffer's enemy entry also carries (shield_dump,
-        # shield_clock) — unused here (the reticle only needs the pose),
-        # but the unpack must match the 9-tuple shape.
-        for (tag, x, y, ang, vx, vy, _eid, _s_dump, _s_clock) in pos['enemies']:
+        # 10.2b/10.3c: the buffer's enemy entry also carries (shield_dump,
+        # shield_clock, power_used) — unused here (the reticle only needs
+        # the pose), but the unpack must match the 10-tuple shape.
+        for (tag, x, y, ang, vx, vy, _eid, _s_dump, _s_clock, _p_used) \
+                in pos['enemies']:
             e = standins.get(tag)
             if e is None:
                 continue

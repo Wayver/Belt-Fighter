@@ -363,13 +363,25 @@ class Ship:
     #                              (the host bumps it on each launch; the
     #                              client's ghost resyncs it so its ghost
     #                              missiles get the same ids the host's do)
+    #   power_used                 10.3c: the live total power demand
+    #                              (recomputed by _allocate every tick).
+    #                              Serialized so the CLIENT can compute the
+    #                              sensor-contact signature
+    #                              (power_used - power_idle_total) for the
+    #                              host's enemies — the ghost's
+    #                              _update_contacts needs it and it is not
+    #                              derivable client-side (the enemy's
+    #                              thruster state / ShipInput is not
+    #                              synced). power_idle_total is a loadout
+    #                              constant the client derives. (Was
+    #                              presentation-only; 10.3c promotes it.)
     #
     # PRESENTATION-ONLY (never serialized):
     #   flame_mags, arcs, arc_clock, shield_impacts
     #   prev_pos, prev_angle, rpos, rangle, accel, dampening
     #   tracked, laser_target, missile_target, contacts
     #                              (Game re-derives these every tick)
-    #   power_used, compute_used, compute_alloc
+    #   compute_used, compute_alloc
     #                              (recomputed by _allocate every tick)
     #   hull, components, thrusters, weapons (slot/comp refs), shield_oval,
     #   shield_comp, sensor_comp, power_idle_total, power_supply,
@@ -398,6 +410,7 @@ class Ship:
             self.id,
             self.dead,   # 10.1: per-player death
             self.missile_seq,   # 10.3b: per-ship missile launch counter
+            self.power_used,   # 10.3c: live power demand (sensor signature)
         )
 
     def sync_render(self, alpha):
@@ -415,7 +428,8 @@ class Ship:
          brownout, power_factor,
          weapons, ship_id,
          dead,
-         missile_seq) = s   # 10.1: per-player death; 10.3b: missile counter
+         missile_seq,
+         power_used) = s   # 10.1: death; 10.3b: missile counter; 10.3c: power
         self.pos = pygame.Vector2(px, py)
         self.vel = pygame.Vector2(vx, vy)
         self.angle = a
@@ -439,6 +453,7 @@ class Ship:
         self.id = ship_id
         self.dead = dead   # 10.1: per-player death
         self.missile_seq = missile_seq   # 10.3b: resync the launch counter
+        self.power_used = power_used   # 10.3c: render-consistent power demand
 
     # --- simulation: per-thruster pipeline ---
 

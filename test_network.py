@@ -512,12 +512,12 @@ def run(res, impairment=None, label="clean", run_s=3.5):
             e_shape_ok = True
             tags = set()
             for e in P.get('enemies', ()):
-                if not (isinstance(e, tuple) and len(e) == 9):
+                if not (isinstance(e, tuple) and len(e) == 10):
                     e_shape_ok = False
                     break
                 tags.add(e[0])
             check("buffer enemy entries are (tag, x, y, angle, vx, vy, id, "
-                  "s_dump, s_clock) (7.2 + 10.2b)",
+                  "s_dump, s_clock, power_used) (7.2 + 10.2b + 10.3c)",
                   e_shape_ok, "n=%d" % len(P.get('enemies', ())))
             check("buffer enemy tags are real hull tags (7.2, D4)",
                   tags <= {'ai', 'mote'}, "tags=%r" % (sorted(tags),))
@@ -594,9 +594,10 @@ def run(res, impairment=None, label="clean", run_s=3.5):
                 curr_ang = {es[2]: es[0][4] for _tag, es in s_curr[1]}
                 in_span = True
                 checked = 0
-                # 10.2b: the entry is now a 9-tuple (… + shield_dump, shield_clock).
+                # 10.3c: the entry is now a 10-tuple (… + shield_dump, shield_clock,
+                # power_used).
                 for (_tag, _x, _y, ang, _vx, _vy, eid,
-                     _s_dump, _s_clock) in P.get('enemies', ()):
+                     _s_dump, _s_clock, _p_used) in P.get('enemies', ()):
                     if eid not in prev_ang or eid not in curr_ang:
                         continue
                     checked += 1

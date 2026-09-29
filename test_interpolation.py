@@ -486,10 +486,11 @@ def id_oracle(prev_s, curr_s, alpha, dt=None):
 
     # 10.2b: the prev enemy also carries (shield_dump, shield_clock) =
     # (es[6], es[7]) — lerp'd with the pose like the player ships'.
+    # 10.3c: + power_used (es[22]) — lerp'd like the shield state.
     prev_e = {}
     for _tag, p in prev_s[1]:
         es = p[0]
-        prev_e[_eid(p)] = (es[0], es[1], es[4], es[6], es[7])
+        prev_e[_eid(p)] = (es[0], es[1], es[4], es[6], es[7], es[22])
     prev_r = {_akey(t): (t[1], t[2]) for t in prev_s[5]}
 
     def mix_enemy_angle(pp, cp):
@@ -519,7 +520,8 @@ def id_oracle(prev_s, curr_s, alpha, dt=None):
                                         t[0][4]),
                         t[0][2], t[0][3], _eid(t),
                         mix_scalar(None if pe is None else pe[3], t[0][6]),
-                        mix_scalar(None if pe is None else pe[4], t[0][7])))
+                        mix_scalar(None if pe is None else pe[4], t[0][7]),
+                        mix_scalar(None if pe is None else pe[5], t[0][22])))
     # Player ships are matched by INDEX (Session 6.1) — ships don't turn
     # over, so slot i of curr_s[0] is the same ship as slot i of prev_s[0].
     # Pose = (x, y, raw angle) (Session 6.8). 10.2: the prev ship also
@@ -1144,9 +1146,10 @@ def main():
             print(f"FAIL: enemy angle — positions_at returned None at "
                   f"render_t={INTERP_DELAY + i * STEP}")
             break
-        # 10.2b: the entry is now a 9-tuple (… + shield_dump, shield_clock).
+        # 10.3c: the entry is now a 10-tuple (… + shield_dump, shield_clock,
+        # power_used).
         cur = {eid: ang for (_tag, _x, _y, ang, _vx, _vy, eid,
-                             _s_dump, _s_clock) in P['enemies']}
+                             _s_dump, _s_clock, _p_used) in P['enemies']}
         for eid, ang in cur.items():
             if eid in prev_enemy_angles:
                 d = abs((ang - prev_enemy_angles[eid] + math.pi)

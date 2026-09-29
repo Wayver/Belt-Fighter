@@ -63,7 +63,8 @@ from .config import (INTERP_DELAY, INTERP_DELAY_MIN, INTERP_DELAY_MAX,
                     ADAPT_K, SNAPSHOT_INTERVAL, TICK, MAX_FRAME_DT,
                     MAX_BULLETS, MAX_MISSILES,
                     MISSILE_SPEED, MISSILE_ACCEL, MISSILE_BOOST_TIME,
-                    MISSILE_TURN_RATE, MISSILE_LIFE)
+                    MISSILE_TURN_RATE, MISSILE_LIFE,
+                    SENSOR_SIGNATURE_THRESHOLD, SENSOR_SIG_FULL)
 from .ship import Ship
 from .bullets import Bullet
 from . import missile_telemetry as _mtel
@@ -695,9 +696,15 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
 
         {'ships': [(x, y, angle, dead, shield_dump, shield_clock), ...],
          'enemies': [(tag, x, y, angle, vx, vy, id,
-                      shield_dump, shield_clock), ...],
+                      shield_dump, shield_clock, power_used), ...],
          'asteroids': [(x, y), ...],
          'bullets': [(x, y, vx, vy, kind, owner, boost, mid), ...]}
+
+    Each enemy entry carries `power_used` (10.3c): the enemy's live power
+    demand (ship_s[22]), lerp'd across the window like the shield state.
+    The ghost's sensor-contact signature is `power_used - power_idle_total`
+    (power_idle_total is a loadout constant the client derives) — see
+    PredictedShip._update_contacts.
 
     Each projectile entry carries `mid` (10.3b): the missile's unique id
     (player_index, seq) for kind == 'missile', else None. The client uses
@@ -812,10 +819,17 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
     # the shield state (10.2b) is lerp'd with the pose so the remote
     # enemy's impact flash fades smoothly across the window (same rule as
     # the player ships' shield state).
+    # 10.3c: the enemy entry also carries power_used (ship_s[22]) — the
+    # live power demand the ghost's sensor-contact signature needs
+    # (power_used - power_idle_total). LERP'd across the window like the
+    # shield state (the enemy's power demand eases smoothly between
+    # snapshots as it throttles / fires); a new enemy pops in at its curr
+    # power_used.
     prev_enemies = {}
     for _tag, p in prev_s[1]:
         es = p[0]
-        prev_enemies[_enemy_id(p)] = (es[0], es[1], es[4], es[6], es[7])
+        prev_enemies[_enemy_id(p)] = (es[0], es[1], es[4], es[6], es[7],
+                                      es[22])
     enemies = []
     for tag, c in curr_s[1]:
         ce = c[0]
@@ -824,7 +838,7 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
         pp = prev_enemies.get(eid)
         if pp is None:
             enemies.append((tag, cpos[0], cpos[1], ce[4], ce[2], ce[3],
-                            eid, ce[6], ce[7]))
+                            eid, ce[6], ce[7], ce[22]))
         else:
             enemies.append((tag,
                             lerp(pp[0], cpos[0], a),
@@ -833,7 +847,8 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
                             ce[2], ce[3],
                             eid,
                             lerp(pp[3], ce[6], a),
-                            lerp(pp[4], ce[7], a)))
+                            lerp(pp[4], ce[7], a),
+                            lerp(pp[5], ce[22], a)))
 
     prev_rocks = {_asteroid_key(p): (p[1], p[2]) for p in prev_s[5]}
     asteroids = []
@@ -956,7 +971,7 @@ class SnapshotBuffer:
         Returns the same dict shape as `interp_positions`
         ({'ships': [(x, y, angle, dead, shield_dump, shield_clock), ...],
         'enemies': [(tag, x, y, angle, vx, vy, id,
-                     shield_dump, shield_clock), ...],
+                     shield_dump, shield_clock, power_used), ...],
         'asteroids': [(x, y), ...],
         'bullets': [(x, y, vx, vy, kind, owner, boost, mid), ...]}) or None
         when there is not yet a window to interpolate between (fewer than
@@ -1361,6 +1376,16 @@ class PredictedShip:
         s.missile_target = self._pick_missile_target(s, enemies)
         s.contacts = []
         shots, beams, missiles = s.update(dt, inp)
+        # 10.3c: build the ghost's sensor contacts AFTER s.update — the
+        # ghost's own sensor state (sensor_on, scan_reveal, scan_cd) is
+        # this tick's value (synced from the snapshot on reconcile, and
+        # mutated immediately by the client's V/G command sink), so the
+        # contacts match what the host's _update_contacts would produce
+        # given the same sensor state + the same enemy positions. The
+        # enemies are the buffer's proxies (at the render point, ~
+        # INTERP_DELAY behind the host's live positions) — acceptable for
+        # presentation (the contacts are 10 Hz blips/arrows).
+        self._update_contacts(s, enemies)
         # Keep the ghost's own gun shots (Session 7.3). The host's world
         # cap is MAX_BULLETS total; the ghost's list holds only the local
         # player's shots, so capping it at MAX_BULLETS is a faithful
@@ -1470,6 +1495,52 @@ class PredictedShip:
             if d <= best_d:
                 best, best_d = e, d
         return best
+
+    def _update_contacts(self, s, enemies):
+        """Build the ghost's sensor contacts from the fitted sensor.
+
+        10.3c: mirrors the host's `Game._update_contacts` EXACTLY so the
+        ghost's contacts match the host's given the same sensor state +
+        the same enemy positions. The host iterates `self.enemies` (live
+        AIEnemies) and reads `e.ship.power_used - e.ship.power_idle_total`;
+        the ghost iterates the buffer's enemy PROXIES and reads the same
+        off `proxy.ship` (a `_GhostEnemyShip` stand-in whose power fields
+        are filled by `_ghost_enemy_proxies` — power_used from the buffer,
+        power_idle_total derived from the tag's loadout).
+
+        Passive: enemies in sensor_range whose active power draw
+        (power_used - idle) crosses SENSOR_SIGNATURE_THRESHOLD. Active:
+        while a ping's reveal lasts, everything in scan_range is
+        confirmed. A confirmed contact replaces a passive one (the host
+        keys `found` by the enemy object; the ghost keys by proxy id —
+        the same 1:1 mapping, since there is one proxy per enemy).
+
+        `enemies` is the list of proxies (or None) — the ghost has no
+        enemy list of its own. When None (tests, or before the buffer has
+        a window) the contacts stay empty (the pre-10.3c behavior).
+        """
+        c = s.sensor_comp
+        s.contacts = []
+        if c is None:
+            return
+        if not enemies:
+            return
+        found = {}
+        if s.sensor_on and c.sensor_range > 0:
+            for e in enemies:
+                d = e.pos.distance_to(s.pos)
+                if d <= c.sensor_range:
+                    sig = e.ship.power_used - e.ship.power_idle_total
+                    if sig >= SENSOR_SIGNATURE_THRESHOLD:
+                        found[e.id] = [e.pos.copy(), d,
+                                       min(1.0, sig / SENSOR_SIG_FULL),
+                                       False]
+        if s.scan_reveal > 0 and c.scan_range > 0:
+            for e in enemies:
+                d = e.pos.distance_to(s.pos)
+                if d <= c.scan_range:
+                    found[e.id] = [e.pos.copy(), d, 1.0, True]
+        s.contacts = list(found.values())
 
     def step_local_beams(self, dt):
         """Age the ghost's local beams by `dt` and cull the expired

@@ -154,8 +154,9 @@ def main():
     # at (100, 100), so the missile must turn toward +y to home in.
     assert gm2.vel.x > 0 and abs(gm2.vel.y) < 1e-6, \
         "the launch vel must be +x (the slot orientation): %r" % gm2.vel
-    # Step through the boost phase (0.35 s = 21 ticks) and into seeking.
-    for _ in range(40):
+    # Step through the boost phase (0.62 s = 37 ticks, 10.3h) and into
+    # seeking.
+    for _ in range(45):
         ghost2.step_local_missiles(TICK, [proxy2])
     assert gm2.vel.y > 0, \
         "after the boost the missile must have turned toward the off-axis " \
@@ -172,8 +173,9 @@ def main():
     ghost3.seed(make_seed_ship_s())
     ghost3.step(TICK, ShipInput(missile_fire=True), enemies=[proxy3])
     gm3 = ghost3.local_missiles[0]
-    # Get through the boost phase (while the target is present).
-    for _ in range(25):
+    # Get through the boost phase (while the target is present). The boost
+    # is 0.62 s = 37 ticks (10.3h), so step 40 to be safely past it.
+    for _ in range(40):
         ghost3.step_local_missiles(TICK, [proxy3])
     vel_before = gm3.vel.copy()
     # Now the target is GONE (empty enemies list) -> the missile coasts.

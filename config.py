@@ -223,10 +223,13 @@ MISSILE_HANDOFF_OFFSET_EPS = 0.5
 # frames: a buffer missile that just appeared is FROZEN for the first
 # interval (no earlier position to lerp from, B_disp = 0), so the cap
 # freezes the offset too (shrinkage = 0) — the rendered position stays put
-# instead of drifting backward. 0.5 = the missile never slows below half
-# its forward speed during the merge; lower = snappier merge, higher =
-# smoother (but 1.0 would let it freeze, and >1.0 would let it reverse).
-MISSILE_HANDOFF_MAX_SHRINK = 0.5
+# instead of drifting backward. The cap IS the merge's visible slowdown:
+# the missile moves at (1-cap)*speed during the merge, so 0.25 = it never
+# slows below 75% of its forward speed (a short, barely-noticeable ease);
+# higher = a longer, smoother ease (1.0 would let it freeze, >1.0 would
+# let it reverse). 0.5 was the first live-test value ("slows down a bit");
+# 0.25 keeps it snappier.
+MISSILE_HANDOFF_MAX_SHRINK = 0.25
 
 # --- sound ---
 SFX_MASTER_VOLUME = 0.8   # 0..1 master gain for all SFX

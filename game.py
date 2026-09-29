@@ -47,7 +47,8 @@ from . import missile_telemetry as _mtel
 from .config import (INTERP_DELAY, SNAPSHOT_INTERVAL, ROCK_FILL, ROCK_EDGE,
                     ENEMY_FILL, ENEMY_EDGE, ENEMY_FLAME,
                     SHIP_COLOR, SHIP_EDGE,
-                    MISSILE_HANDOFF_DECAY, MISSILE_HANDOFF_OFFSET_EPS)
+                    MISSILE_HANDOFF_DECAY, MISSILE_HANDOFF_OFFSET_EPS,
+                    MISSILE_HANDOFF_MAX_SHRINK)
 
 STEP = 1 / 60   # fixed simulation timestep
 
@@ -708,18 +709,27 @@ class Game:
         # predicted_view can detect the alive->dead transition (to spawn
         # the client-side explosion burst exactly once).
         self._local_was_dead = False
-        # 10.3d/10.3e: the decoupled render offset (the handback fix). At
-        # handback, the buffer's copy of a ghost missile is INTERP_DELAY
-        # seconds BEHIND the ghost's predicted position, so drawing it at
-        # its interpolated position makes the missile JUMP BACKWARD. The
-        # fix: add (ghost_pos - interp_pos) to the buffer's missile
-        # rendering and decay it each frame (MISSILE_HANDOFF_DECAY) so the
-        # missile converges to the buffer's position smoothly, moving
-        # forward the whole time. 10.3e: the handoff happens on the frame
-        # the buffer's copy is VISIBLE (not at snapshot arrival — that
-        # left a 6-15 frame gap where the missile was drawn by neither
-        # the ghost nor the buffer, the "blink"), so the ghost's position
-        # is captured at THAT moment, not at cull time. Two dicts:
+        # 10.3d/10.3e/10.3f/10.3g: the decoupled render offset (the
+        # handback fix). At handback, the buffer's copy of a ghost missile
+        # is INTERP_DELAY seconds BEHIND the ghost's predicted position,
+        # so drawing it at its interpolated position makes the missile
+        # JUMP BACKWARD. The fix: add (ghost_pos - interp_pos) to the
+        # buffer's missile rendering and decay it each frame
+        # (MISSILE_HANDOFF_DECAY) so the missile converges to the buffer's
+        # position smoothly. 10.3e: the handoff happens on the frame the
+        # buffer's copy is VISIBLE (not at snapshot arrival — that left a
+        # 6-15 frame gap where the missile was drawn by neither the ghost
+        # nor the buffer, the "blink"), so the ghost's position is
+        # captured at THAT moment, not at cull time. 10.3f: the decay is
+        # CAPPED (MISSILE_HANDOFF_MAX_SHRINK) so the rendered position
+        # never moves backward — the plain decay's backward pull
+        # (9*INTERP_DELAY*speed px/s at handback) exceeded the missile's
+        # forward speed at high adaptive delays, so the missile visibly
+        # reversed before resuming. 10.3g: the handoff waits until the
+        # buffer's copy is MOVING (not merely visible — a new buffer
+        # missile is FROZEN for its pop-in window, so handing off on the
+        # first visible frame stalled the missile for up to a snapshot
+        # interval). Three dicts:
         #   _missile_handoff_ghost_pos: {mid: (gx, gy)} — the ghost's
         #     position at the handoff frame, set by predicted_view when it
         #     hands a pending ghost missile off to the buffer. Consumed by
@@ -730,8 +740,15 @@ class Game:
         #     offset, set by predicted_view (first draw) and decayed each
         #     frame. Applied to the buffer's missile rendering + fog
         #     light. Client-only (the host never runs the ghost).
+        #   _missile_handoff_buf_pos: {mid: (x, y)} — the buffer's
+        #     INTERPOLATED position of each offset-carrying missile on the
+        #     PREVIOUS frame (10.3f). predicted_view diffs it against the
+        #     current frame's position to get the buffer's displacement,
+        #     which caps the offset's shrinkage (the no-backward-motion
+        #     guarantee).
         self._missile_handoff_ghost_pos = {}
         self._missile_handoff_offsets = {}
+        self._missile_handoff_buf_pos = {}
         self.reset()
 
     @property
@@ -817,6 +834,7 @@ class Game:
         # copies are gone).
         self._missile_handoff_offsets.clear()
         self._missile_handoff_ghost_pos.clear()
+        self._missile_handoff_buf_pos.clear()
         self._sfx_thruster(False)   # never carry the engine loop across a reset
         if self.test_mode:
             self._setup_test_scene()
@@ -2310,20 +2328,47 @@ class Game:
         # not skipped this frame.
         _pending = [m for m in self.ghost.local_missiles if m.pending]
         if _pending:
-            _visible = {tuple(b[7]) for b in pos['bullets']
-                        if b[7] is not None}
-            _hgo = self._missile_handoff_offsets
+            # 10.3g: hand off only when the buffer's copy is MOVING, not
+            # merely visible. A buffer missile that just entered the
+            # window "pops in" at its curr position and is FROZEN for the
+            # rest of that window (the snapshot before it has no missile
+            # to lerp from — _match_bullets returns None). 10.3e handed
+            # off on the first VISIBLE frame, seeding the offset against
+            # a FROZEN position — so the missile held still for up to a
+            # snapshot interval (~100 ms) before the buffer advanced: a
+            # visible stall. The fix: keep the ghost drawing the pending
+            # missile until the buffer's copy ADVANCES (its position
+            # differs from the previous frame's, tracked in _hbuf). The
+            # first advancing frame is the handoff frame: remove the
+            # missile from local_missiles (so the buffer copy is no longer
+            # dedup-skipped below) and record the ghost's position AT THIS
+            # MOMENT — the offset is then computed against the
+            # interpolated position on the first buffer draw (the 10.3d
+            # path). _hbuf is seeded here during the frozen frames so the
+            # 10.3f decay cap (below) sees a real displacement from the
+            # handoff frame on. This must run BEFORE local_missile_ids is
+            # built, so a handed-off missile is not skipped this frame.
+            _hbuf = self._missile_handoff_buf_pos
             _hgpos = self._missile_handoff_ghost_pos
+            _buf_now = {tuple(b[7]): (b[0], b[1]) for b in pos['bullets']
+                        if b[4] == 'missile' and b[7] is not None}
             _kept = []
             for m in self.ghost.local_missiles:
-                if m.pending and tuple(m.id) in _visible:
-                    _hgpos[tuple(m.id)] = (m.pos.x, m.pos.y)
-                    _mtel.log("HANDBACK", h_host_seq="",
-                              h_buf_ids="", h_before="", h_after="",
-                              h_culled=_mtel.fmt_ids([tuple(m.id)]),
-                              h_jump="")
-                else:
-                    _kept.append(m)
+                _mid = tuple(m.id)
+                _bp = _buf_now.get(_mid)
+                if m.pending and _bp is not None:
+                    _prev = _hbuf.get(_mid)
+                    _hbuf[_mid] = _bp
+                    if _prev is not None and _prev != _bp:
+                        # The buffer's copy has ADVANCED since it first
+                        # appeared — the pop-in freeze is over. Hand off.
+                        _hgpos[_mid] = (m.pos.x, m.pos.y)
+                        _mtel.log("HANDBACK", h_host_seq="",
+                                  h_buf_ids="", h_before="", h_after="",
+                                  h_culled=_mtel.fmt_ids([_mid]),
+                                  h_jump="")
+                        continue
+                _kept.append(m)
             self.ghost.local_missiles = _kept
         local_missile_ids = {tuple(m.id) for m in self.ghost.local_missiles}
         # 10.3d: the decoupled render offset (the handback fix). For each
@@ -2348,15 +2393,63 @@ class Game:
         # decayed each frame.
         _hgo = self._missile_handoff_offsets
         _hgpos = self._missile_handoff_ghost_pos
-        # Decay existing offsets (frame-rate independent).
+        _hbuf = self._missile_handoff_buf_pos
+        # 10.3f: the buffer's per-missile position THIS frame (drives the
+        # displacement-based shrinkage cap below).
+        _buf_pos = {}
+        for _b in pos['bullets']:
+            if _b[4] == 'missile' and _b[7] is not None:
+                _buf_pos[tuple(_b[7])] = (_b[0], _b[1])
+        # Decay existing offsets (frame-rate independent), CAPPED by the
+        # buffer's ACTUAL displacement this frame so the rendered position
+        # (buffer_pos + offset) NEVER moves backward (10.3f — see
+        # MISSILE_HANDOFF_MAX_SHRINK in config). The plain 0.85 decay
+        # shrank the offset by 0.15*|offset|/frame, which at handback
+        # (|offset| ~ INTERP_DELAY*speed) is 9*INTERP_DELAY*speed px/s of
+        # backward pull — faster than the missile's forward speed once
+        # INTERP_DELAY > ~0.11, so the missile visibly reversed. Capping
+        # the shrinkage at a fraction of the buffer's OWN advance this
+        # frame guarantees the net rendered motion is always forward
+        # (>= (1 - cap) * B_disp). It also handles the POP-IN frames: a
+        # buffer missile that just appeared has no earlier position to
+        # lerp from, so it is FROZEN for the first interval (B_disp = 0)
+        # — the cap then freezes the offset too (shrinkage = 0), so the
+        # rendered position stays put instead of drifting backward.
         if _hgo:
             _decay = MISSILE_HANDOFF_DECAY ** (dt * 60.0)
             for _mid in list(_hgo):
                 _dx, _dy = _hgo[_mid]
-                _dx *= _decay
-                _dy *= _decay
+                _mag = math.hypot(_dx, _dy)
+                if _mag < MISSILE_HANDOFF_OFFSET_EPS:
+                    del _hgo[_mid]
+                    _hbuf.pop(_mid, None)
+                    continue
+                _bp = _buf_pos.get(_mid)
+                if _bp is not None:
+                    _prev = _hbuf.get(_mid)
+                    _hbuf[_mid] = _bp
+                    if _prev is not None:
+                        _b_disp = math.hypot(_bp[0] - _prev[0],
+                                             _bp[1] - _prev[1])
+                        _shrink = min(_mag * (1.0 - _decay),
+                                      MISSILE_HANDOFF_MAX_SHRINK * _b_disp)
+                    else:
+                        # First frame the buffer's copy is tracked (the
+                        # pop-in frame): it is frozen (no earlier
+                        # position), so freeze the offset too (no
+                        # backward drift while the buffer is stationary).
+                        _shrink = 0.0
+                else:
+                    # The buffer's copy left the window this frame: no
+                    # displacement to cap against — use the plain decay
+                    # (the offset is about to be culled anyway).
+                    _shrink = _mag * (1.0 - _decay)
+                _s = 1.0 - _shrink / _mag
+                _dx *= _s
+                _dy *= _s
                 if math.hypot(_dx, _dy) < MISSILE_HANDOFF_OFFSET_EPS:
                     del _hgo[_mid]
+                    _hbuf.pop(_mid, None)
                 else:
                     _hgo[_mid] = (_dx, _dy)
         # TELEMETRY (10.3b): the DEDUP ground truth — which buffer missiles

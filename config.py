@@ -206,6 +206,27 @@ MISSILE_HANDOFF_DECAY = 0.85
 # The offset is removed when its magnitude drops below this threshold (px),
 # to avoid floating-point noise (a 0.1 px offset is invisible).
 MISSILE_HANDOFF_OFFSET_EPS = 0.5
+# 10.3f: the decoupled offset must never pull the missile BACKWARD. The
+# rendered position is buffer_pos + offset; the buffer advances forward at
+# the missile's speed while the offset decays (shrinks), pulling the
+# rendered position BACKWARD. With a plain 0.85 decay the shrinkage is
+# 0.15*|offset|/frame = 9*INTERP_DELAY*speed px/s at handback (|offset| is
+# ~INTERP_DELAY*speed), so the net rendered velocity is
+# speed*(1 - 9*INTERP_DELAY): forward at INTERP_DELAY=0.1 but BACKWARD at
+# 0.35 (the adaptive delay's max) — the visible "slows down and reverses"
+# after handback. The fix: cap the per-frame shrinkage at
+# MISSILE_HANDOFF_MAX_SHRINK * (the buffer's ACTUAL displacement this
+# frame), so the rendered position always moves FORWARD (net motion >=
+# (1-cap) * B_disp, never zero, never backward). The cap is a fraction of
+# the buffer's own advance, so it is frame-rate independent and tracks the
+# missile's actual motion (boost ramp, homing). It also handles the POP-IN
+# frames: a buffer missile that just appeared is FROZEN for the first
+# interval (no earlier position to lerp from, B_disp = 0), so the cap
+# freezes the offset too (shrinkage = 0) — the rendered position stays put
+# instead of drifting backward. 0.5 = the missile never slows below half
+# its forward speed during the merge; lower = snappier merge, higher =
+# smoother (but 1.0 would let it freeze, and >1.0 would let it reverse).
+MISSILE_HANDOFF_MAX_SHRINK = 0.5
 
 # --- sound ---
 SFX_MASTER_VOLUME = 0.8   # 0..1 master gain for all SFX

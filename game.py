@@ -2644,6 +2644,24 @@ class Game:
         # burst behind the local light bubble).
         self._draw_death_bursts(screen, self.cam)
 
+        # 10.3c: the ghost's scan pulse ring + sensor contacts, drawn
+        # ABOVE the fog — the SAME two calls the host's model path makes
+        # (fog -> scan pulse -> contacts -> HUD). The ghost's contacts
+        # are built every step from the buffer's enemy proxies (the
+        # proxy's .ship carries power_used from the buffer +
+        # power_idle_total derived from the tag's loadout — the same
+        # signature the host's _update_contacts reads off the live
+        # enemy), so given the same sensor state the client sees the
+        # same blips/arrows the host does. The pulse ring is the
+        # expanding circle on a G press (Ship._draw_scan_pulse, driven
+        # by the ghost's scan_pulse).
+        if not self.ghost.ship.dead:
+            self.ghost.ship._draw_scan_pulse(screen, self.cam,
+                                             self.ghost.ship.pos)
+            _draw_sensor_contacts_model(screen, self.cam, self.font,
+                                        self.ghost.ship.pos,
+                                        self.ghost.ship.contacts)
+
         # HUD: the LOCAL (ghost) ship's power/shield/velocity, and the real
         # (interpolated) enemy count from the buffer. self.ship is players[0]
         # (the HOST's ship on a client) and self.enemies is the client's stale

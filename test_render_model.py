@@ -160,7 +160,7 @@ def check_parity(m, g):
     # --- enemies ---
     assert len(m["enemies"]) == len(g.enemies), "enemies len"
     for (mtag, mid, mpos, mang, mvel, macc, mcr, mpoly,
-             mdump, mclock), e in zip(m["enemies"], g.enemies):
+             mdump, mclock, mflame), e in zip(m["enemies"], g.enemies):
         assert mtag == g._enemy_tag(e), "enemy tag"
         assert mid == e.ship.id, "enemy ship_id"
         assert mpos == (e.pos.x, e.pos.y), "enemy pos"
@@ -173,6 +173,10 @@ def check_parity(m, g):
         # host's rendered enemies flash (restores the M2a deliberate loss).
         assert mdump == e.ship.shield_dump, "enemy shield_dump"
         assert mclock == e.ship.shield_clock, "enemy shield_clock"
+        # 10.6: the model carries the enemy's flame_mags so the host's
+        # rendered enemies show their exhaust (restores the M2a deliberate
+        # loss of enemy flames, parity with the client's buffer path).
+        assert mflame == dict(e.ship.flame_mags), "enemy flame_mags"
     # --- projectiles ---
     assert len(m["bullets"]) == len(g.bullets), "bullets len"
     for (mpos, mvel), b in zip(m["bullets"], g.bullets):

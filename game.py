@@ -201,16 +201,16 @@ class _GhostEnemyShip:
 # (M3) once the model is published by an atomic reference swap.
 #
 # They mirror the live `a.draw` / `e.draw` / `p.draw` / inline bullet-missile
-# code exactly, so the world renders identically. The deliberate loss
-# (restorable later): the enemy tuple carries pose + hull tag, NOT the
-# enemy ship's presentation state (flame_mags / shield_impacts / arcs), so a
-# stand-in draws the enemy hull WITHOUT its thruster flames. The local ship
-# (M2b) keeps its full presentation, so the host's own feel is unaffected.
-# 10.2b restored the SHIELD FLASH half: the model's enemy tuple now carries
-# shield_dump/shield_clock and _draw_world_enemy feeds them to the stand-in
-# (the client's buffer path does the same — both peers flash identically).
-# To restore enemy thruster flames later, add flame_mags to the model's
-# enemy tuple and pass them into _draw_world_enemy.
+# code exactly, so the world renders identically. The M2a "deliberate loss"
+# (the enemy tuple carried pose + hull tag, NOT the enemy ship's
+# presentation state) has been fully restored: 10.2b added the SHIELD FLASH
+# half (shield_dump/shield_clock) and 10.6 added the THRUSTER FLAMES half
+# (flame_mags) — _draw_world_enemy feeds both to the stand-in (the client's
+# buffer path does the same, so both peers render enemy flames + flash
+# identically). The remaining dropped presentation (shield_impacts / arcs)
+# is still not carried — the enemy stand-in draws no impact sparks or
+# brownout arcs (a 10.5 follow-up). The local ship (M2b) keeps its full
+# presentation, so the host's own feel is unaffected.
 #
 # Deferred to M2b (still read live state in draw() for now): the laser BEAMS
 # and the targeting RETICLE — both are entangled with the local ship's
@@ -240,7 +240,8 @@ def _draw_world_asteroid(screen, cam, pos, angle, verts):
 
 
 def _draw_world_enemy(screen, cam, tag, pos, angle, standins,
-                      shield_dump=0.0, shield_clock=0.0):
+                      shield_dump=0.0, shield_clock=0.0,
+                      flame_mags=None):
     """One enemy as its REAL hull at (pos, angle), via the per-tag
     presentation stand-in (the same stand-ins the client's remote render
     uses — the hull + loadout are fixed on both peers by construction).
@@ -252,12 +253,20 @@ def _draw_world_enemy(screen, cam, tag, pos, angle, standins,
     the enemy's shield-impact flash — restoring the M2a "deliberate loss"
     (the stand-in's own never-stepped state was a zero dump, so it drew
     nothing). The stand-in is per-tag and drawn once per enemy, so the
-    feed is correct for the enemy being drawn this call."""
+    feed is correct for the enemy being drawn this call.
+
+    10.6: `flame_mags` (from the model's enemy tuple, the CURRENT frame —
+    not lerp'd) is fed to the stand-in before the draw, so Ship.draw
+    renders the enemy's thruster exhaust — restoring the M2a "deliberate
+    loss" of enemy flames on the host's model path (the client's buffer
+    path does the same, so both peers show enemy exhaust). None (or an
+    empty dict) draws no exhaust, the pre-10.6 behavior."""
     e = standins.get(tag)
     if e is None:
         return
     e.ship.shield_dump = shield_dump
     e.ship.shield_clock = shield_clock
+    e.ship.flame_mags = dict(flame_mags) if flame_mags else {}
     e.ship.draw(screen, cam, pygame.Vector2(pos), angle,
                 fill=e.hull.fill or ENEMY_FILL,
                 edge=e.hull.edge or ENEMY_EDGE,
@@ -1115,7 +1124,8 @@ class Game:
                           e.collision_radius,
                           tuple(e.ship.collision.local_poly),
                           e.ship.shield_dump,
-                          e.ship.shield_clock))
+                          e.ship.shield_clock,
+                          dict(e.ship.flame_mags)))
                         for e in self.enemies],
             "bullets": [((b.pos.x, b.pos.y), (b.vel.x, b.vel.y))
                         for b in self.bullets],
@@ -1910,9 +1920,9 @@ class Game:
         # ship_id -> model enemy tuple (for beam-target resolution).
         enemies_by_id = {e[1]: e for e in model["enemies"]}
         for (tag, _id, pos, angle, _vel, _acc, _cr, _poly,
-             s_dump, s_clock) in model["enemies"]:
+             s_dump, s_clock, flame_mags) in model["enemies"]:
             _draw_world_enemy(screen, self.cam, tag, pos, angle, standins,
-                              s_dump, s_clock)
+                              s_dump, s_clock, flame_mags)
         # The LOCAL player's model pack (fog / beams / reticle / contacts / HUD
         # all read the local ship, mirroring the live self.ship = players[0]
         # on the host, players[local_index] on a client).
@@ -2049,11 +2059,11 @@ class Game:
             self._draw_remote_rock(screen, x, y)
         # Remote enemies as their REAL hulls (Session 7.2, the D4 fix) —
         # the buffer carries (tag, x, y, angle, vx, vy, id, shield_dump,
-        # shield_clock, power_used) (10.2b + 10.3c).
-        for (tag, x, y, ang, vx, vy, _eid, s_dump, s_clock, _p_used) \
-                in pos['enemies']:
+        # shield_clock, power_used, flame_mags) (10.2b + 10.3c + 10.6).
+        for (tag, x, y, ang, vx, vy, _eid, s_dump, s_clock, _p_used,
+             flame_mags) in pos['enemies']:
             self._draw_remote_enemy_hull(screen, tag, x, y, ang,
-                                         s_dump, s_clock)
+                                         s_dump, s_clock, flame_mags)
         # Remote projectiles (Session 7.2, the D3 fix). 10.3b: the entry
         # carries the missile id (mid) too — unused here (remote_view has
         # no ghost to dedup against).
@@ -2065,12 +2075,16 @@ class Game:
         # instead of a dot. 10.1: the entry is (x, y, angle, dead); a dead
         # ship is not drawn (it disappears until it respawns). 10.2: the
         # entry also carries (shield_dump, shield_clock) — fed to the ship
-        # so its impact flash renders (mirrors predicted_view).
-        for i, (x, y, ang, dead, s_dump, s_clock) in enumerate(pos['ships']):
+        # so its impact flash renders (mirrors predicted_view). 10.6: the
+        # entry also carries flame_mags — fed to the ship so its exhaust
+        # renders (parity with the host's _sync_local_ship).
+        for i, (x, y, ang, dead, s_dump, s_clock, flame_mags) \
+                in enumerate(pos['ships']):
             if dead:
                 continue
             self.players[i].shield_dump = s_dump
             self.players[i].shield_clock = s_clock
+            self.players[i].flame_mags = dict(flame_mags)
             self.players[i].draw(screen, self.cam,
                                  pygame.Vector2(x, y), ang)
 
@@ -2286,16 +2300,18 @@ class Game:
             self._draw_remote_rock(screen, x, y)
         # Remote enemies as their REAL hulls (Session 7.2, the D4 fix):
         # the buffer carries (tag, x, y, angle, vx, vy, id, shield_dump,
-        # shield_clock, power_used) (10.2b + 10.3c); the angle is lerp'd
-        # with lerp_angle (the same wrapped-delta rule as player ships,
-        # 6.8) and the hull is fixed on both peers by construction, so the
-        # stand-in per tag draws it faithfully. The shield state feeds the
-        # stand-in so the enemy's shield-impact flash renders (mirrors the
-        # host's model path, 10.2b).
-        for (tag, x, y, ang, vx, vy, _eid, s_dump, s_clock, _p_used) \
-                in pos['enemies']:
+        # shield_clock, power_used, flame_mags) (10.2b + 10.3c + 10.6);
+        # the angle is lerp'd with lerp_angle (the same wrapped-delta rule
+        # as player ships, 6.8) and the hull is fixed on both peers by
+        # construction, so the stand-in per tag draws it faithfully. The
+        # shield state feeds the stand-in so the enemy's shield-impact
+        # flash renders (mirrors the host's model path, 10.2b); the flame
+        # mags feed it so the enemy's exhaust renders (10.6, mirrors the
+        # host's model path too).
+        for (tag, x, y, ang, vx, vy, _eid, s_dump, s_clock, _p_used,
+             flame_mags) in pos['enemies']:
             self._draw_remote_enemy_hull(screen, tag, x, y, ang,
-                                         s_dump, s_clock)
+                                         s_dump, s_clock, flame_mags)
         # Remote projectiles (Session 7.2, the D3 fix): every bullet and
         # missile in the buffer, at its interpolated position.
         # 10.3b: DEDUP — the buffer also carries the LOCAL player's own
@@ -2507,8 +2523,12 @@ class Game:
         # shield-impact flash (Ship._draw_shield) from those two fields —
         # so feeding them here makes the remote ship's blue->white impact
         # flash render the same way the host's does (the client's own
-        # ship already shows its flash via the ghost).
-        for i, (x, y, ang, dead, s_dump, s_clock) in enumerate(pos['ships']):
+        # ship already shows its flash via the ghost). 10.6: the entry
+        # also carries flame_mags — fed to the ship so its exhaust
+        # renders (parity with the host's _sync_local_ship, which feeds
+        # the remote player ship's flames on the host's render path).
+        for i, (x, y, ang, dead, s_dump, s_clock, flame_mags) \
+                in enumerate(pos['ships']):
             if i == self.local_index:
                 continue
             if dead:
@@ -2519,6 +2539,7 @@ class Game:
             self.players[i].dead = False
             self.players[i].shield_dump = s_dump
             self.players[i].shield_clock = s_clock
+            self.players[i].flame_mags = dict(flame_mags)
             self.players[i].draw(screen, self.cam,
                                  pygame.Vector2(x, y), ang)
 
@@ -2694,7 +2715,8 @@ class Game:
         return s
 
     def _draw_remote_enemy_hull(self, screen, tag, x, y, ang,
-                            shield_dump=0.0, shield_clock=0.0):
+                            shield_dump=0.0, shield_clock=0.0,
+                            flame_mags=None):
         """Draw a remote enemy as its REAL hull at the interpolated
         (pos, angle) (Session 7.2 — replaces the 10 px dot, the D4
         defect). The stand-in's Ship.draw takes explicit pos/angle, so
@@ -2704,7 +2726,14 @@ class Game:
         entry, lerp'd across the window) are fed to the stand-in before
         the draw, so Ship._draw_shield renders the enemy's shield-impact
         flash — the same blue->white glow the host now shows (10.2b
-        restored it on the host's model path too)."""
+        restored it on the host's model path too).
+
+        10.6: `flame_mags` (from the buffer's enemy entry, the CURRENT
+        snapshot — not lerp'd) is fed to the stand-in before the draw, so
+        Ship.draw renders the enemy's thruster exhaust — the same flames
+        the host's model path now shows (10.6 restored the M2a
+        "deliberate loss" of enemy flames on both peers). None (or an
+        empty dict) draws no exhaust, the pre-10.6 behavior."""
         e = self._get_remote_enemies().get(tag)
         if e is None:
             # Unknown tag (e.g. 'test'): fall back to the coarse dot so
@@ -2713,6 +2742,7 @@ class Game:
             return
         e.ship.shield_dump = shield_dump
         e.ship.shield_clock = shield_clock
+        e.ship.flame_mags = dict(flame_mags) if flame_mags else {}
         e.ship.draw(screen, self.cam, pygame.Vector2(x, y), ang,
                     fill=e.hull.fill or ENEMY_FILL,
                     edge=e.hull.edge or ENEMY_EDGE,
@@ -2877,8 +2907,8 @@ class Game:
         """
         standins = self._get_remote_enemies()
         proxies = []
-        for (tag, x, y, ang, vx, vy, eid, _s_dump, _s_clock, power_used) \
-                in pos['enemies']:
+        for (tag, x, y, ang, vx, vy, eid, _s_dump, _s_clock, power_used,
+             _flame_mags) in pos['enemies']:
             e = standins.get(tag)
             # power_idle_total is a loadout constant (sum of the fitted
             # components' power_idle). The stand-in's ship is built with
@@ -2906,11 +2936,12 @@ class Game:
         they are presentation, never stepped, never fed to the sim."""
         proxies = []
         standins = self._get_remote_enemies()
-        # 10.2b/10.3c: the buffer's enemy entry also carries (shield_dump,
-        # shield_clock, power_used) — unused here (the reticle only needs
-        # the pose), but the unpack must match the 10-tuple shape.
-        for (tag, x, y, ang, vx, vy, _eid, _s_dump, _s_clock, _p_used) \
-                in pos['enemies']:
+        # 10.2b/10.3c/10.6: the buffer's enemy entry also carries (shield_dump,
+        # shield_clock, power_used, flame_mags) — unused here (the reticle
+        # only needs the pose), but the unpack must match the 11-tuple
+        # shape.
+        for (tag, x, y, ang, vx, vy, _eid, _s_dump, _s_clock, _p_used,
+             _flame_mags) in pos['enemies']:
             e = standins.get(tag)
             if e is None:
                 continue

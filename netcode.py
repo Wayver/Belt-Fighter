@@ -19,13 +19,15 @@ id) so interpolation survives entity turnover — see `interp_positions`
 for the membership rules.
 
 Player ships carry their ANGLE too (Session 6.8): the buffer returns
-(x, y, angle, dead, shield_dump, shield_clock) per ship, with the angle
-lerp'd the same way `Ship.sync_render` does (the wrapped delta, via
-`lerp_angle`), so the remote peer can draw the remote hull at its
+(x, y, angle, dead, shield_dump, shield_clock, flame_mags) per ship, with
+the angle lerp'd the same way `Ship.sync_render` does (the wrapped delta,
+via `lerp_angle`), so the remote peer can draw the remote hull at its
 interpolated orientation instead of a dot. The `dead` flag (Session
 10.1) lets the remote peer skip a dead ship (it disappears until it
 respawns) and spawn a
-client-side explosion on the alive->dead transition.
+client-side explosion on the alive->dead transition. `flame_mags`
+(10.6) is the per-thruster exhaust (current snapshot, not lerp'd) so the
+remote player ship's exhaust renders (parity with the host).
 
 Session 7.2 (full remote rendering): enemies carry their ANGLE, TAG,
 VELOCITY, and ID too — (tag, x, y, angle, vx, vy, id) — so the remote
@@ -694,17 +696,32 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
     is clamped (never extrapolate into the future). Returns a plain dict —
     no pygame objects, no sim state touched:
 
-        {'ships': [(x, y, angle, dead, shield_dump, shield_clock), ...],
+        {'ships': [(x, y, angle, dead, shield_dump, shield_clock,
+                    flame_mags), ...],
          'enemies': [(tag, x, y, angle, vx, vy, id,
-                      shield_dump, shield_clock, power_used), ...],
+                      shield_dump, shield_clock, power_used,
+                      flame_mags), ...],
          'asteroids': [(x, y), ...],
          'bullets': [(x, y, vx, vy, kind, owner, boost, mid), ...]}
+
+    Each ship entry carries `flame_mags` (10.6): the per-thruster exhaust
+    magnitudes (ship_s[23]), taken from the CURRENT snapshot (not lerp'd —
+    a flame dict has no meaningful cross-window blend). The client feeds it
+    to the remote player ship's stand-in before drawing so the remote
+    ship's exhaust renders (parity with the host's _sync_local_ship).
 
     Each enemy entry carries `power_used` (10.3c): the enemy's live power
     demand (ship_s[22]), lerp'd across the window like the shield state.
     The ghost's sensor-contact signature is `power_used - power_idle_total`
     (power_idle_total is a loadout constant the client derives) — see
     PredictedShip._update_contacts.
+
+    Each enemy entry also carries `flame_mags` (10.6): the enemy's
+    per-thruster exhaust magnitudes (ship_s[23]), taken from the CURRENT
+    snapshot (not lerp'd — a flame dict has no meaningful cross-window
+    blend). The client feeds it to the enemy stand-in before drawing so
+    the remote enemy's exhaust renders (parity with the host's model
+    path, which carries it in the model's enemy tuple too).
 
     Each projectile entry carries `mid` (10.3b): the missile's unique id
     (player_index, seq) for kind == 'missile', else None. The client uses
@@ -794,6 +811,13 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
     # The prev ship carries (x, y, angle, shield_dump, shield_clock) — the
     # shield state (10.2) is lerp'd with the pose so the remote ship's
     # impact flash fades smoothly across the window.
+    # 10.6: the entry also carries flame_mags (ship_s[23]) — the per-
+    # thruster exhaust magnitudes. Taken from the CURRENT snapshot (like
+    # `dead`), NOT lerp'd: a flame dict is a set of per-bucket scalars with
+    # no meaningful cross-window blend (the host recomputes it every tick;
+    # the newest window's value is the freshest exhaust), and the client
+    # feeds it to the remote stand-in before drawing so the remote player
+    # ship's exhaust renders (parity with the host's _sync_local_ship).
     prev_ships = {i: (p[0], p[1], p[4], p[6], p[7])
                   for i, p in enumerate(prev_s[0])}
     ships = []
@@ -801,14 +825,16 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
         cp = (c[0], c[1], c[4], c[6], c[7])
         pp = prev_ships.get(i)
         if pp is None:
-            ships.append((cp[0], cp[1], cp[2], c[20], cp[3], cp[4]))
+            ships.append((cp[0], cp[1], cp[2], c[20], cp[3], cp[4],
+                          dict(c[23])))
         else:
             ships.append((lerp(pp[0], cp[0], a),
                           lerp(pp[1], cp[1], a),
                           lerp_angle(pp[2], cp[2], a),
                           c[20],
                           lerp(pp[3], cp[3], a),
-                          lerp(pp[4], cp[4], a)))
+                          lerp(pp[4], cp[4], a),
+                          dict(c[23])))
 
     # Enemies (Session 7.2): carry (tag, x, y, angle, vx, vy). The angle
     # is lerp'd with lerp_angle (the same wrapped-delta rule as player
@@ -825,6 +851,14 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
     # shield state (the enemy's power demand eases smoothly between
     # snapshots as it throttles / fires); a new enemy pops in at its curr
     # power_used.
+    # 10.6: the entry also carries flame_mags (ship_s[23]) — the enemy's
+    # per-thruster exhaust. Taken from the CURRENT snapshot (like the
+    # player ships' flame_mags), NOT lerp'd: a flame dict is a set of
+    # per-bucket scalars with no meaningful cross-window blend. The
+    # client feeds it to the enemy stand-in before drawing so the remote
+    # enemy's exhaust renders (parity with the host's model path, which
+    # carries it in the model's enemy tuple too — 10.6 restored the M2a
+    # "deliberate loss" of enemy flames on both peers).
     prev_enemies = {}
     for _tag, p in prev_s[1]:
         es = p[0]
@@ -838,7 +872,7 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
         pp = prev_enemies.get(eid)
         if pp is None:
             enemies.append((tag, cpos[0], cpos[1], ce[4], ce[2], ce[3],
-                            eid, ce[6], ce[7], ce[22]))
+                            eid, ce[6], ce[7], ce[22], dict(ce[23])))
         else:
             enemies.append((tag,
                             lerp(pp[0], cpos[0], a),
@@ -848,7 +882,8 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
                             eid,
                             lerp(pp[3], ce[6], a),
                             lerp(pp[4], ce[7], a),
-                            lerp(pp[5], ce[22], a)))
+                            lerp(pp[5], ce[22], a),
+                            dict(ce[23])))
 
     prev_rocks = {_asteroid_key(p): (p[1], p[2]) for p in prev_s[5]}
     asteroids = []
@@ -969,9 +1004,11 @@ class SnapshotBuffer:
         """Interpolated positions at render time `render_t`.
 
         Returns the same dict shape as `interp_positions`
-        ({'ships': [(x, y, angle, dead, shield_dump, shield_clock), ...],
+        ({'ships': [(x, y, angle, dead, shield_dump, shield_clock,
+                     flame_mags), ...],
         'enemies': [(tag, x, y, angle, vx, vy, id,
-                     shield_dump, shield_clock, power_used), ...],
+                     shield_dump, shield_clock, power_used,
+                     flame_mags), ...],
         'asteroids': [(x, y), ...],
         'bullets': [(x, y, vx, vy, kind, owner, boost, mid), ...]}) or None
         when there is not yet a window to interpolate between (fewer than
@@ -1222,6 +1259,18 @@ class PredictedShip:
         # snapshot on reconcile), so predicted_view dedups it against the
         # buffer's copy. Homing is client-side (see GhostMissile).
         self.local_missiles = []
+        # 10.6 V/G/T (option A): when True, the ghost's SENSOR state
+        # (targeting_on, sensor_on, scan_cd, scan_reveal, scan_dump,
+        # scan_pulse) is CLIENT-AUTHORITATIVE — the client's V/G/T keys
+        # mutate it directly (via the command sink) and reconcile must
+        # PRESERVE it across apply_snapshot, which would otherwise
+        # overwrite it with the host's values (the host never saw the
+        # client's V/G/T, so its snapshot carries the host's own sensor
+        # state). The host's ship stays authoritative for everything else
+        # (pose, weapons, power, shield) — only the sensor fields the
+        # client controls locally are preserved. Off by default (the host's
+        # ghost and tests keep the host-authoritative behavior).
+        self.client_sensor_authoritative = False
 
     @property
     def ship(self):
@@ -1247,8 +1296,47 @@ class PredictedShip:
         the first snapshot. Session 7.6: the game loop uses
         `reconcile_rewind` instead (dead-reckoning); this stays for tests
         and as the v1 fallback."""
+        self._capture_client_sensor_state()
         self._ship.apply_snapshot(ship_s)
         self._seeded = True
+        self._restore_client_sensor_state()
+
+    def _capture_client_sensor_state(self):
+        """10.6 V/G/T (option A): save the ghost's sensor fields before an
+        apply_snapshot overwrites them. No-op when the client is not
+        authoritative for its sensor state (host's ghost + tests)."""
+        if not self.client_sensor_authoritative:
+            return
+        s = self._ship
+        self._client_targeting_on = s.targeting_on
+        self._client_sensor_on = s.sensor_on
+        self._client_scan_cd = s.scan_cd
+        self._client_scan_reveal = s.scan_reveal
+        self._client_scan_dump = s.scan_dump
+        self._client_scan_pulse = s.scan_pulse
+
+    def _restore_client_sensor_state(self):
+        """10.6 V/G/T (option A): re-apply the ghost's own sensor state
+        after an apply_snapshot, when the client is authoritative for it.
+
+        apply_snapshot restores the host's sensor fields (sensor_on,
+        scan_cd, scan_reveal, scan_dump, scan_pulse, targeting_on) — but
+        the host never saw the client's V/G/T presses, so those values are
+        the host's OWN ship's sensor state, not the client's. When
+        `client_sensor_authoritative` is set, the ghost's pre-snapshot
+        sensor state (mutated by the client's command sink) is the truth,
+        so it is restored on top of the authoritative snap. Everything
+        else (pose, weapons, power, shield) stays host-authoritative.
+        No-op when the flag is off (host's ghost + tests)."""
+        if not self.client_sensor_authoritative:
+            return
+        s = self._ship
+        s.targeting_on = self._client_targeting_on
+        s.sensor_on = self._client_sensor_on
+        s.scan_cd = self._client_scan_cd
+        s.scan_reveal = self._client_scan_reveal
+        s.scan_dump = self._client_scan_dump
+        s.scan_pulse = self._client_scan_pulse
 
     def record_input(self, host_time, inp):
         """Record the local input sampled at host time `host_time`
@@ -1304,9 +1392,16 @@ class PredictedShip:
         at most (now - snap_time)/STEP steps — one snapshot interval
         (~6 steps) in steady state. The fixed-step accumulator is reset
         so the next `advance` starts clean from the replayed state.
+
+        10.6 V/G/T (option A): the client's sensor state is captured
+        before the apply_snapshot (which would overwrite it with the
+        host's) and restored after, so the replay advances the CLIENT's
+        sensor state forward (the host never saw the client's V/G/T).
         """
+        self._capture_client_sensor_state()
         self._ship.apply_snapshot(ship_s)
         self._seeded = True
+        self._restore_client_sensor_state()
         self._acc = 0.0
         buf = self._input_buffer
         if not buf:

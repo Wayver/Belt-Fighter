@@ -477,12 +477,15 @@ def id_oracle(prev_s, curr_s, alpha, dt=None):
         # 10.2: full ships entry (x, y, angle, dead, s_dump, s_clock).
         # pp = prev (x, y, angle, s_dump, s_clock) or None; c = the curr
         # ship snapshot. Pose via mix_pose, dead from curr (membership
-        # follows curr), shield state via mix_scalar.
+        # follows curr), shield state via mix_scalar. 10.6: + flame_mags
+        # (c[23]) — taken from the CURRENT snapshot (not lerp'd: a flame
+        # dict has no meaningful cross-window blend).
         pose = mix_pose((pp[0], pp[1], pp[2]) if pp is not None else None,
                         (c[0], c[1], c[4]))
         return (pose[0], pose[1], pose[2], c[20],
                 mix_scalar(None if pp is None else pp[3], c[6]),
-                mix_scalar(None if pp is None else pp[4], c[7]))
+                mix_scalar(None if pp is None else pp[4], c[7]),
+                dict(c[23]))
 
     # 10.2b: the prev enemy also carries (shield_dump, shield_clock) =
     # (es[6], es[7]) — lerp'd with the pose like the player ships'.
@@ -521,7 +524,11 @@ def id_oracle(prev_s, curr_s, alpha, dt=None):
                         t[0][2], t[0][3], _eid(t),
                         mix_scalar(None if pe is None else pe[3], t[0][6]),
                         mix_scalar(None if pe is None else pe[4], t[0][7]),
-                        mix_scalar(None if pe is None else pe[5], t[0][22])))
+                        mix_scalar(None if pe is None else pe[5], t[0][22]),
+                        # 10.6: flame_mags from the CURRENT snapshot (not
+                        # lerp'd — a flame dict has no meaningful cross-
+                        # window blend).
+                        dict(t[0][23])))
     # Player ships are matched by INDEX (Session 6.1) — ships don't turn
     # over, so slot i of curr_s[0] is the same ship as slot i of prev_s[0].
     # Pose = (x, y, raw angle) (Session 6.8). 10.2: the prev ship also
@@ -1147,9 +1154,10 @@ def main():
                   f"render_t={INTERP_DELAY + i * STEP}")
             break
         # 10.3c: the entry is now a 10-tuple (… + shield_dump, shield_clock,
-        # power_used).
+        # power_used). 10.6: + flame_mags (11-tuple).
         cur = {eid: ang for (_tag, _x, _y, ang, _vx, _vy, eid,
-                             _s_dump, _s_clock, _p_used) in P['enemies']}
+                             _s_dump, _s_clock, _p_used,
+                             _flame_mags) in P['enemies']}
         for eid, ang in cur.items():
             if eid in prev_enemy_angles:
                 d = abs((ang - prev_enemy_angles[eid] + math.pi)

@@ -180,21 +180,22 @@ def main():
     g, = (make_client(screen, font, big_font, light_tex, fog_surf,
                       light_surf),)
 
-    # --- 1. BUFFER-CARRIES: the enemy entry is a 10-tuple with the shield
+    # --- 1. BUFFER-CARRIES: the enemy entry is an 11-tuple with the shield
     #     state at [7] (dump) and [8] (clock). 10.3c grew it to a 10-tuple
-    #     (+ power_used at [9]) — the shape assert tracks that. ---
+    #     (+ power_used at [9]); 10.6 grew it to an 11-tuple (+ flame_mags
+    #     at [10]) — the shape assert tracks that. ---
     prev = make_snap(0.0, 0.0)
     curr = make_snap(25.0, 0.05)
     P = interp_positions(prev, curr, 1.0, dt=0.1)
     entry = P['enemies'][ENEMY_IDX]
-    assert isinstance(entry, tuple) and len(entry) == 10, \
-        "enemy entry must be a 10-tuple, got %r" % (entry,)
+    assert isinstance(entry, tuple) and len(entry) == 11, \
+        "enemy entry must be an 11-tuple, got %r" % (entry,)
     # At alpha=1 the entry sits exactly on curr (endpoint-exact): the
     # target enemy's dump/clock are curr's (25.0, 0.05).
     assert entry[7] == 25.0 and entry[8] == 0.05, \
         "shield_dump/clock must be at [7]/[8], endpoint-exact: %r" % (entry,)
     print("PASS: BUFFER-CARRIES — enemy entry is "
-          "(tag,x,y,angle,vx,vy,id,dump,clock,power_used)")
+          "(tag,x,y,angle,vx,vy,id,dump,clock,power_used,flame_mags)")
 
     # --- 2. LERP: interp_positions lerps the enemy's shield state between
     #     two snapshots (midpoint), endpoint-exact at alpha 0/1. ---
@@ -271,7 +272,11 @@ def main():
     he.ship.shield_clock = 0.05
     m = host.render_model()
     met = m["enemies"][ENEMY_IDX]
-    assert len(met) == 10, "model enemy tuple must be a 10-tuple, got %r" \
+    # 10.6 grew the model enemy tuple to an 11-tuple (+ flame_mags at
+    # [10]); the shield state is still at [8]/[9]. This test is about the
+    # shield flash, so it does not pass flame_mags to _draw_world_enemy
+    # (it defaults to None -> no flames, keeping the pixel count pure).
+    assert len(met) == 11, "model enemy tuple must be an 11-tuple, got %r" \
         % (met,)
     assert met[8] == 25.0 and met[9] == 0.05, \
         "model enemy tuple must carry shield_dump/clock at [8]/[9]: %r" \

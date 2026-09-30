@@ -21,7 +21,9 @@ Networked-ready (unchanged):
 - update() expects a fixed timestep for deterministic simulation.
 - snapshot()/apply_snapshot() expose the full synced state (see the
   SYNCED vs PRESENTATION-ONLY classification above the methods).
-- flame_mags (and the other presentation-only state) is never serialized.
+- 10.6: flame_mags is now SYNCED (the remote peer draws the remote ship's
+  + enemies' exhaust from it); the other presentation-only state (arcs,
+  shield_impacts, ...) is still never serialized.
 """
 import math
 import random
@@ -376,8 +378,25 @@ class Ship:
     #                              constant the client derives. (Was
     #                              presentation-only; 10.3c promotes it.)
     #
+    #   flame_mags                 10.6: per-thruster exhaust magnitudes
+    #                              (the 'forward'/'reverse'/'to_left'/
+    #                              'to_right' buckets). Serialized so the
+    #                              CLIENT can draw the REMOTE player ship's
+    #                              AND the REMOTE enemies' exhaust (the
+    #                              host's draw() renders player flames via
+    #                              _sync_local_ship and enemy flames via the
+    #                              model's enemy tuple; the client's buffer
+    #                              path must too, for parity). Recomputed
+    #                              from scratch every tick by
+    #                              _resolve_forces, so it is always the
+    #                              current frame's exhaust. (Was
+    #                              presentation-only; 10.6 promotes it. One
+    #                              field serves both player ships and
+    #                              enemies — the enemy's Ship snapshot is
+    #                              the same 24-tuple.)
+    #
     # PRESENTATION-ONLY (never serialized):
-    #   flame_mags, arcs, arc_clock, shield_impacts
+    #   arcs, arc_clock, shield_impacts
     #   prev_pos, prev_angle, rpos, rangle, accel, dampening
     #   tracked, laser_target, missile_target, contacts
     #                              (Game re-derives these every tick)
@@ -411,6 +430,7 @@ class Ship:
             self.dead,   # 10.1: per-player death
             self.missile_seq,   # 10.3b: per-ship missile launch counter
             self.power_used,   # 10.3c: live power demand (sensor signature)
+            self.flame_mags,   # 10.6: per-thruster flame mags (remote exhaust)
         )
 
     def sync_render(self, alpha):
@@ -429,7 +449,8 @@ class Ship:
          weapons, ship_id,
          dead,
          missile_seq,
-         power_used) = s   # 10.1: death; 10.3b: missile counter; 10.3c: power
+         power_used,
+         flame_mags) = s   # 10.1: death; 10.3b: missile; 10.3c: power; 10.6: flames
         self.pos = pygame.Vector2(px, py)
         self.vel = pygame.Vector2(vx, vy)
         self.angle = a
@@ -454,6 +475,31 @@ class Ship:
         self.dead = dead   # 10.1: per-player death
         self.missile_seq = missile_seq   # 10.3b: resync the launch counter
         self.power_used = power_used   # 10.3c: render-consistent power demand
+        # 10.6: restore the per-thruster flame mags (presentation only —
+        # the remote peer draws the remote ship's exhaust from these).
+        # _resolve_forces recomputes them every tick on the host, so this
+        # is the host's CURRENT frame's exhaust; the client feeds them to
+        # the remote stand-in before drawing.
+        self.flame_mags = dict(flame_mags)
+
+    def power_state(self):
+        """Bundle the ship's power presentation state into one plain dict.
+
+        10.6: the four fields that power-driven presentation reads —
+        brownout (latched flag), power_factor (0..1 allocation scale),
+        power_used (live total demand) and flame_mags (per-thruster
+        exhaust magnitudes) — in one place. A future power feature
+        (brownout zaps, flame animation, a power HUD) reads them as a
+        unit instead of reaching for four separate attributes. The dict
+        is plain data (JSON-safe) so it can ride the wire or a render
+        model. The flame_mags value is a COPY (the caller may mutate it
+        without touching the ship)."""
+        return {
+            "brownout": self.brownout,
+            "power_factor": self.power_factor,
+            "power_used": self.power_used,
+            "flame_mags": dict(self.flame_mags),
+        }
 
     # --- simulation: per-thruster pipeline ---
 

@@ -24,7 +24,7 @@ The fix (no wire change — both fields are already in the ship snapshot):
     to the host.
 
 This test proves it:
-  1. BUFFER-CARRIES — the buffer's ships entry is a 6-tuple with
+  1. BUFFER-CARRIES — the buffer's ships entry is a 7-tuple with
                      shield_dump at [4] and shield_clock at [5].
   2. LERP           — interp_positions lerps shield_dump/clock between two
                      snapshots (midpoint), endpoint-exact at alpha 0/1.
@@ -167,19 +167,21 @@ def main():
     g, host_hull, client_hull = make_client(screen, font, big_font,
                                             light_tex, fog_surf, light_surf)
 
-    # --- 1. BUFFER-CARRIES: the ships entry is a 6-tuple with the shield
-    #     state at [4] (dump) and [5] (clock). ---
+    # --- 1. BUFFER-CARRIES: the ships entry is a 7-tuple with the shield
+    #     state at [4] (dump) and [5] (clock). 10.6 grew it to a 7-tuple
+    #     (+ flame_mags at [6]); the shield state is unchanged. ---
     prev = make_snap(0.0, 0.0, 0.0)
     curr = make_snap(25.0, 0.05, 0.1)
     P = interp_positions(prev, curr, 1.0, dt=0.1)
     entry = P['ships'][0]
-    assert isinstance(entry, tuple) and len(entry) == 6, \
-        "ships entry must be a 6-tuple, got %r" % (entry,)
+    assert isinstance(entry, tuple) and len(entry) == 7, \
+        "ships entry must be a 7-tuple, got %r" % (entry,)
     # At alpha=1 the entry sits exactly on curr (endpoint-exact): the
     # remote ship's dump/clock are curr's (25.0, 0.05).
     assert entry[4] == 25.0 and entry[5] == 0.05, \
         "shield_dump/clock must be at [4]/[5], endpoint-exact: %r" % (entry,)
-    print("PASS: BUFFER-CARRIES — ships entry is (x,y,angle,dead,dump,clock)")
+    print("PASS: BUFFER-CARRIES — ships entry is "
+          "(x,y,angle,dead,dump,clock,flame_mags)")
 
     # --- 2. LERP: interp_positions lerps the shield state between two
     #     snapshots (midpoint), endpoint-exact at alpha 0/1. ---

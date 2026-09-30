@@ -241,9 +241,10 @@ def main():
     # --- ENEMY hull parity: _draw_world_enemy == AIEnemy.draw for the hull.
     #     Checked on a FRESH (unstepped) game: the enemies have no thruster
     #     flames / shield flash / arcs, so the stand-in (which carries no
-    #     enemy presentation state) draws EXACTLY the live hull. This makes
-    #     the one deliberate M2a loss explicit — the hull is faithful, the
-    #     enemy flames are deferred to M2b. ---
+    #     enemy presentation state) draws EXACTLY the live hull. 10.6
+    #     restored the enemy flame_mags on the model path (the M2a
+    #     "deliberate loss"), but on a fresh game they are empty, so the
+    #     parity check still holds (both paths draw no flames). ---
     fresh = make_game(screen, font, big_font, light_tex, fog_surf,
                       light_surf, SEED)
     fm = fresh.render_model()
@@ -254,12 +255,13 @@ def main():
     for e in fresh.enemies:
         e.draw(s_live, fcam)
     for (tag, _id, pos, angle, _vel, _acc, _cr, _poly,
-             s_dump, s_clock) in fm["enemies"]:
+             s_dump, s_clock, flame_mags) in fm["enemies"]:
         _draw_world_enemy(s_model, fcam, tag, pos, angle, standins,
-                          s_dump, s_clock)
+                          s_dump, s_clock, flame_mags)
     if _pixels(s_live) == _pixels(s_model):
         print("PASS: ENEMY — %d fresh enemies render their hull "
-              "pixel-identically via the model (flames deferred to M2b)"
+              "pixel-identically via the model (10.6: flame_mags carried, "
+              "empty on a fresh game)"
               % len(fresh.enemies))
     else:
         ok = False

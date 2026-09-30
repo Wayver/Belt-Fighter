@@ -613,6 +613,15 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
     # ghost's ids match the host's.
     game.ghost = PredictedShip(hull=menu.hull, loadout=menu.loadout,
                                local_index=game.local_index)
+    # 10.6 V/G/T (option A): the client's sensor state is CLIENT-
+    # AUTHORITATIVE. The client's V/G/T keys mutate the ghost directly
+    # (via the command sink below), and reconcile preserves them across
+    # apply_snapshot (the host never saw the client's V/G/T, so its
+    # snapshot carries the host's own sensor state — restoring it would
+    # flicker the client's sensor off every ~100 ms). The host's ship
+    # stays authoritative for everything else (pose, weapons, power,
+    # shield). The host's ghost keeps the default (host-authoritative).
+    game.ghost.client_sensor_authoritative = True
     # The client's estimate of the host's sim clock (Session 7.1). The
     # client never runs the sim, so it has no sim clock of its own — the
     # estimator derives one from the snapshots: each is stamped with the
@@ -674,6 +683,28 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
     worker = NetWorker(conn, is_host=False)
     worker.start()
 
+    # 10.6 V/G/T (option A): the client's command sink. handle_events
+    # routes T/V/G/R/F through it (a sink is provided), so it must handle
+    # all five — not just the sensor keys. T/V/G mutate the GHOST (the
+    # client's local ship) directly: the client's sensor state is
+    # client-authoritative (game.ghost.client_sensor_authoritative), so
+    # these take effect immediately and survive reconciles (the host never
+    # saw them, so its snapshot can't flicker them off). R and F keep the
+    # client's pre-10.6 behavior: R sets _respawn_requested (the loop
+    # drains it into a T_RESPAWN — the host respawns player 1) and F/reset
+    # calls game.reset() (the client's local presentation reset).
+    def _client_command(name, *args):
+        if name == "targeting" and not game.game_over:
+            game.ghost.ship.targeting_on = not game.ghost.ship.targeting_on
+        elif name == "sensor" and not game.game_over:
+            game.ghost.ship.sensor_on = not game.ghost.ship.sensor_on
+        elif name == "scan" and not game.game_over:
+            game.ghost.ship.fire_scan()
+        elif name == "respawn":
+            game._respawn_requested = True
+        elif name == "reset":
+            game.reset()
+
     while True:
         # Session 7.10 (Chunk 1): capture the RAW frame time before the
         # clamp — the clamp hides hiccups from the sim, but the render
@@ -692,7 +723,11 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
         # debug overlay (client only — the ghost never runs on the host).
         missile_telemetry.set_enabled(game.debug_net)
         now = pygame.time.get_ticks() / 1000.0
-        if not game.handle_events():
+        # 10.6 V/G/T (option A): route T/V/G/R/F through the client command
+        # sink (T/V/G -> the ghost; R/F -> the client's existing behavior).
+        # Without a sink these keys mutated the STALE host ship (self.ship),
+        # so the client's V/G/T never reached the ghost.
+        if not game.handle_events(_client_command):
             break
         keys = pygame.key.get_pressed()
         # Sample the local input ONCE per frame (the intent edge) and use

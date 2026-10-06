@@ -30,9 +30,9 @@ from .net import (Host, connect, do_handshake_host, do_handshake_client,
                   serialize_snapshot, deserialize_snapshot,
                   serialize_input, deserialize_input,
                   NetWorker,
-                  T_INPUT, T_SNAP, T_RESPAWN)
+                  T_INPUT, T_SNAP, T_RESPAWN, T_BEAM)
 from .netcode import (PredictedShip, HostTimeEstimator, LatencyTracker,
-                      RenderPoint)
+                      RenderPoint, BEAM_TTL)
 from .ship import Ship
 from .sim_thread import SimThread
 from .sound import SoundBank
@@ -775,6 +775,19 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
                 game.push_snapshot(m["sim_time"],
                                    deserialize_snapshot(m["snap"]),
                                    now=game.host_time.now(now))
+            elif m.get("type") == T_BEAM:
+                # 10.4: a laser beam the host fired — an EVENT (a 0.15 s
+                # flash, too short to ride the snapshot's INTERP_DELAY
+                # window). Push it into game.remote_beams as
+                # [start, end, age, ttl] in WORLD space (muzzle ->
+                # endpoint); predicted_view draws it immediately (before
+                # the ships) and ages it each frame (_step_remote_beams).
+                # One-way LAN latency (~10-20 ms) is imperceptible against
+                # the 0.15 s flash.
+                game.remote_beams.append([
+                    pygame.Vector2(m["sx"], m["sy"]),
+                    pygame.Vector2(m["ex"], m["ey"]),
+                    0.0, BEAM_TTL])
         # Session 8.2: the worker owns the socket now — read worker.closed (the
         # worker mirrors conn.closed) and never touch conn.* here. The
         # worker also does the drain_send() (off the render thread), so the

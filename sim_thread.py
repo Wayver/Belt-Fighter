@@ -58,6 +58,7 @@ import time
 
 from .game import STEP
 from .intent import ShipInput
+from .net import T_BEAM
 
 
 class SimThread:
@@ -229,5 +230,15 @@ class SimThread:
                 if self._worker is not None:
                     self._worker.set_latest_snapshot(g.sim_time,
                                                      g.snapshot())
+                    # 10.4: send any laser beams fired this step as T_BEAM
+                    # events (drained here, on the sim thread — the only
+                    # thread that touches g._beam_events). The client draws
+                    # each immediately on receipt; one-way LAN latency is
+                    # imperceptible against the 0.15 s beam flash.
+                    for (sx, sy, ex, ey, t) in g._beam_events:
+                        self._worker.send({"type": T_BEAM, "sim_time": t,
+                                           "sx": sx, "sy": sy,
+                                           "ex": ex, "ey": ey})
+                    g._beam_events.clear()
             # 4. sleep ~1 ms (bounds CPU + makes stop() prompt).
             self._stop.wait(self.WAIT)

@@ -42,7 +42,7 @@ from .fog import draw_fog, LightSource
 
 from .hud import draw_hud, draw_game_over, draw_respawn
 from .camera import Camera
-from .netcode import SnapshotBuffer, PredictedShip
+from .netcode import SnapshotBuffer, PredictedShip, BEAM_TTL
 from . import missile_telemetry as _mtel
 from .config import (INTERP_DELAY, SNAPSHOT_INTERVAL, ROCK_FILL, ROCK_EDGE,
                     ENEMY_FILL, ENEMY_EDGE, ENEMY_FLAME,
@@ -660,6 +660,14 @@ class Game:
         self.bullets = []
         self.missiles = []
         self.beams   = []
+        # 10.4: laser beams the host fired, queued for the sim thread to
+        # send to the client as T_BEAM events (one per discharge). Each
+        # entry is (sx, sy, ex, ey, sim_time) — world-space muzzle ->
+        # endpoint + the sim clock at fire time. The client draws it
+        # immediately on receipt (a beam is a 0.15 s flash, too short to
+        # ride the snapshot's INTERP_DELAY window). Drained after each
+        # sim step (sim_thread.py); cleared on reset/respawn.
+        self._beam_events = []
         self.enemy_bullets = []
         self.particles = []
         self.asteroids = []
@@ -718,6 +726,15 @@ class Game:
         # predicted_view can detect the alive->dead transition (to spawn
         # the client-side explosion burst exactly once).
         self._local_was_dead = False
+        # 10.4: the REMOTE player's laser beams, received as T_BEAM events
+        # (run_client pushes one per discharge). Each entry is
+        # [start, end, age, ttl] in WORLD space (muzzle -> endpoint), the
+        # same shape as the ghost's local_beams. A beam is a 0.15 s flash
+        # (BEAM_TTL), too short to ride the snapshot's INTERP_DELAY window,
+        # so it is drawn immediately on receipt and aged here (predicted_view
+        # calls _step_remote_beams each frame). Presentation only: no
+        # collision, no sim feedback.
+        self.remote_beams = []
         # 10.3d/10.3e/10.3f/10.3g: the decoupled render offset (the
         # handback fix). At handback, the buffer's copy of a ghost missile
         # is INTERP_DELAY seconds BEHIND the ghost's predicted position,
@@ -830,6 +847,7 @@ class Game:
         self.bullets.clear()
         self.enemy_bullets.clear()
         self.beams.clear()
+        self._beam_events.clear()   # 10.4: stale beam events are gone
         self.missiles.clear()
         self.particles.clear()
         self.asteroids.clear()
@@ -888,6 +906,7 @@ class Game:
         self.bullets.clear()
         self.enemy_bullets.clear()
         self.beams.clear()
+        self._beam_events.clear()   # 10.4: stale beam events are gone
         self.missiles.clear()
         self.protect_timer = SPAWN_PROTECT
 
@@ -1580,6 +1599,14 @@ class Game:
         return best
 
 
+    def _emit_beam_event(self, start, end):
+        """10.4: queue a laser beam for the client (world-space muzzle ->
+        endpoint + the sim clock at fire time). The sim thread drains
+        `self._beam_events` after each step and sends it as a T_BEAM
+        message. `start`/`end` are pygame.Vector2 (beam.start / vis_end)."""
+        self._beam_events.append((start.x, start.y, end.x, end.y,
+                                  self.sim_time))
+
     def _resolve_beam(self, beam):
         """Hitscan: hit the first enemy near the beam's end point.
 
@@ -1620,6 +1647,7 @@ class Game:
                              e.ship.shield_impact_point(impact),
                               rng=self.rng)
                 self.beams.append([beam.local_start, e, d,  vis_end, 0.0, 0.15])
+                self._emit_beam_event(beam.start, vis_end)   # 10.4
                 return
 
 
@@ -1660,6 +1688,7 @@ class Game:
         d = d.normalize()
         vis_end = a.pos + d * a.collision_radius
         self.beams.append([beam.local_start, None, d, vis_end, 0.0, 0.15])
+        self._emit_beam_event(beam.start, vis_end)   # 10.4
 
     def _draw_targeting(self, screen, e):
         pts = e.predict_path(TARGETING_HORIZON, TARGETING_STEPS)
@@ -2286,6 +2315,8 @@ class Game:
         self.ghost.advance(dt, inp, enemies=ghost_enemies)
         # 10.1: advance + cull the client-side death bursts (presentation).
         self._step_death_bursts(dt)
+        # 10.4: age + cull the remote player's laser beams (T_BEAM events).
+        self._step_remote_beams(dt)
 
         screen = self.screen
         self.cam.update(dt, self.ghost.ship.pos, self.ghost.ship.vel,
@@ -2298,6 +2329,18 @@ class Game:
 
         for (x, y) in pos['asteroids']:
             self._draw_remote_rock(screen, x, y)
+        # 10.4: the REMOTE player's laser beams — received as T_BEAM events
+        # (run_client pushes one per discharge into self.remote_beams),
+        # drawn BEFORE the ships (mirrors the host's draw() order: beams,
+        # then ships). Each entry is [start, end, age, ttl] in WORLD space
+        # (muzzle -> endpoint), so it is drawn directly — no re-anchoring.
+        # Same visual as the host's beam (LASER_COLOR line, width 2, fading
+        # over the ttl). Presentation only: no collision, no sim feedback.
+        for (start, end, age, ttl) in self.remote_beams:
+            fade = 1.0 - age / ttl
+            c = tuple(int(ch * fade) for ch in LASER_COLOR)
+            pygame.draw.line(screen, c, self.cam.to_screen(start),
+                             self.cam.to_screen(end), 2)
         # Remote enemies as their REAL hulls (Session 7.2, the D4 fix):
         # the buffer carries (tag, x, y, angle, vx, vy, id, shield_dump,
         # shield_clock, power_used, flame_mags) (10.2b + 10.3c + 10.6);
@@ -2872,6 +2915,19 @@ class Game:
             self._death_bursts.setdefault(index, []).append(
                 Particle(pos, vel, rng.choice(PARTICLE_COLORS),
                          rng.uniform(0.4, 0.9)))
+
+    def _step_remote_beams(self, dt):
+        """10.4: age + cull the remote player's laser beams (presentation
+        only). Called once per frame from predicted_view. Mirrors
+        PredictedShip.step_local_beams (the ghost's OWN beams) and the
+        host's `for b in self.beams: b[4] += dt` + ttl cull: each entry is
+        [start, end, age, ttl]; age advances by dt and an entry is dropped
+        once age >= ttl (the 0.15 s beam flash)."""
+        if not self.remote_beams:
+            return
+        for b in self.remote_beams:
+            b[2] += dt
+        self.remote_beams = [b for b in self.remote_beams if b[2] < b[3]]
 
     def _step_death_bursts(self, dt):
         """Advance + cull the client-side death bursts (presentation only).

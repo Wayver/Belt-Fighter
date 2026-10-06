@@ -65,7 +65,7 @@ __all__ = [
     "Connection", "Host", "connect",
     "do_handshake_client", "do_handshake_host",
     "NetWorker",
-    "T_JOIN", "T_WELCOME", "T_INPUT", "T_SNAP", "T_RESPAWN",
+    "T_JOIN", "T_WELCOME", "T_INPUT", "T_SNAP", "T_RESPAWN", "T_BEAM",
 ]
 
 # 4-byte big-endian unsigned length prefix.
@@ -83,6 +83,16 @@ T_SNAP = "snap"
 # is a no-op unless that ship is actually dead, so a spammy client is
 # harmless).
 T_RESPAWN = "respawn"
+# 10.4: a laser beam the host fired — an EVENT, not a state. A beam is a
+# 0.15 s flash (BEAM_TTL), but the client renders INTERP_DELAY (0.1-0.35 s)
+# in the PAST, so a beam whose age rode the snapshot would be expired (or
+# only a flicker) by the time the render point reached it. Instead the host
+# sends the beam the moment it fires: {"type": T_BEAM, "sim_time": t,
+# "sx":.., "sy":.., "ex":.., "ey":..} (world-space muzzle -> endpoint). The
+# client draws it immediately on receipt, fading over BEAM_TTL — the same
+# way the ghost draws its OWN beams (10.3a). One-way LAN latency (~10-20 ms)
+# is imperceptible against a 0.15 s flash.
+T_BEAM = "beam"
 
 
 # --- framing: pure byte functions (no socket) -----------------------------

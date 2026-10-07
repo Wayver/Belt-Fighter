@@ -296,15 +296,16 @@ def main():
     print("PASS: POWER-STATE — power_state() bundles the 4 fields + "
           "returns a copy of flame_mags")
 
-    # --- 3. BUFFER-CARRIES: the buffer's ship entry is a 7-tuple
-    #     (flame_mags at [6]) and the enemy entry an 11-tuple (flame_mags
-    #     at [10]); both taken from the CURRENT snapshot (not lerp'd). ---
+    # --- 3. BUFFER-CARRIES: the buffer's ship entry is a 9-tuple
+    #     (flame_mags at [6], brownout at [7], power_factor at [8] — 10.5)
+    #     and the enemy entry an 11-tuple (flame_mags at [10]); the flame
+    #     mags are taken from the CURRENT snapshot (not lerp'd). ---
     prev = make_snap(NO_FLAME, NO_FLAME)
     curr = make_snap(FLAME_FWD, FLAME_FWD)
     P = interp_positions(prev, curr, 0.5, dt=0.1)
     s_entry = P['ships'][0]
-    assert isinstance(s_entry, tuple) and len(s_entry) == 7, \
-        "ship entry must be a 7-tuple, got %r" % (s_entry,)
+    assert isinstance(s_entry, tuple) and len(s_entry) == 9, \
+        "ship entry must be a 9-tuple, got %r" % (s_entry,)
     assert s_entry[6] == FLAME_FWD, \
         "ship flame_mags must be at [6] (from curr, not lerp'd): %r" \
         % (s_entry[6],)
@@ -314,8 +315,9 @@ def main():
     assert e_entry[10] == FLAME_FWD, \
         "enemy flame_mags must be at [10] (from curr, not lerp'd): %r" \
         % (e_entry[10],)
-    print("PASS: BUFFER-CARRIES — ship entry 7-tuple (flame_mags [6]), "
-          "enemy entry 11-tuple (flame_mags [10]), from curr")
+    print("PASS: BUFFER-CARRIES — ship entry 9-tuple (flame_mags [6], "
+          "brownout [7], power_factor [8]), enemy entry 11-tuple "
+          "(flame_mags [10]), from curr")
 
     # --- 4-6. FEEDS-STANDIN + PIXEL: build the client, render a no-flame
     #     baseline frame, then a full-flame frame. ---

@@ -2162,14 +2162,24 @@ class Game:
         # entry also carries (shield_dump, shield_clock) — fed to the ship
         # so its impact flash renders (mirrors predicted_view). 10.6: the
         # entry also carries flame_mags — fed to the ship so its exhaust
-        # renders (parity with the host's _sync_local_ship).
-        for i, (x, y, ang, dead, s_dump, s_clock, flame_mags) \
+        # renders (parity with the host's _sync_local_ship). 10.5: the
+        # entry also carries (brownout, power_factor) — fed to the ship +
+        # _update_arcs(dt) driven here (the client never runs Ship.update
+        # for the remote stand-in) so its brownout crackle renders
+        # (mirrors predicted_view).
+        for i, (x, y, ang, dead, s_dump, s_clock, flame_mags,
+                brownout, pf) \
                 in enumerate(pos['ships']):
             if dead:
+                self.players[i].brownout = False
+                self.players[i]._update_arcs(dt)
                 continue
             self.players[i].shield_dump = s_dump
             self.players[i].shield_clock = s_clock
             self.players[i].flame_mags = dict(flame_mags)
+            self.players[i].brownout = brownout
+            self.players[i].power_factor = pf
+            self.players[i]._update_arcs(dt)
             self.players[i].draw(screen, self.cam,
                                  pygame.Vector2(x, y), ang)
 
@@ -2652,7 +2662,22 @@ class Game:
         # also carries flame_mags — fed to the ship so its exhaust
         # renders (parity with the host's _sync_local_ship, which feeds
         # the remote player ship's flames on the host's render path).
-        for i, (x, y, ang, dead, s_dump, s_clock, flame_mags) \
+        # 10.5: the buffer's ships entry also carries the remote ship's power
+        # state (brownout, power_factor). The client never runs Ship.update
+        # for the remote stand-in, so its brownout arcs (Ship._update_arcs)
+        # are never advanced — and Ship.draw renders the arcs but does NOT
+        # age them. So we feed brownout + power_factor to the stand-in and
+        # drive _update_arcs(dt) ourselves each frame (the host's sim does
+        # this every tick). The arcs are random presentation (never synced —
+        # the snapshot has no arcs field), so the client generates its OWN
+        # bolts, scaled by (1 - power_factor), exactly like the ghost's own
+        # arcs. _update_arcs is called in BOTH branches: on the live branch
+        # it spawns + ages arcs (brownout active -> crackle); on the dead
+        # branch it only ages them out (a dead ship stops spawning but its
+        # last bolts fade, mirroring the host where a dead ship's arcs age
+        # to zero). Presentation only: no collision, no sim feedback.
+        for i, (x, y, ang, dead, s_dump, s_clock, flame_mags,
+                brownout, pf) \
                 in enumerate(pos['ships']):
             if i == self.local_index:
                 continue
@@ -2660,11 +2685,16 @@ class Game:
                 if not self.players[i].dead:
                     self._death_burst(i, pygame.Vector2(x, y))
                 self.players[i].dead = True
+                self.players[i].brownout = False
+                self.players[i]._update_arcs(dt)
                 continue
             self.players[i].dead = False
             self.players[i].shield_dump = s_dump
             self.players[i].shield_clock = s_clock
             self.players[i].flame_mags = dict(flame_mags)
+            self.players[i].brownout = brownout
+            self.players[i].power_factor = pf
+            self.players[i]._update_arcs(dt)
             self.players[i].draw(screen, self.cam,
                                  pygame.Vector2(x, y), ang)
 

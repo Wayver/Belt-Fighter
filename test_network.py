@@ -472,12 +472,14 @@ def run(res, impairment=None, label="clean", run_s=3.5):
             # client-side explosion on the alive->dead transition.
             # 10.2: it also carries (shield_dump, shield_clock) so the
             # remote ship's shield-impact flash renders. 10.6: + flame_mags
-            # so the remote ship's exhaust renders (7-tuple).
+            # so the remote ship's exhaust renders. 10.5: + brownout +
+            # power_factor so the remote ship's brownout arcs render
+            # (9-tuple).
             check("buffer ships entry is (x, y, angle, dead, s_dump, s_clock, "
-                  "flame_mags)",
-                  isinstance(entry, tuple) and len(entry) == 7,
+                  "flame_mags, brownout, power_factor)",
+                  isinstance(entry, tuple) and len(entry) == 9,
                   "got %r" % (entry,))
-            if isinstance(entry, tuple) and len(entry) == 7:
+            if isinstance(entry, tuple) and len(entry) == 9:
                 da = abs((entry[2] - host.players[0].angle + math.pi)
                          % (2 * math.pi) - math.pi)
                 check("buffer ship angle tracks the authoritative angle (6.8)",

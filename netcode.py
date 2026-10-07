@@ -697,7 +697,7 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
     no pygame objects, no sim state touched:
 
         {'ships': [(x, y, angle, dead, shield_dump, shield_clock,
-                    flame_mags), ...],
+                    flame_mags, brownout, power_factor), ...],
          'enemies': [(tag, x, y, angle, vx, vy, id,
                       shield_dump, shield_clock, power_used,
                       flame_mags), ...],
@@ -709,6 +709,16 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
     a flame dict has no meaningful cross-window blend). The client feeds it
     to the remote player ship's stand-in before drawing so the remote
     ship's exhaust renders (parity with the host's _sync_local_ship).
+
+    Each ship entry also carries the power state (10.5): `brownout`
+    (ship_s[16], the latched brownout flag) taken from the CURRENT
+    snapshot (like `dead` — a latch has no meaningful cross-window blend),
+    and `power_factor` (ship_s[17], the 0..1 allocation scale) LERP'd
+    across the window like the shield state (it sags/recovers smoothly).
+    The client feeds both to the remote player ship's stand-in and drives
+    its brownout arcs (Ship._update_arcs) so the remote ship's crackle
+    renders (parity with the host's model path, which packs the arcs
+    directly). No wire change — both fields are already in the snapshot.
 
     Each enemy entry carries `power_used` (10.3c): the enemy's live power
     demand (ship_s[22]), lerp'd across the window like the shield state.
@@ -808,9 +818,10 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
     # on the alive->dead transition. It is taken from the CURRENT snapshot
     # (membership follows curr) — a dead ship's pose is static, so only the
     # flag, not the pose, changes at the death.
-    # The prev ship carries (x, y, angle, shield_dump, shield_clock) — the
-    # shield state (10.2) is lerp'd with the pose so the remote ship's
-    # impact flash fades smoothly across the window.
+    # The prev ship carries (x, y, angle, shield_dump, shield_clock,
+    # power_factor) — the shield state (10.2) and the power sag (10.5) are
+    # lerp'd with the pose so the remote ship's impact flash fades and its
+    # power factor sags/recovers smoothly across the window.
     # 10.6: the entry also carries flame_mags (ship_s[23]) — the per-
     # thruster exhaust magnitudes. Taken from the CURRENT snapshot (like
     # `dead`), NOT lerp'd: a flame dict is a set of per-bucket scalars with
@@ -818,15 +829,20 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
     # the newest window's value is the freshest exhaust), and the client
     # feeds it to the remote stand-in before drawing so the remote player
     # ship's exhaust renders (parity with the host's _sync_local_ship).
-    prev_ships = {i: (p[0], p[1], p[4], p[6], p[7])
+    # 10.5: the entry also carries brownout (ship_s[16]) — the latched
+    # brownout flag, taken from the CURRENT snapshot (like `dead`): a latch
+    # has no meaningful cross-window blend. The client feeds it (with the
+    # lerp'd power_factor) to the remote stand-in and drives its brownout
+    # arcs (Ship._update_arcs) so the remote ship's crackle renders.
+    prev_ships = {i: (p[0], p[1], p[4], p[6], p[7], p[17])
                   for i, p in enumerate(prev_s[0])}
     ships = []
     for i, c in enumerate(curr_s[0]):
-        cp = (c[0], c[1], c[4], c[6], c[7])
+        cp = (c[0], c[1], c[4], c[6], c[7], c[17])
         pp = prev_ships.get(i)
         if pp is None:
             ships.append((cp[0], cp[1], cp[2], c[20], cp[3], cp[4],
-                          dict(c[23])))
+                          dict(c[23]), c[16], cp[5]))
         else:
             ships.append((lerp(pp[0], cp[0], a),
                           lerp(pp[1], cp[1], a),
@@ -834,7 +850,9 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
                           c[20],
                           lerp(pp[3], cp[3], a),
                           lerp(pp[4], cp[4], a),
-                          dict(c[23])))
+                          dict(c[23]),
+                          c[16],
+                          lerp(pp[5], cp[5], a)))
 
     # Enemies (Session 7.2): carry (tag, x, y, angle, vx, vy). The angle
     # is lerp'd with lerp_angle (the same wrapped-delta rule as player

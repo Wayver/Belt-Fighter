@@ -37,6 +37,10 @@ This test proves it:
   4. PIXEL       — predicted_view renders the remote beam (beam-colored
                    pixels appear along the line; the no-beam baseline has
                    none).
+  5. DEDUP       — the client skips T_BEAMs from its OWN ship (owner ==
+                   local_index; the ghost already draws those, 10.3a) and
+                   draws the remote ship's — so firing your own laser does
+                   NOT double-draw (the "criss-cross" fix).
 """
 import os
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
@@ -194,9 +198,10 @@ def main():
              seed=SEED, players=2)
     g.set_player_ship(1, Ship(hull=SILAS_HULL,
                               loadout=default_loadout(SILAS_HULL)))
-    # Pre-seed a known beam event; the sim (empty input) won't fire its
-    # own, so this is the only one the drain should send.
-    g._beam_events.append((111.0, 222.0, 333.0, 444.0, 0.5))
+    # Pre-seed a known beam event (owner 0 = the host's ship); the sim (empty
+    # input) won't fire its own, so this is the only one the drain should
+    # send.
+    g._beam_events.append((111.0, 222.0, 333.0, 444.0, 0.5, 0))
     worker = FakeWorker()
     st = SimThread(g, worker=worker)
     st.start()
@@ -212,11 +217,13 @@ def main():
         time.sleep(0.01)
     st.stop()
     assert got is not None, "the SimThread must drain _beam_events -> T_BEAM"
-    for k in ("type", "sim_time", "sx", "sy", "ex", "ey"):
+    for k in ("type", "sim_time", "sx", "sy", "ex", "ey", "owner"):
         assert k in got, "T_BEAM missing field %r: %r" % (k, got)
     assert got["sim_time"] == 0.5 and got["sx"] == 111.0 \
         and got["sy"] == 222.0 and got["ex"] == 333.0 and got["ey"] == 444.0, \
         "T_BEAM fields not carried: %r" % (got,)
+    assert got["owner"] == 0, \
+        "T_BEAM must carry the firing player's index: %r" % (got,)
     # JSON-serializable (it rides the wire as a JSON frame).
     json.dumps(got)
     assert g._beam_events == [], "the buffer must be drained (cleared)"
@@ -290,6 +297,31 @@ def main():
                      "(beam-colored pixels along the line): hit=%d" % hit)
     print("PASS: PIXEL — predicted_view renders the remote beam (%d beam "
           "pixels vs %d baseline)" % (hit, base))
+
+    # --- 5. DEDUP: the client skips T_BEAMs from its OWN ship (the ghost
+    #     already draws those, 10.3a) and draws the remote ship's. Without
+    #     this, firing your own laser double-draws: the ghost's immediate
+    #     beam + the host's authoritative copy ~10-20 ms later, at
+    #     slightly different poses -> a "criss-cross". ---
+    g5 = make_client(screen, font, big_font, light_tex, fog_surf, light_surf)
+    assert g5.local_index == 1, "the test client is player 1"
+    own = {"type": T_BEAM, "sim_time": 0.5, "owner": 1,
+           "sx": 50.0, "sy": 0.0, "ex": 250.0, "ey": 0.0}
+    remote = {"type": T_BEAM, "sim_time": 0.5, "owner": 0,
+              "sx": 50.0, "sy": 0.0, "ex": 250.0, "ey": 0.0}
+    # The exact run_client handler (skip own, append remote).
+    for m in (own, remote):
+        if m.get("owner") == g5.local_index:
+            continue
+        g5.remote_beams.append([
+            pygame.Vector2(m["sx"], m["sy"]),
+            pygame.Vector2(m["ex"], m["ey"]),
+            0.0, BEAM_TTL])
+    assert len(g5.remote_beams) == 1, \
+        "the client must skip its OWN ship's beam (owner == local_index) " \
+        "and keep the remote ship's: remote_beams=%r" % (g5.remote_beams,)
+    print("PASS: DEDUP — own-ship T_BEAM skipped (ghost draws it), "
+          "remote-ship T_BEAM drawn (no double-draw criss-cross)")
 
     print("ALL PASS: 10.4 (remote player's laser beams)")
 

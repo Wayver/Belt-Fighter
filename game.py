@@ -1378,7 +1378,11 @@ class Game:
                     self._sfx("missile_launch")
 
                 for beam in beams:
-                    self._resolve_beam(beam)
+                    # 10.4: tag the beam with the FIRING player's index so
+                    # the client can skip its OWN ship's beams (the ghost
+                    # already draws those, 10.3a) and only draw the remote
+                    # (host's) ship's beams — no double-draw criss-cross.
+                    self._resolve_beam(beam, i)
                 if beams:
                     # Hitscan laser: one discharge per charge cycle (~1/s),
                     # so no throttle needed — unlike the rapid-fire gun blip.
@@ -1599,15 +1603,18 @@ class Game:
         return best
 
 
-    def _emit_beam_event(self, start, end):
+    def _emit_beam_event(self, start, end, owner):
         """10.4: queue a laser beam for the client (world-space muzzle ->
-        endpoint + the sim clock at fire time). The sim thread drains
-        `self._beam_events` after each step and sends it as a T_BEAM
-        message. `start`/`end` are pygame.Vector2 (beam.start / vis_end)."""
+        endpoint + the sim clock at fire time + the FIRING player's index).
+        The sim thread drains `self._beam_events` after each step and sends
+        it as a T_BEAM message. `start`/`end` are pygame.Vector2
+        (beam.start / vis_end); `owner` is the player index (0 = host,
+        1 = client) so the client can skip its OWN ship's beams (the ghost
+        already draws those, 10.3a) and only draw the remote ship's."""
         self._beam_events.append((start.x, start.y, end.x, end.y,
-                                  self.sim_time))
+                                  self.sim_time, owner))
 
-    def _resolve_beam(self, beam):
+    def _resolve_beam(self, beam, owner):
         """Hitscan: hit the first enemy near the beam's end point.
 
         The beam *line* is drawn to the point on the target's shield/hull
@@ -1616,7 +1623,7 @@ class Game:
         """
         rock, hit_pt = self._beam_blocked(beam)
         if rock is not None:
-            self._beam_hit_asteroid(rock, hit_pt, beam)
+            self._beam_hit_asteroid(rock, hit_pt, beam, owner)
             return
 
         for i, e in enumerate(self.enemies):
@@ -1647,7 +1654,7 @@ class Game:
                              e.ship.shield_impact_point(impact),
                               rng=self.rng)
                 self.beams.append([beam.local_start, e, d,  vis_end, 0.0, 0.15])
-                self._emit_beam_event(beam.start, vis_end)   # 10.4
+                self._emit_beam_event(beam.start, vis_end, owner)   # 10.4
                 return
 
 
@@ -1666,7 +1673,7 @@ class Game:
                 best_t, best_a, best_pt = t, a, closest
         return best_a, best_pt
 
-    def _beam_hit_asteroid(self, a, hit_pt, beam):
+    def _beam_hit_asteroid(self, a, hit_pt, beam, owner):
         # Same kill/split as a bullet hitting a rock.
         burst(self.particles, hit_pt, a.radius, rng=self.rng)
         self._sfx("small_explosion")
@@ -1688,7 +1695,7 @@ class Game:
         d = d.normalize()
         vis_end = a.pos + d * a.collision_radius
         self.beams.append([beam.local_start, None, d, vis_end, 0.0, 0.15])
-        self._emit_beam_event(beam.start, vis_end)   # 10.4
+        self._emit_beam_event(beam.start, vis_end, owner)   # 10.4
 
     def _draw_targeting(self, screen, e):
         pts = e.predict_path(TARGETING_HORIZON, TARGETING_STEPS)

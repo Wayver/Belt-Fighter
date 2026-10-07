@@ -235,10 +235,11 @@ class SimThread:
                     # thread that touches g._beam_events). The client draws
                     # each immediately on receipt; one-way LAN latency is
                     # imperceptible against the 0.15 s beam flash.
-                    for (sx, sy, ex, ey, t) in g._beam_events:
+                    for (sx, sy, ex, ey, t, owner) in g._beam_events:
                         self._worker.send({"type": T_BEAM, "sim_time": t,
                                            "sx": sx, "sy": sy,
-                                           "ex": ex, "ey": ey})
+                                           "ex": ex, "ey": ey,
+                                           "owner": owner})
                     g._beam_events.clear()
             # 4. sleep ~1 ms (bounds CPU + makes stop() prompt).
             self._stop.wait(self.WAIT)

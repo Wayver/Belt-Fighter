@@ -784,6 +784,14 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
                 # the ships) and ages it each frame (_step_remote_beams).
                 # One-way LAN latency (~10-20 ms) is imperceptible against
                 # the 0.15 s flash.
+                # 10.4 fix: SKIP beams from OUR OWN ship (owner ==
+                # local_index) — the ghost already draws those (10.3a),
+                # and drawing the host's copy too (at the slightly
+                # different authoritative pose, ~10-20 ms later) produced
+                # a double-draw "criss-cross". Same dedup idea as the
+                # 10.3b ghost-missile id skip.
+                if m.get("owner") == game.local_index:
+                    continue
                 game.remote_beams.append([
                     pygame.Vector2(m["sx"], m["sy"]),
                     pygame.Vector2(m["ex"], m["ey"]),

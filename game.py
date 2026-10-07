@@ -418,16 +418,17 @@ def _draw_local_ship(screen, cam, standin, pack, alpha,
 def _draw_world_beam(screen, cam, rpos, rangle, beam, enemies_by_id,
                      standins):
     """One laser beam from the model. `beam` is (local_start, target_id,
-    d, vis_end, age, ttl); (rpos, rangle) is the LOCAL ship's interpolated
-    pose (returned by _draw_local_ship this frame); `enemies_by_id` maps
-    ship_id -> model enemy tuple (tag, ship_id, pos, angle, vel, acc, cr,
-    poly); `standins` is the {tag: _RemoteEnemyProxy} dict (for the
-    target's shield oval). The start is computed from the local ship's
-    interpolated pose; the end resolves the target by ship_id (a plain
-    lookup, no live-list membership) and lands on the TARGET's shield oval
-    via the same math as Ship.shield_impact_point. Mirrors the live beam
-    loop in draw()."""
-    local, target_id, d, vis_end, age, ttl = beam
+    d, vis_end, age, ttl, owner); (rpos, rangle) is the FIRING ship's
+    interpolated pose (draw() picks it from the owner's model pack —
+    10.4d; the same pose _draw_local_ship draws that ship at this frame);
+    `enemies_by_id` maps ship_id -> model enemy tuple (tag, ship_id, pos,
+    angle, vel, acc, cr, poly); `standins` is the {tag: _RemoteEnemyProxy}
+    dict (for the target's shield oval). The start is computed from the
+    firing ship's interpolated pose; the end resolves the target by
+    ship_id (a plain lookup, no live-list membership) and lands on the
+    TARGET's shield oval via the same math as Ship.shield_impact_point.
+    Mirrors the live beam loop in draw()."""
+    local, target_id, d, vis_end, age, ttl, _owner = beam
     # `d` is a PLAIN TUPLE in the model (render_model serializes the live
     # Vector2 as (x, y)) — convert it back before the `d * e[6]` math, or a
     # beam whose target is still alive crashes (tuple * float). The
@@ -1108,11 +1109,15 @@ class Game:
           bullets       [(pos, vel), ...]
           enemy_bullets [(pos, vel), ...]
           missiles      [(pos, vel, boost, life), ...]
-          beams         [(local_start, target_id, d, vis_end, age, ttl), ...]
+          beams         [(local_start, target_id, d, vis_end, age, ttl, owner), ...]
                         target_id is the enemy's ship id (or None for a rock
                         beam) — draw() resolves it back to the enemy so the
                         `target in self.enemies` membership test becomes a
-                        plain lookup (no live-list membership at render time)
+                        plain lookup (no live-list membership at render time).
+                        owner is the FIRING player's index (10.4d) — draw()
+                        anchors each beam to its owner's interpolated pose,
+                        so the remote player's beams don't emanate from the
+                        local ship.
           particles     [(pos, vel, color, life, max_life), ...]
           players       [per-ship dict, ...] — see _ship_render_pack
           game_over     bool
@@ -1153,11 +1158,16 @@ class Game:
             "missiles": [((m.pos.x, m.pos.y), (m.vel.x, m.vel.y),
                           m.boost, m.life) for m in self.missiles],
             # --- beams: target_id replaces the live enemy reference ---
+            # 10.4d: `owner` is the FIRING player's index. The host's sim
+            # runs BOTH players (Session 6.2a), so self.beams holds the
+            # remote player's beams too — and draw() must anchor each beam
+            # to ITS owner's pose, not the local ship's (a remote beam
+            # anchored to the local ship looks like the local player fired).
             "beams": [((beam[0],
                         beam[1].ship.id if beam[1] is not None else None,
                         (beam[2].x, beam[2].y),
                         (beam[3].x, beam[3].y),
-                        beam[4], beam[5]))
+                        beam[4], beam[5], beam[6]))
                       for beam in self.beams],
             # --- particles ---
             "particles": [((p.pos.x, p.pos.y), (p.vel.x, p.vel.y),
@@ -1664,7 +1674,10 @@ class Game:
                     shield_burst(self.particles,
                              e.ship.shield_impact_point(impact),
                               rng=self.rng)
-                self.beams.append([beam.local_start, e, d,  vis_end, 0.0, 0.15])
+                # 10.4d: the beam's OWNER (firing player's index) is part of
+                # the entry — draw() anchors each beam to its owner's pose.
+                self.beams.append([beam.local_start, e, d,  vis_end, 0.0,
+                                   0.15, owner])
                 self._emit_beam_event(beam.start, vis_end,
                                       beam.local_start, owner)   # 10.4
                 return
@@ -1706,7 +1719,9 @@ class Game:
             d = beam.end - beam.start
         d = d.normalize()
         vis_end = a.pos + d * a.collision_radius
-        self.beams.append([beam.local_start, None, d, vis_end, 0.0, 0.15])
+        # 10.4d: owner index on the entry (see _resolve_beam).
+        self.beams.append([beam.local_start, None, d, vis_end, 0.0, 0.15,
+                           owner])
         self._emit_beam_event(beam.start, vis_end,
                               beam.local_start, owner)   # 10.4
 
@@ -1988,12 +2003,33 @@ class Game:
         for pos, vel, boost, life in model["missiles"]:
             _draw_world_missile(screen, self.cam, pos, vel, boost, life)
         # Laser beams from the model — drawn BEFORE the ships, mirroring the
-        # live order. The start uses the local ship's INTERPOLATED pose
-        # (computed from the model pack, the same value the live code reads
-        # as self.ship.rpos/rangle); the end resolves the target by ship_id.
+        # live order. The start uses the FIRING ship's INTERPOLATED pose
+        # (computed from that ship's model pack, the same value the live
+        # code reads as self.ship.rpos/rangle); the end resolves the
+        # target by ship_id.
+        #
+        # 10.4d (remote-beam-on-local-ship fix): the host's sim runs BOTH
+        # players (Session 6.2a), so model["beams"] holds the REMOTE
+        # player's beams too. Anchoring every beam to the LOCAL ship's
+        # pose made the client's beam appear to emanate from the host's
+        # ship ("looks like the host player just fired"). Each beam now
+        # carries its owner's index (render_model) and is anchored to
+        # THAT ship's interpolated pose — the same pose _draw_local_ship
+        # draws that ship at below, so the origin stays glued to the
+        # drawn ship. Single-player (1-ship list) is bit-identical: every
+        # beam's owner is 0 == local_index.
         local_rpos, local_rangle = _ship_pose(local_pack, model["step_alpha"])
         for beam in model["beams"]:
-            _draw_world_beam(screen, self.cam, local_rpos, local_rangle,
+            owner = beam[6]
+            if 0 <= owner < len(model["players"]):
+                bpos, bang = _ship_pose(model["players"][owner],
+                                        model["step_alpha"])
+            else:
+                # Owner not in the model this frame (shouldn't happen —
+                # the sim always has every player): fall back to the
+                # local pose rather than dropping the 0.15 s flash.
+                bpos, bang = local_rpos, local_rangle
+            _draw_world_beam(screen, self.cam, bpos, bang,
                              beam, enemies_by_id, standins)
         for pos, vel in model["enemy_bullets"]:
             _draw_world_bullet(screen, self.cam, pos, ENEMY_BULLET_COLOR)
@@ -2634,18 +2670,31 @@ class Game:
 
         # 10.3a: the player's OWN laser beams — the ghost's predicted beams,
         # drawn BEFORE the local ship (mirrors the host's draw() order:
-        # beams, then ships). Each entry is (start, end, age, ttl) in
-        # WORLD space (muzzle -> target), so it is drawn directly — no
-        # re-anchoring (the host re-anchors via a hull-local start only
-        # because the RenderModel stores a hull-local start; the ghost's
-        # Beam already carries the world-space muzzle). Each entry is
-        # [start, end, age, ttl]. The end is the
-        # buffer enemy's pos at fire time, so the beam lands where the
-        # host's beam lands (the buffer's enemy pos ~ the host's at that
-        # instant). Same visual as the host's beam (LASER_COLOR line,
-        # width 2, fading over the ttl). Presentation only: no
-        # collision, no sim feedback.
-        for (start, end, age, ttl) in self.ghost.local_beams:
+        # beams, then ships). Each entry is [local_start, end, age, ttl]:
+        # local_start is the HULL-LOCAL muzzle offset (lx, ly), end is the
+        # world-space endpoint.
+        #
+        # 10.4c (detach fix): the origin is RE-ANCHORED to the ghost's
+        # CURRENT pose each frame — the exact math the host's
+        # _draw_world_beam uses for its own beams (and the 10.4b remote-beam
+        # fix). The ghost's Beam carries the world-space muzzle at fire
+        # time, but drawing it directly left the origin behind in empty
+        # space as the ghost moved during the 0.15 s flash (the same bug
+        # the 10.4b remote path had — the ghost's OWN beams were the one
+        # path that never got the re-anchoring). The ghost's pose
+        # (self.ghost.ship.pos/angle) is the same pose the local ship is
+        # drawn at below, so the beam origin stays glued to the drawn
+        # ship. The end is the buffer enemy's pos at fire time, so the
+        # beam lands where the host's beam lands (the buffer's enemy pos ~
+        # the host's at that instant). Same visual as the host's beam
+        # (LASER_COLOR line, width 2, fading over the ttl). Presentation
+        # only: no collision, no sim feedback.
+        gpos = self.ghost.ship.pos
+        gangle = self.ghost.ship.angle
+        gfwd = pygame.Vector2(math.cos(gangle), math.sin(gangle))
+        gright = pygame.Vector2(-gfwd.y, gfwd.x)
+        for (local_start, end, age, ttl) in self.ghost.local_beams:
+            start = gpos + gfwd * local_start[0] + gright * local_start[1]
             fade = 1.0 - age / ttl
             c = tuple(int(ch * fade) for ch in LASER_COLOR)
             pygame.draw.line(screen, c, self.cam.to_screen(start),

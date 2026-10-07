@@ -55,6 +55,7 @@ beam-pixel-count sanity check):
                     beam pixels appear on the client; the no-beam baseline
                     has none).
 """
+import math
 import os
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
@@ -76,6 +77,7 @@ SEED = 1234
 # silas 360-degree firing arc, so the ghost charges + fires at it.
 ENEMY_OFFSET = 100.0
 ENEMY_IDX = 0
+EPS = 1e-3   # pose-comparison tolerance (the RE-ANCHOR draw-spy check)
 # Silas's eyes: two LASER_360 (range 600, charge 0.5 s, 360-degree arc).
 LASER_RANGE = 600.0
 CHARGE_TIME = 0.5
@@ -176,7 +178,7 @@ def push_stream(g, charge, enemy_offset=ENEMY_OFFSET):
         g.push_snapshot(t, make_snap(charge, enemy_offset), now=t)
 
 
-def beam_pixels(screen, cam, beams):
+def beam_pixels(screen, cam, beams, gpos, gangle):
     """Count beam-colored pixels sampled along the ghost's beam lines.
 
     The beam is drawn BEFORE the fog (mirrors the host's draw() order), so
@@ -190,9 +192,17 @@ def beam_pixels(screen, cam, beams):
     the beam-colored pixels (g > 100 and g > r and g > b). Baseline (no
     beams) -> 0; a fired beam -> > 0. This is a value-level pixel check
     (the beam is a deterministic 2 px line; flames/arcs use per-frame
-    random, so a full-frame compare is not the gate)."""
+    random, so a full-frame compare is not the gate).
+
+    10.4c: each beam entry is [local_start, end, age, ttl] — the stored
+    muzzle is a HULL-LOCAL offset, not a world point. The helper
+    re-anchors it to the ghost's pose (gpos, gangle) with the SAME math
+    predicted_view uses, so it samples the line that is actually drawn."""
     n = 0
-    for (start, end, _age, _ttl) in beams:
+    fwd = pygame.Vector2(math.cos(gangle), math.sin(gangle))
+    right = pygame.Vector2(-fwd.y, fwd.x)
+    for (local_start, end, _age, _ttl) in beams:
+        start = gpos + fwd * local_start[0] + right * local_start[1]
         for t in (0.3, 0.5, 0.7):
             p = start + (end - start) * t
             s = cam.to_screen(p)
@@ -203,6 +213,26 @@ def beam_pixels(screen, cam, beams):
                     r, gg, b = px[0], px[1], px[2]
                     if gg > 100 and gg > r and gg > b:
                         n += 1
+    return n
+
+
+def _beam_px_at(screen, cam, world_pt, radius=2):
+    """Count beam-colored pixels in a box around one world point.
+
+    The beam is a 2 px LASER_COLOR line drawn under the fog; near the
+    light source (the ghost) it stays green-dominant (g > 100 and g > r
+    and g > b). Used by the RE-ANCHOR check to probe specific points on
+    / off the beam line (mirrors the 10.4b remote-beam helper)."""
+    s = cam.to_screen(world_pt)
+    cx, cy = int(s.x), int(s.y)
+    n = 0
+    for dx in range(-radius, radius + 1):
+        for dy in range(-radius, radius + 1):
+            px, py = cx + dx, cy + dy
+            if 0 <= px < WIDTH and 0 <= py < HEIGHT:
+                r, gg, b = screen.get_at((px, py))[:3]
+                if gg > 100 and gg > r and gg > b:
+                    n += 1
     return n
 
 
@@ -311,11 +341,20 @@ def main():
         "the ghost must emit a beam on the same tick the host does: " \
         "local_beams=%r" % (ghost.local_beams,)
     gb = ghost.local_beams[0]
-    # start (muzzle): the ghost is seeded from the host's snapshot, so the
-    # muzzle matches the host's beam.start.
-    assert gb[0].distance_to(host_beam.start) < 1e-6, \
-        "the ghost's beam start (muzzle) must match the host's: %r vs %r" \
-        % (gb[0], host_beam.start)
+    # start (muzzle): 10.4c — the ghost stores the HULL-LOCAL muzzle
+    # (gb[0] is a (lx, ly) tuple, not a world point). Re-anchor it to the
+    # ghost's CURRENT pose with the SAME math predicted_view uses, then
+    # compare to the host's world-space muzzle (the ghost is seeded from
+    # the host's snapshot, so the re-anchored muzzle matches).
+    gpos = ghost.ship.pos
+    gangle = ghost.ship.angle
+    gfwd = pygame.Vector2(math.cos(gangle), math.sin(gangle))
+    gright = pygame.Vector2(-gfwd.y, gfwd.x)
+    ghost_muzzle = gpos + gfwd * gb[0][0] + gright * gb[0][1]
+    assert ghost_muzzle.distance_to(host_beam.start) < 1e-6, \
+        "the ghost's beam start (muzzle, re-anchored to the ghost's pose) " \
+        "must match the host's: %r vs %r" \
+        % (ghost_muzzle, host_beam.start)
     # end (target): the buffer's enemy pos ~ the host's at that instant
     # (the enemy is static here, so it matches exactly).
     assert gb[1].distance_to(host_beam.end) < 1e-6, \
@@ -464,7 +503,8 @@ def main():
     assert not g.ghost.local_beams, \
         "baseline (no laser_fire) must fire no beam: local_beams=%r" \
         % (g.ghost.local_beams,)
-    base = beam_pixels(g.screen, g.cam, g.ghost.local_beams)
+    base = beam_pixels(g.screen, g.cam, g.ghost.local_beams,
+                       g.ghost.ship.pos, g.ghost.ship.angle)
     assert base == 0, "baseline must have no beam pixels: %d" % base
     # Fire: laser_fire pressed -> the ghost fires a beam this frame.
     push_stream(g, 1.0)
@@ -475,12 +515,116 @@ def main():
         "predicted_view must fire the ghost's beam (laser_fire pressed, " \
         "charge 1.0, enemy in range): local_beams=%r" \
         % (g.ghost.local_beams,)
-    hit = beam_pixels(g.screen, g.cam, g.ghost.local_beams)
+    hit = beam_pixels(g.screen, g.cam, g.ghost.local_beams,
+                      g.ghost.ship.pos, g.ghost.ship.angle)
     assert hit > 0, \
         "predicted_view must render the ghost's beam (beam-colored pixels " \
         "along the line): hit=%d" % hit
     print("PASS: PIXEL — predicted_view renders the ghost's beam (%d beam "
           "pixels vs %d baseline)" % (hit, base))
+
+    # --- 6b. RE-ANCHOR: the ghost's beam ORIGIN tracks the ghost's
+    #     CURRENT pose, not the frozen fire-time muzzle. This is the
+    #     actual 10.4c detach fix — the PIXEL check above uses a STATIC
+    #     ghost at the origin, where the frozen and re-anchored muzzles
+    #     are identical, so it would pass even if re-anchoring were
+    #     broken (the exact gap the 10.4b remote-beam fix closed). Here
+    #     the ghost MOVES +60 px in +x after firing; the FROZEN muzzle
+    #     stays at the fire-time pose, the RE-ANCHORED muzzle moves with
+    #     the ghost.
+    #
+    #     We prove the origin moved with a DRAW-SPY (deterministic,
+    #     fog-immune — the fog dims the beam below the pixel threshold
+    #     at the gap point once the ghost has moved away from its own
+    #     light, so a pixel probe is unreliable here). A spy on
+    #     pygame.draw.line captures the beam's START point (converted
+    #     back to world coords); it must equal the RE-ANCHORED muzzle
+    #     (the ghost's CURRENT pose) and differ from the FROZEN muzzle
+    #     (the fire-time pose). If re-anchoring were broken (origin
+    #     frozen), the spy would capture the frozen muzzle and this
+    #     would fail. ---
+    g6 = make_client(screen, font, big_font, light_tex, fog_surf, light_surf)
+    push_stream(g6, 1.0)
+    g6.latency.tick(0.016)
+    g6.render_point.advance(0.016, g6.snap_buf.newest_time())
+    g6.predicted_view(0.05, _keys_with_laser_fire())
+    assert g6.ghost.local_beams, \
+        "the ghost must fire a beam (laser_fire, charge 1.0, enemy in " \
+        "range): local_beams=%r" % (g6.ghost.local_beams,)
+    # Record the ghost's FIRE-TIME pose (the origin of the frozen muzzle).
+    fire_pos = g6.ghost.ship.pos.copy()
+    fire_ang = g6.ghost.ship.angle
+    # Move the ghost +60 px in +x (the direction the beam travels). The
+    # re-anchored muzzle must follow; the frozen muzzle stays behind.
+    g6.ghost.ship.pos += pygame.Vector2(60.0, 0.0)
+    # Re-render WITHOUT laser_fire: no new beam, the existing beam ages
+    # (0.05 -> ~0.10, still < the 0.15 ttl) and is drawn re-anchored to
+    # the ghost's NEW pose.
+    cur_pos = g6.ghost.ship.pos
+    cur_ang = g6.ghost.ship.angle
+    # Spy on pygame.draw.line to capture the beam's START (world coords).
+    # The beam is a long line (muzzle -> target, ~90 px); the ship's own
+    # hull/flame lines are short, so filter by length.
+    orig_line = pygame.draw.line
+    beam_starts = []
+
+    def _spy_line(surf, color, p1, p2, w=1):
+        cam = g6.cam
+        center = pygame.Vector2(WIDTH / 2, HEIGHT / 2)
+        s_world = pygame.Vector2(p1) - center + cam.pos
+        e_world = pygame.Vector2(p2) - center + cam.pos
+        if (e_world - s_world).length() > 20:   # the beam, not a hull line
+            beam_starts.append(s_world)
+        return orig_line(surf, color, p1, p2, w)
+
+    pygame.draw.line = _spy_line
+    try:
+        g6.predicted_view(0.05, pygame.key.get_pressed())
+    finally:
+        pygame.draw.line = orig_line
+    assert g6.ghost.local_beams, \
+        "the beam must survive the second frame (age < ttl): " \
+        "local_beams=%r" % (g6.ghost.local_beams,)
+    assert beam_starts, "the beam must be drawn (a long line): " \
+        "beam_starts=%r" % (beam_starts,)
+    fwd = pygame.Vector2(math.cos(fire_ang), math.sin(fire_ang))
+    right = pygame.Vector2(-fwd.y, fwd.x)
+    cfwd = pygame.Vector2(math.cos(cur_ang), math.sin(cur_ang))
+    cright = pygame.Vector2(-cfwd.y, cfwd.x)
+    re_ok = True
+    re_detail = ""
+    for (local_start, _end, _age, _ttl) in g6.ghost.local_beams:
+        frozen = fire_pos + fwd * local_start[0] + right * local_start[1]
+        reanchored = cur_pos + cfwd * local_start[0] + cright * local_start[1]
+        # Find the drawn start matching this beam's muzzle (either the
+        # frozen or the re-anchored one — we assert it is the re-anchored).
+        match = None
+        for s in beam_starts:
+            if s.distance_to(reanchored) < EPS or s.distance_to(frozen) < EPS:
+                match = s
+                break
+        if match is None:
+            re_ok = False
+            re_detail = ("no drawn beam start near either muzzle "
+                         "(starts=%r, frozen=%r, reanchored=%r)"
+                         % (beam_starts, frozen, reanchored))
+            continue
+        if match.distance_to(reanchored) >= EPS:
+            re_ok = False
+            re_detail = ("beam start is the FROZEN muzzle, not the "
+                         "re-anchored one (start=%r, frozen=%r, "
+                         "reanchored=%r)" % (match, frozen, reanchored))
+    assert re_ok, "the ghost's beam origin must track the ghost's current " \
+        "pose (not the frozen fire-time muzzle): %s" % re_detail
+    print("PASS: RE-ANCHOR — the ghost's beam origin tracks the ghost's "
+          "current pose (frozen muzzle %r vs re-anchored %r; the drawn "
+          "start is the re-anchored one)"
+          % (tuple(round(v, 1) for v in
+                   (fire_pos + fwd * g6.ghost.local_beams[0][0][0]
+                    + right * g6.ghost.local_beams[0][0][1])),
+             tuple(round(v, 1) for v in
+                   (cur_pos + cfwd * g6.ghost.local_beams[0][0][0]
+                    + cright * g6.ghost.local_beams[0][0][1]))))
 
     print("ALL PASS: 10.3a (ghost emits laser beams)")
 

@@ -1192,8 +1192,9 @@ class PredictedShip:
     `enemies` proxies (the interpolation buffer's enemy entries) when
     given — the ghost charges + fires a beam on the same tick the host
     does, and the fired beams are kept as presentation entries in
-    `self.local_beams` (world-space muzzle -> target, aged at the host's
-    0.15 s beam ttl). `contacts` stays idle (10.3c).
+    `self.local_beams` (hull-local muzzle -> world target, aged at the
+    host's 0.15 s beam ttl; 10.4c re-anchors the muzzle to the ghost's
+    current pose at draw time). `contacts` stays idle (10.3c).
 
     10.3b: `missile_target` is now picked from the caller's `enemies`
     proxies too (the SAME nearest-in-range math the host's
@@ -1451,8 +1452,9 @@ class PredictedShip:
         picked from them (the SAME nearest-in-range math the host's
         `_pick_laser_target` uses) so the ghost charges + fires a beam on
         the same tick the host does. The BEAMS `s.update()` returns are
-        kept as presentation entries in `self.local_beams` (world-space
-        muzzle -> target), so the player sees their own beam immediately
+        kept as presentation entries in `self.local_beams` (hull-local
+        muzzle -> world target; 10.4c re-anchors the muzzle to the ghost's
+        current pose at draw time), so the player sees their own beam immediately
         instead of waiting ~100 ms for the host's next snapshot. Call
         `step_local_beams` after `step` to age + cull the list. When
         `enemies` is None (tests, or before the buffer has a window) the
@@ -1491,16 +1493,19 @@ class PredictedShip:
                 self.local_bullets.append(
                     Bullet(shot.pos, shot.vel, owner=shot.owner))
         # 10.3a: keep the ghost's own laser discharges as presentation
-        # entries [start, end, age, ttl] in WORLD space. The host re-anchors
-        # its beams via a hull-local start + target_id because the RenderModel
-        # stores a hull-local start; the ghost's Beam already carries the
-        # world-space muzzle (beam.start) and target pos (beam.end), so the
-        # client draws it directly (no re-anchoring). A LIST (not tuple) so
-        # step_local_beams can age `b[2]` in place (mirrors the host's
-        # `self.beams` list-of-lists).
+        # entries [local_start, end, age, ttl]. 10.4c (detach fix): the
+        # muzzle is the HULL-LOCAL offset (beam.local_start), NOT the frozen
+        # world-space point (beam.start) — predicted_view re-anchors it to
+        # the ghost's CURRENT pose each frame (the exact math the host's
+        # _draw_world_beam uses for its own beams, and the 10.4b remote-beam
+        # fix). Storing the world-space muzzle drew the origin at where the
+        # muzzle WAS at fire time, so as the ghost moved during the 0.15 s
+        # flash the origin was left behind in empty space (the same bug the
+        # 10.4b remote path had). A LIST (not tuple) so step_local_beams can
+        # age `b[2]` in place (mirrors the host's `self.beams` list-of-lists).
         for beam in beams:
             self.local_beams.append(
-                [beam.start.copy(), beam.end.copy(), 0.0, BEAM_TTL])
+                [beam.local_start, beam.end.copy(), 0.0, BEAM_TTL])
         # 10.3b: keep the ghost's own LAUNCHED missiles as presentation
         # GhostMissiles. Each gets the SAME unique id the host assigns at
         # launch — (player_index, per-ship seq) — and the ghost's

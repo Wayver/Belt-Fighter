@@ -99,8 +99,9 @@ FIELD_MAP = {
     "bullets":         "for b in self.bullets  (pos/vel)",
     "enemy_bullets":   "for b in self.enemy_bullets  (pos/vel)",
     "missiles":        "for m in self.missiles  (pos/vel/boost/life)",
-    "beams":           "for local,target,d,vis_end,age,ttl in self.beams "
-                       "(target_id replaces the live enemy ref)",
+    "beams":           "for local,target,d,vis_end,age,ttl,owner in self.beams "
+                       "(target_id replaces the live enemy ref; owner is the "
+                       "firing player's index — 10.4d)",
     "particles":       "for p in self.particles: p.draw  "
                        "(pos/vel/color/life/max_life)",
     "players":         "per-ship presentation: flame_mags/arcs/"
@@ -194,7 +195,8 @@ def check_parity(m, g):
         assert mlife == ms.life, "missile life"
     # --- beams (target_id must resolve back to the live enemy) ---
     assert len(m["beams"]) == len(g.beams), "beams len"
-    for (mls, mtid, md, mvend, mage, mttl), beam in zip(m["beams"], g.beams):
+    for (mls, mtid, md, mvend, mage, mttl, mowner), beam in \
+            zip(m["beams"], g.beams):
         assert mls == beam[0], "beam local_start"
         want_tid = beam[1].ship.id if beam[1] is not None else None
         assert mtid == want_tid, "beam target_id"
@@ -202,6 +204,7 @@ def check_parity(m, g):
         assert mvend == (beam[3].x, beam[3].y), "beam vis_end"
         assert mage == beam[4], "beam age"
         assert mttl == beam[5], "beam ttl"
+        assert mowner == beam[6], "beam owner (10.4d)"
     # --- particles ---
     assert len(m["particles"]) == len(g.particles), "particles len"
     for (mpos, mvel, mcolor, mlife, mmax), p in \

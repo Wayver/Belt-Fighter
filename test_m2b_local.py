@@ -362,14 +362,15 @@ def main():
         proxies = fresh._get_remote_enemies()
         proxy = proxies.get(fresh._enemy_tag(e))
         # model-shaped beam: local_start tuple, target_id, d TUPLE,
-        # vis_end TUPLE, age, ttl — exactly what render_model() emits.
+        # vis_end TUPLE, age, ttl, owner — exactly what render_model()
+        # emits (owner = the firing player's index, 10.4d).
         d_live = fship.pos - e.pos
         if d_live.length_squared() < 1e-6:
             d_live = pygame.Vector2(1, 0)
         d_live.normalize_ip()
         vis_end = e.pos - d_live * e.collision_radius
         beam = ((0.0, 0.0), e.ship.id, (d_live.x, d_live.y),
-                (vis_end.x, vis_end.y), 0.0, 0.15)
+                (vis_end.x, vis_end.y), 0.0, 0.15, 0)
         enemies_by_id = {e.ship.id: (fresh._enemy_tag(e), e.ship.id,
                                      (e.pos.x, e.pos.y), e.ship.angle,
                                      (e.ship.vel.x, e.ship.vel.y),

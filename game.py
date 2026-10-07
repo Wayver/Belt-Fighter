@@ -1603,16 +1603,27 @@ class Game:
         return best
 
 
-    def _emit_beam_event(self, start, end, owner):
+    def _emit_beam_event(self, start, end, local_start, owner):
         """10.4: queue a laser beam for the client (world-space muzzle ->
         endpoint + the sim clock at fire time + the FIRING player's index).
         The sim thread drains `self._beam_events` after each step and sends
         it as a T_BEAM message. `start`/`end` are pygame.Vector2
         (beam.start / vis_end); `owner` is the player index (0 = host,
         1 = client) so the client can skip its OWN ship's beams (the ghost
-        already draws those, 10.3a) and only draw the remote ship's."""
+        already draws those, 10.3a) and only draw the remote ship's.
+
+        10.4b (detach fix): `local_start` is the HULL-LOCAL muzzle offset
+        (beam.local_start, a (lx, ly) tuple). The client re-anchors the
+        beam's origin to the firing ship's INTERPOLATED pose each frame
+        (mirrors the host's _draw_world_beam / the original 1p fix) — the
+        world-space `start` is frozen at fire time, so drawing it directly
+        left the origin behind in empty space as the ship moved during the
+        0.15 s flash. The world-space `start` is still sent (sx, sy) for
+        diagnostics; the client anchors on the hull-local muzzle and skips
+        a beam whose owner has no interpolated pose this frame."""
         self._beam_events.append((start.x, start.y, end.x, end.y,
-                                  self.sim_time, owner))
+                                  self.sim_time, owner,
+                                  local_start[0], local_start[1]))
 
     def _resolve_beam(self, beam, owner):
         """Hitscan: hit the first enemy near the beam's end point.
@@ -1654,7 +1665,8 @@ class Game:
                              e.ship.shield_impact_point(impact),
                               rng=self.rng)
                 self.beams.append([beam.local_start, e, d,  vis_end, 0.0, 0.15])
-                self._emit_beam_event(beam.start, vis_end, owner)   # 10.4
+                self._emit_beam_event(beam.start, vis_end,
+                                      beam.local_start, owner)   # 10.4
                 return
 
 
@@ -1695,7 +1707,8 @@ class Game:
         d = d.normalize()
         vis_end = a.pos + d * a.collision_radius
         self.beams.append([beam.local_start, None, d, vis_end, 0.0, 0.15])
-        self._emit_beam_event(beam.start, vis_end, owner)   # 10.4
+        self._emit_beam_event(beam.start, vis_end,
+                              beam.local_start, owner)   # 10.4
 
     def _draw_targeting(self, screen, e):
         pts = e.predict_path(TARGETING_HORIZON, TARGETING_STEPS)
@@ -2339,11 +2352,37 @@ class Game:
         # 10.4: the REMOTE player's laser beams — received as T_BEAM events
         # (run_client pushes one per discharge into self.remote_beams),
         # drawn BEFORE the ships (mirrors the host's draw() order: beams,
-        # then ships). Each entry is [start, end, age, ttl] in WORLD space
-        # (muzzle -> endpoint), so it is drawn directly — no re-anchoring.
-        # Same visual as the host's beam (LASER_COLOR line, width 2, fading
-        # over the ttl). Presentation only: no collision, no sim feedback.
-        for (start, end, age, ttl) in self.remote_beams:
+        # then ships). Each entry is [local_start, end, age, ttl, owner]:
+        # local_start is the HULL-LOCAL muzzle offset (lx, ly), end is the
+        # world-space endpoint, owner is the firing player's index.
+        #
+        # 10.4b (detach fix): the origin is RE-ANCHORED to the firing ship's
+        # INTERPOLATED pose each frame — the exact math the host's
+        # _draw_world_beam uses for its own beams (and the original 1p fix).
+        # The T_BEAM's world-space muzzle is frozen at fire time, so drawing
+        # it directly left the origin behind in empty space as the ship
+        # moved during the 0.15 s flash. The firing ship's interpolated pose
+        # is pos['ships'][owner] (the same pose the ship is drawn at below),
+        # so the beam origin stays glued to the drawn ship. Same visual as
+        # the host's beam (LASER_COLOR line, width 2, fading over the ttl).
+        # A DEAD firing ship still carries its frozen pose in the buffer
+        # (10.1: a dead ship's pose is static), so the beam anchors to the
+        # death location for the rest of its flash — mirroring the host,
+        # which keeps its own beams anchored to the (frozen) death pose
+        # rather than vanishing them. Presentation only: no collision, no
+        # sim feedback.
+        for (local_start, end, age, ttl, owner) in self.remote_beams:
+            if not (0 <= owner < len(pos['ships'])):
+                # Firing ship not in the buffer this frame (index out of
+                # range): no pose to anchor to — skip the beam (it is a
+                # 0.15 s flash; a missing frame is imperceptible).
+                continue
+            _sx, _sy, _sang = pos['ships'][owner][:3]
+            rpos = pygame.Vector2(_sx, _sy)
+            rangle = _sang
+            fwd = pygame.Vector2(math.cos(rangle), math.sin(rangle))
+            right = pygame.Vector2(-fwd.y, fwd.x)
+            start = rpos + fwd * local_start[0] + right * local_start[1]
             fade = 1.0 - age / ttl
             c = tuple(int(ch * fade) for ch in LASER_COLOR)
             pygame.draw.line(screen, c, self.cam.to_screen(start),

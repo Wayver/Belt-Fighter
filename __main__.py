@@ -779,11 +779,12 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
                 # 10.4: a laser beam the host fired — an EVENT (a 0.15 s
                 # flash, too short to ride the snapshot's INTERP_DELAY
                 # window). Push it into game.remote_beams as
-                # [start, end, age, ttl] in WORLD space (muzzle ->
-                # endpoint); predicted_view draws it immediately (before
-                # the ships) and ages it each frame (_step_remote_beams).
-                # One-way LAN latency (~10-20 ms) is imperceptible against
-                # the 0.15 s flash.
+                # [local_start, end, age, ttl, owner] (hull-local muzzle
+                # + world endpoint); predicted_view draws it immediately
+                # (before the ships), re-anchoring the origin to the
+                # firing ship's interpolated pose, and ages it each frame
+                # (_step_remote_beams). One-way LAN latency (~10-20 ms) is
+                # imperceptible against the 0.15 s flash.
                 # 10.4 fix: SKIP beams from OUR OWN ship (owner ==
                 # local_index) — the ghost already draws those (10.3a),
                 # and drawing the host's copy too (at the slightly
@@ -792,10 +793,19 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
                 # 10.3b ghost-missile id skip.
                 if m.get("owner") == game.local_index:
                     continue
+                # 10.4b (detach fix): store the HULL-LOCAL muzzle (lx, ly)
+                # + the firing owner, not the frozen world-space start.
+                # predicted_view re-anchors the origin to the firing ship's
+                # INTERPOLATED pose each frame (mirrors the host's
+                # _draw_world_beam / the original 1p fix) — the world-space
+                # start is where the muzzle WAS at fire time, so drawing it
+                # directly left the origin behind in empty space as the ship
+                # moved during the 0.15 s flash. Entry shape:
+                # [local_start, end, age, ttl, owner].
                 game.remote_beams.append([
-                    pygame.Vector2(m["sx"], m["sy"]),
+                    (m.get("lx", 0.0), m.get("ly", 0.0)),
                     pygame.Vector2(m["ex"], m["ey"]),
-                    0.0, BEAM_TTL])
+                    0.0, BEAM_TTL, m.get("owner", 0)])
         # Session 8.2: the worker owns the socket now — read worker.closed (the
         # worker mirrors conn.closed) and never touch conn.* here. The
         # worker also does the drain_send() (off the render thread), so the

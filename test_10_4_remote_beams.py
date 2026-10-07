@@ -12,25 +12,35 @@ remote ship's.) A laser beam is a 0.15 s flash (BEAM_TTL), but the client
 renders INTERP_DELAY (0.1-0.35 s) in the PAST, so a beam whose age rode
 the snapshot would be expired (or a flicker) by the time the render point
 reached it. The fix is EVENT-based: the host sends a discrete T_BEAM
-message the moment it fires (world-space muzzle -> endpoint + sim_time);
-the client draws it immediately on receipt, fading over BEAM_TTL — the
-same way the ghost draws its OWN beams (10.3a).
+message the moment it fires (muzzle -> endpoint + sim_time); the client
+draws it immediately on receipt, fading over BEAM_TTL — the same way the
+ghost draws its OWN beams (10.3a).
+
+10.4b (detach fix): the T_BEAM's muzzle rides the wire as a HULL-LOCAL
+offset (lx, ly), not a frozen world-space point. predicted_view
+RE-ANCHORS the beam origin to the firing ship's INTERPOLATED pose each
+frame (the exact math the host's _draw_world_beam uses for its own beams,
+and the original 1p fix) — a frozen world-space start left the origin
+behind in empty space as the ship moved during the 0.15 s flash.
 
   * HOST (step 1): Game._resolve_beam / _beam_hit_asteroid emit
-    (sx, sy, ex, ey, sim_time) into Game._beam_events; the SimThread
-    drains it after each step and sends T_BEAM via the worker.
+    (sx, sy, ex, ey, sim_time, owner, lx, ly) into Game._beam_events; the
+    SimThread drains it after each step and sends T_BEAM via the worker.
   * CLIENT (steps 2-4): run_client's poll loop pushes each T_BEAM into
-    game.remote_beams as [start, end, age, ttl] (world space);
-    predicted_view ages it each frame (_step_remote_beams) and draws it
-    BEFORE the ships (LASER_COLOR line, width 2, fading over the ttl).
+    game.remote_beams as [local_start, end, age, ttl, owner] (hull-local
+    muzzle + world endpoint); predicted_view ages it each frame
+    (_step_remote_beams) and draws it BEFORE the ships, re-anchoring the
+    origin to pos['ships'][owner]'s interpolated pose (LASER_COLOR line,
+    width 2, fading over the ttl).
 
 This test proves it:
   1. WIRE-SHAPE  — T_BEAM == "beam"; the host's real SimThread drain
                    emits a JSON-serializable message carrying
-                   type/sim_time/sx/sy/ex/ey (the host->wire contract).
+                   type/sim_time/sx/sy/ex/ey/owner/lx/ly (the host->wire
+                   contract).
   2. RECEIVE     — a T_BEAM pushed into game.remote_beams (the exact
-                   run_client append) is [Vector2, Vector2, 0.0, BEAM_TTL]
-                   in world space.
+                   run_client append) is [local_start, end, 0.0, BEAM_TTL,
+                   owner] (hull-local muzzle + world endpoint).
   3. AGE-CULL    — _step_remote_beams advances the age by dt each frame
                    and culls the beam once age >= ttl (mirrors the ghost's
                    step_local_beams + the host's beam aging).
@@ -47,6 +57,7 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
 import json
+import math
 import time
 
 import pygame
@@ -112,14 +123,21 @@ def _scratch_game():
 
 
 def make_snap(charge=1.0):
-    """A valid 2-player Game snapshot with the CLIENT ship (index 1) at the
-    origin facing +x, its lasers at `charge`. The client ship's pose is
-    fixed so the ghost (seeded from this snapshot) sits at the origin."""
+    """A valid 2-player Game snapshot with BOTH ships at the origin facing
+    +x, the client ship's (index 1) lasers at `charge`. The client ship's
+    pose is fixed so the ghost (seeded from this snapshot) sits at the
+    origin. 10.4b: the REMOTE ship (index 0) is ALSO placed at the origin
+    facing +x — predicted_view re-anchors each remote beam's origin to the
+    firing ship's INTERPOLATED pose (pos['ships'][owner]), so the remote
+    ship must be on-screen (near the ghost's camera) for the re-anchored
+    beam to render. Both ships at the origin is fine (no ship-vs-ship
+    collision; the beam_pixels helper samples the beam line, not the hulls)."""
     tmp = _scratch_game()
+    for p in tmp.players:
+        p.pos = pygame.Vector2(0.0, 0.0)
+        p.vel = pygame.Vector2(0.0, 0.0)
+        p.angle = 0.0
     cs = tmp.players[1]
-    cs.pos = pygame.Vector2(0.0, 0.0)
-    cs.vel = pygame.Vector2(0.0, 0.0)
-    cs.angle = 0.0
     snap = tmp.snapshot()
     cs_s = list(snap[0][1])
     cs_s[18] = tuple((0.0, charge, 0.0) for _ in cs.weapons)
@@ -161,7 +179,7 @@ class FakeWorker:
         self.snaps += 1
 
 
-def beam_pixels(screen, cam, beams):
+def beam_pixels(screen, cam, beams, rpos, rangle):
     """Count beam-colored pixels sampled along the beam lines.
 
     The beam is drawn BEFORE the fog (mirrors the host's draw() order), so
@@ -170,9 +188,18 @@ def beam_pixels(screen, cam, beams):
     each beam, sample a small box around a few points along the line
     (t = 0.3, 0.5, 0.7 — avoiding the endpoints) and count the
     beam-colored pixels (g > 100 and g > r and g > b). Baseline (no beams)
-    -> 0; a fired beam -> > 0."""
+    -> 0; a fired beam -> > 0.
+
+    10.4b: each beam entry is [local_start, end, age, ttl, owner] — the
+    stored start is a HULL-LOCAL muzzle offset, not a world point. The
+    helper re-anchors it to the firing ship's interpolated pose (rpos,
+    rangle) with the SAME math predicted_view uses, so it samples the line
+    that is actually drawn."""
     n = 0
-    for (start, end, _age, _ttl) in beams:
+    for (local_start, end, _age, _ttl, _owner) in beams:
+        fwd = pygame.Vector2(math.cos(rangle), math.sin(rangle))
+        right = pygame.Vector2(-fwd.y, fwd.x)
+        start = rpos + fwd * local_start[0] + right * local_start[1]
         for t in (0.3, 0.5, 0.7):
             p = start + (end - start) * t
             s = cam.to_screen(p)
@@ -200,8 +227,9 @@ def main():
                               loadout=default_loadout(SILAS_HULL)))
     # Pre-seed a known beam event (owner 0 = the host's ship); the sim (empty
     # input) won't fire its own, so this is the only one the drain should
-    # send.
-    g._beam_events.append((111.0, 222.0, 333.0, 444.0, 0.5, 0))
+    # send. 10.4b: the tuple carries the hull-local muzzle (lx, ly) too —
+    # (sx, sy, ex, ey, sim_time, owner, lx, ly).
+    g._beam_events.append((111.0, 222.0, 333.0, 444.0, 0.5, 0, 12.0, 3.0))
     worker = FakeWorker()
     st = SimThread(g, worker=worker)
     st.start()
@@ -217,13 +245,18 @@ def main():
         time.sleep(0.01)
     st.stop()
     assert got is not None, "the SimThread must drain _beam_events -> T_BEAM"
-    for k in ("type", "sim_time", "sx", "sy", "ex", "ey", "owner"):
+    for k in ("type", "sim_time", "sx", "sy", "ex", "ey", "owner",
+              "lx", "ly"):
         assert k in got, "T_BEAM missing field %r: %r" % (k, got)
     assert got["sim_time"] == 0.5 and got["sx"] == 111.0 \
         and got["sy"] == 222.0 and got["ex"] == 333.0 and got["ey"] == 444.0, \
         "T_BEAM fields not carried: %r" % (got,)
     assert got["owner"] == 0, \
         "T_BEAM must carry the firing player's index: %r" % (got,)
+    # 10.4b: the hull-local muzzle (lx, ly) rides the wire so the client
+    # can re-anchor the beam origin to the firing ship's interpolated pose.
+    assert got["lx"] == 12.0 and got["ly"] == 3.0, \
+        "T_BEAM must carry the hull-local muzzle (lx, ly): %r" % (got,)
     # JSON-serializable (it rides the wire as a JSON frame).
     json.dumps(got)
     assert g._beam_events == [], "the buffer must be drained (cleared)"
@@ -231,32 +264,39 @@ def main():
           "JSON-safe T_BEAM %r" % (got,))
 
     # --- 2. RECEIVE: a T_BEAM pushed into game.remote_beams (the exact
-    #     run_client append) is [Vector2, Vector2, 0.0, BEAM_TTL]. ---
+    #     run_client append) is [local_start, end, 0.0, BEAM_TTL, owner].
+    #     10.4b: the start is the HULL-LOCAL muzzle (lx, ly), not the
+    #     frozen world-space point — predicted_view re-anchors it to the
+    #     firing ship's interpolated pose each frame. ---
     g2 = make_client(screen, font, big_font, light_tex, fog_surf, light_surf)
     assert g2.remote_beams == [], "remote_beams must start empty"
     # The exact append run_client performs on a T_BEAM message.
-    msg = {"type": T_BEAM, "sim_time": 0.5,
-           "sx": 50.0, "sy": 0.0, "ex": 250.0, "ey": 0.0}
+    msg = {"type": T_BEAM, "sim_time": 0.5, "owner": 0,
+           "sx": 50.0, "sy": 0.0, "ex": 250.0, "ey": 0.0,
+           "lx": 8.0, "ly": -5.5}
     g2.remote_beams.append([
-        pygame.Vector2(msg["sx"], msg["sy"]),
+        (msg.get("lx", 0.0), msg.get("ly", 0.0)),
         pygame.Vector2(msg["ex"], msg["ey"]),
-        0.0, BEAM_TTL])
+        0.0, BEAM_TTL, msg.get("owner", 0)])
     assert len(g2.remote_beams) == 1
-    start, end, age, ttl = g2.remote_beams[0]
-    assert isinstance(start, pygame.Vector2) and isinstance(end, pygame.Vector2), \
-        "remote beam endpoints must be Vector2: %r" % (g2.remote_beams[0],)
-    assert start.x == 50.0 and start.y == 0.0, "start = muzzle (sx, sy)"
+    local_start, end, age, ttl, owner = g2.remote_beams[0]
+    assert isinstance(local_start, tuple) and len(local_start) == 2, \
+        "remote beam start must be a hull-local (lx, ly) tuple: %r" \
+        % (g2.remote_beams[0],)
+    assert local_start == (8.0, -5.5), "start = hull-local muzzle (lx, ly)"
+    assert isinstance(end, pygame.Vector2), "end must be a world Vector2"
     assert end.x == 250.0 and end.y == 0.0, "end = endpoint (ex, ey)"
     assert age == 0.0, "a freshly received beam starts at age 0"
     assert ttl == BEAM_TTL, "the beam's ttl is BEAM_TTL (0.15 s)"
-    print("PASS: RECEIVE — a T_BEAM becomes [Vector2, Vector2, 0.0, "
-          "BEAM_TTL] in world space")
+    assert owner == 0, "the beam carries the firing player's index"
+    print("PASS: RECEIVE — a T_BEAM becomes [local_start, end, 0.0, "
+          "BEAM_TTL, owner] (hull-local muzzle + world endpoint)")
 
     # --- 3. AGE-CULL: _step_remote_beams advances the age by dt each
     #     frame and culls the beam once age >= ttl. ---
     g3 = make_client(screen, font, big_font, light_tex, fog_surf, light_surf)
-    g3.remote_beams.append([pygame.Vector2(50.0, 0.0),
-                            pygame.Vector2(250.0, 0.0), 0.0, BEAM_TTL])
+    g3.remote_beams.append([(8.0, -5.5), pygame.Vector2(250.0, 0.0),
+                            0.0, BEAM_TTL, 0])
     # One frame: age advances by dt.
     g3._step_remote_beams(TICK)
     assert len(g3.remote_beams) == 1, "the beam must survive one frame"
@@ -278,21 +318,28 @@ def main():
     # --- 4. PIXEL: predicted_view renders the remote beam (beam-colored
     #     pixels appear along the line; the no-beam baseline has none). ---
     g4 = make_client(screen, font, big_font, light_tex, fog_surf, light_surf)
+    # The remote ship (owner 0) is at the origin facing +x (make_snap), so
+    # its interpolated pose is (0, 0, 0) — the beam_pixels helper re-anchors
+    # the hull-local muzzle to this pose, exactly as predicted_view does.
+    rpos = pygame.Vector2(0.0, 0.0)
+    rangle = 0.0
     # Baseline: no remote beams -> 0 beam pixels.
     push_stream(g4, 1.0)
     _advance_render_point(g4)
     g4.predicted_view(0.05, pygame.key.get_pressed())
     assert not g4.remote_beams, "baseline must have no remote beams"
-    base = beam_pixels(g4.screen, g4.cam, g4.remote_beams)
+    base = beam_pixels(g4.screen, g4.cam, g4.remote_beams, rpos, rangle)
     assert base == 0, "baseline must have no beam pixels: %d" % base
-    # Fire: push a remote beam on-screen (a horizontal beam to the right
-    # of the ghost, away from its hull) and render.
+    # Fire: push a remote beam on-screen (a beam to the right of the ghost,
+    # away from its hull) and render. The hull-local muzzle (8, -5.5) is
+    # re-anchored to the remote ship's pose (the origin, facing +x) -> a
+    # world start of (8, -5.5), so the beam runs (8,-5.5) -> (250, 0).
     push_stream(g4, 1.0)
     _advance_render_point(g4)
-    g4.remote_beams.append([pygame.Vector2(50.0, 0.0),
-                            pygame.Vector2(250.0, 0.0), 0.0, BEAM_TTL])
+    g4.remote_beams.append([(8.0, -5.5), pygame.Vector2(250.0, 0.0),
+                            0.0, BEAM_TTL, 0])
     g4.predicted_view(0.05, pygame.key.get_pressed())
-    hit = beam_pixels(g4.screen, g4.cam, g4.remote_beams)
+    hit = beam_pixels(g4.screen, g4.cam, g4.remote_beams, rpos, rangle)
     assert hit > 0, ("predicted_view must render the remote beam "
                      "(beam-colored pixels along the line): hit=%d" % hit)
     print("PASS: PIXEL — predicted_view renders the remote beam (%d beam "
@@ -306,17 +353,19 @@ def main():
     g5 = make_client(screen, font, big_font, light_tex, fog_surf, light_surf)
     assert g5.local_index == 1, "the test client is player 1"
     own = {"type": T_BEAM, "sim_time": 0.5, "owner": 1,
-           "sx": 50.0, "sy": 0.0, "ex": 250.0, "ey": 0.0}
+           "sx": 50.0, "sy": 0.0, "ex": 250.0, "ey": 0.0,
+           "lx": 8.0, "ly": -5.5}
     remote = {"type": T_BEAM, "sim_time": 0.5, "owner": 0,
-              "sx": 50.0, "sy": 0.0, "ex": 250.0, "ey": 0.0}
+              "sx": 50.0, "sy": 0.0, "ex": 250.0, "ey": 0.0,
+              "lx": 8.0, "ly": -5.5}
     # The exact run_client handler (skip own, append remote).
     for m in (own, remote):
         if m.get("owner") == g5.local_index:
             continue
         g5.remote_beams.append([
-            pygame.Vector2(m["sx"], m["sy"]),
+            (m.get("lx", 0.0), m.get("ly", 0.0)),
             pygame.Vector2(m["ex"], m["ey"]),
-            0.0, BEAM_TTL])
+            0.0, BEAM_TTL, m.get("owner", 0)])
     assert len(g5.remote_beams) == 1, \
         "the client must skip its OWN ship's beam (owner == local_index) " \
         "and keep the remote ship's: remote_beams=%r" % (g5.remote_beams,)

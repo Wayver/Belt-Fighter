@@ -47,6 +47,11 @@ This test proves it:
   4. PIXEL       — predicted_view renders the remote beam (beam-colored
                    pixels appear along the line; the no-beam baseline has
                    none).
+  4b. RE-ANCHOR  — the beam ORIGIN tracks the firing ship's CURRENT
+                   interpolated pose, not the frozen fire-time muzzle (the
+                   actual 10.4b detach fix). The firing ship moves across
+                   the window; a point on the re-anchored line must light
+                   up and a point in the frozen-only gap must stay empty.
   5. DEDUP       — the client skips T_BEAMs from its OWN ship (owner ==
                    local_index; the ghost already draws those, 10.3a) and
                    draws the remote ship's — so firing your own laser does
@@ -122,21 +127,22 @@ def _scratch_game():
     return tmp
 
 
-def make_snap(charge=1.0):
-    """A valid 2-player Game snapshot with BOTH ships at the origin facing
-    +x, the client ship's (index 1) lasers at `charge`. The client ship's
-    pose is fixed so the ghost (seeded from this snapshot) sits at the
-    origin. 10.4b: the REMOTE ship (index 0) is ALSO placed at the origin
-    facing +x — predicted_view re-anchors each remote beam's origin to the
+def make_snap(charge=1.0, remote_x=0.0):
+    """A valid 2-player Game snapshot with the local ship (index 1) at the
+    origin facing +x (the ghost seeds there) and the REMOTE ship (index 0)
+    at (remote_x, 0) facing +x, the client ship's lasers at `charge`.
+    10.4b: predicted_view re-anchors each remote beam's origin to the
     firing ship's INTERPOLATED pose (pos['ships'][owner]), so the remote
     ship must be on-screen (near the ghost's camera) for the re-anchored
-    beam to render. Both ships at the origin is fine (no ship-vs-ship
-    collision; the beam_pixels helper samples the beam line, not the hulls)."""
+    beam to render. remote_x=0.0 (the default) puts both ships at the
+    origin — the static-pose case; a nonzero remote_x moves the firing
+    ship so the RE-ANCHOR check can prove the origin tracks it."""
     tmp = _scratch_game()
     for p in tmp.players:
         p.pos = pygame.Vector2(0.0, 0.0)
         p.vel = pygame.Vector2(0.0, 0.0)
         p.angle = 0.0
+    tmp.players[0].pos = pygame.Vector2(float(remote_x), 0.0)
     cs = tmp.players[1]
     snap = tmp.snapshot()
     cs_s = list(snap[0][1])
@@ -145,18 +151,22 @@ def make_snap(charge=1.0):
     return (ships,) + snap[1:]
 
 
-def push_stream(g, charge=1.0):
+def push_stream(g, charge=1.0, remote_xs=None):
     """Reset the client's buffer + ghost + render point, then push a 3-
     snapshot stream at 10 Hz (t = 0, 0.1, 0.2) so predicted_view has a
-    render window."""
+    render window. remote_xs (a 3-tuple of x offsets) moves the REMOTE
+    ship across the window (the RE-ANCHOR check); None keeps it at the
+    origin (the static PIXEL check)."""
     g.snap_buf = g.snap_buf.__class__()
     g.ghost = PredictedShip(hull=SILAS_HULL,
                             loadout=default_loadout(SILAS_HULL),
                             local_index=1)
     g.render_point = RenderPoint(g.latency)
+    if remote_xs is None:
+        remote_xs = (0.0, 0.0, 0.0)
     for k in range(3):
         t = k * 0.1
-        g.push_snapshot(t, make_snap(charge), now=t)
+        g.push_snapshot(t, make_snap(charge, remote_xs[k]), now=t)
 
 
 def _advance_render_point(g):
@@ -344,6 +354,81 @@ def main():
                      "(beam-colored pixels along the line): hit=%d" % hit)
     print("PASS: PIXEL — predicted_view renders the remote beam (%d beam "
           "pixels vs %d baseline)" % (hit, base))
+
+    # --- 4b. RE-ANCHOR: the beam ORIGIN tracks the firing ship's CURRENT
+    #     interpolated pose, not the frozen fire-time muzzle. This is the
+    #     actual 10.4b detach fix — the PIXEL check above uses a STATIC
+    #     ship at the origin, where the frozen and re-anchored muzzles are
+    #     identical, so it would pass even if re-anchoring were broken.
+    #     Here the remote ship (owner 0) MOVES from x=0 (fire time) to
+    #     x=120 across the snapshot window; its interpolated pose at the
+    #     render point is x=60. The beam was fired at t=0 (ship at origin),
+    #     so the FROZEN world muzzle is (8, -5.5); the RE-ANCHORED muzzle
+    #     is (60+8, -5.5) = (68, -5.5). We prove the origin moved with the
+    #     ship by sampling two points:
+    #       * a point on the RE-ANCHORED line (midway) -> beam pixels MUST
+    #         be present (positive control: the beam is drawn, and its
+    #         origin is at the ship's current pose);
+    #       * a point in the GAP between the frozen and re-anchored muzzles
+    #         (x ~ 38) that ONLY the frozen beam would cover -> beam pixels
+    #         must be ABSENT (the origin is not left behind at fire time).
+    #     If re-anchoring were broken (origin frozen), the gap point would
+    #     light up and the assertion would fail. ---
+    g4b = make_client(screen, font, big_font, light_tex, fog_surf, light_surf)
+    # Remote ship moves 0 -> 60 -> 120 across the window (interp pose x=60).
+    push_stream(g4b, 1.0, remote_xs=(0.0, 60.0, 120.0))
+    _advance_render_point(g4b)
+    rp = g4b.render_point.now()
+    pos = g4b.snap_buf.positions_at(rp)
+    sx, sy, sang = pos["ships"][0][:3]
+    assert abs(sx - 60.0) < 1e-6, \
+        "the remote ship's interpolated pose must be x=60: %r" % (sx,)
+    fwd = pygame.Vector2(math.cos(sang), math.sin(sang))
+    right = pygame.Vector2(-fwd.y, fwd.x)
+    frozen = pygame.Vector2(8.0, -5.5)                    # fire-time muzzle
+    reanchored = pygame.Vector2(sx, sy) + fwd * 8.0 + right * -5.5
+    end = pygame.Vector2(250.0, 0.0)
+    # A point on the re-anchored line (midway between its muzzle and end).
+    re_mid = reanchored + (end - reanchored) * 0.5
+    # A point in the GAP: on the FROZEN line, at x halfway between the
+    # frozen and re-anchored muzzles — only the frozen beam covers it.
+    x_gap = frozen.x + (reanchored.x - frozen.x) * 0.5
+    y_gap = frozen.y + (end.y - frozen.y) * (x_gap - frozen.x) / (end.x - frozen.x)
+    gap_pt = pygame.Vector2(x_gap, y_gap)
+
+    def _beam_px_at(screen, cam, world_pt, radius=3):
+        s = cam.to_screen(world_pt)
+        cx, cy = int(s.x), int(s.y)
+        n = 0
+        for dx in range(-radius, radius + 1):
+            for dy in range(-radius, radius + 1):
+                try:
+                    px = screen.get_at((cx + dx, cy + dy))
+                except ValueError:
+                    continue
+                r, gg, b = px[0], px[1], px[2]
+                if gg > 100 and gg > r and gg > b:
+                    n += 1
+        return n
+
+    g4b.remote_beams.append([(8.0, -5.5), end, 0.0, BEAM_TTL, 0])
+    g4b.predicted_view(0.05, pygame.key.get_pressed())
+    re_px = _beam_px_at(g4b.screen, g4b.cam, re_mid)
+    gap_px = _beam_px_at(g4b.screen, g4b.cam, gap_pt)
+    assert re_px > 0, ("the re-anchored beam must be drawn (beam pixels "
+                       "along the line from the ship's CURRENT pose): "
+                       "re_px=%d" % re_px)
+    assert gap_px == 0, ("the beam origin must NOT be frozen at the "
+                         "fire-time muzzle — the gap between the frozen "
+                         "and re-anchored muzzles must be empty "
+                         "(gap_px=%d, frozen=%r, reanchored=%r)"
+                         % (gap_px, (frozen.x, frozen.y),
+                            (reanchored.x, reanchored.y)))
+    print("PASS: RE-ANCHOR — the beam origin tracks the firing ship's "
+          "current pose (re_px=%d on the re-anchored line, gap_px=%d in "
+          "the frozen-only gap; frozen muzzle %r vs re-anchored %r)"
+          % (re_px, gap_px, (round(frozen.x, 1), round(frozen.y, 1)),
+             (round(reanchored.x, 1), round(reanchored.y, 1))))
 
     # --- 5. DEDUP: the client skips T_BEAMs from its OWN ship (the ghost
     #     already draws those, 10.3a) and draws the remote ship's. Without

@@ -776,6 +776,16 @@ class Game:
         self._missile_handoff_ghost_pos = {}
         self._missile_handoff_offsets = {}
         self._missile_handoff_buf_pos = {}
+        # 10.7: the bullet handoff needs only ONE dict (no offset, no
+        # ghost-pos — the pull-forward is closed-form). _bullet_handoff_
+        # buf_pos: {bid: (x, y)} — the buffer's INTERPOLATED position of
+        # each pending bullet on the PREVIOUS frame. predicted_view diffs
+        # it against the current frame's position to detect the ADVANCING
+        # frame (the 10.3g wait-until-advancing rule): a new buffer bullet
+        # is FROZEN for its pop-in window, so the handoff fires on the
+        # first frame the position CHANGES, not the first visible frame.
+        # Client-only (the host never runs the ghost).
+        self._bullet_handoff_buf_pos = {}
         self.reset()
 
     @property
@@ -863,6 +873,7 @@ class Game:
         self._missile_handoff_offsets.clear()
         self._missile_handoff_ghost_pos.clear()
         self._missile_handoff_buf_pos.clear()
+        self._bullet_handoff_buf_pos.clear()   # 10.7: stale bullet handoff
         self._sfx_thruster(False)   # never carry the engine loop across a reset
         if self.test_mode:
             self._setup_test_scene()
@@ -1008,10 +1019,10 @@ class Game:
         # Bullets: construct minimally, then overwrite.
         self.bullets.clear()
         for b_s in bullets_s:
-            px, py, vx, vy, owner, _life = b_s
+            px, py, vx, vy, owner, _life, _bid = b_s   # 10.7: + id
             b = Bullet(pygame.Vector2(px, py), pygame.Vector2(vx, vy),
                        owner=owner)
-            b.apply_snapshot(b_s)
+            b.apply_snapshot(b_s)   # also restores b.id (10.7)
             self.bullets.append(b)
 
         self.enemy_bullets.clear()
@@ -1368,8 +1379,15 @@ class Game:
                 shots, beams, missiles = p.update(dt, p_inp)
 
                 for shot in shots:
+                    # 10.7: assign the unique player-prefixed id
+                    # (player_index, per-ship bullet_seq) and bump the
+                    # counter. The counter is synced via the ship snapshot
+                    # (like missile_seq, 10.3b), so the client's ghost
+                    # derives the same ids — the no-double-draw dedup key.
+                    bid = (i, p.bullet_seq)
+                    p.bullet_seq += 1
                     self.bullets.append(Bullet(shot.pos, shot.vel,
-                                               owner=shot.owner))
+                                               owner=shot.owner, bid=bid))
                 # S3: fire sounds. The gun fires ~100 shots/s (FIRE_COOLDOWN
                 # 0.01), so the laser blip is throttled to a human rate.
                 if shots:
@@ -2296,6 +2314,18 @@ class Game:
             self.ghost.handback_missiles(
                 local_s[21],
                 latest_missiles=_latest[4] if _latest is not None else None)
+            # 10.7: hand the ghost's OWN bullets back to the BUFFER the
+            # same way (the lightweight mirror of the missile handback).
+            # `local_s[24]` is the snapshot's authoritative bullet_seq
+            # (the exact count of bullets the host had fired as of the
+            # snapshot); `_latest[2]` is the newest snapshot's player-
+            # bullet list (each entry's id at field 6). The ghost keeps
+            # drawing a pending bullet until predicted_view sees the
+            # buffer's copy ADVANCE, then hands it off (the buffer draws
+            # it pulled forward by V*delay — the closed-form handoff).
+            self.ghost.handback_bullets(
+                local_s[24],
+                latest_bullets=_latest[2] if _latest is not None else None)
 
     def predicted_view(self, dt, keys, host_time=None):
         """Draw the frame with the LOCAL ship taken from the prediction
@@ -2524,6 +2554,50 @@ class Game:
                 _kept.append(m)
             self.ghost.local_missiles = _kept
         local_missile_ids = {tuple(m.id) for m in self.ghost.local_missiles}
+        # 10.7: BULLET HANDOFF (the lightweight mirror of the missile
+        # handoff above, minus the offset/decay/cap — a bullet is a
+        # straight line, so the handoff is closed-form). Hand off a
+        # PENDING ghost bullet to the buffer on the frame the buffer's
+        # copy has ADVANCED (not merely visible — a new buffer bullet is
+        # FROZEN for its pop-in window, so handing off on the first
+        # visible frame would stall it for up to a snapshot interval).
+        # _bullet_handoff_buf_pos tracks the buffer's INTERPOLATED
+        # position per id across frames; the first frame the position
+        # CHANGES is the handoff frame. Remove the bullet from
+        # local_bullets (so the buffer copy is no longer dedup-skipped
+        # below) — the buffer then draws it PULLED FORWARD by V*delay
+        # (the closed-form handoff: buffer_pos + V*delay == ghost_pos,
+        # so it is a no-op visually). This must run BEFORE
+        # local_bullet_ids is built, so a handed-off bullet is not
+        # skipped this frame.
+        _bbuf = self._bullet_handoff_buf_pos
+        _bnow = {tuple(b[7]): (b[0], b[1]) for b in pos['bullets']
+                 if b[4] == 'player' and b[7] is not None}
+        _bkept = []
+        for b in self.ghost.local_bullets:
+            _bid = tuple(b.id) if b.id is not None else None
+            _bp = _bnow.get(_bid)
+            if b.pending and _bp is not None:
+                _bprev = _bbuf.get(_bid)
+                _bbuf[_bid] = _bp
+                if _bprev is not None and _bprev != _bp:
+                    # The buffer's copy has ADVANCED since it first
+                    # appeared — the pop-in freeze is over. Hand off.
+                    _mtel.log("HANDBACK", h_host_seq="",
+                              h_buf_ids="", h_before="", h_after="",
+                              h_culled=_mtel.fmt_ids([_bid]),
+                              h_jump="")
+                    continue
+            _bkept.append(b)
+        self.ghost.local_bullets = _bkept
+        local_bullet_ids = {tuple(b.id) for b in self.ghost.local_bullets
+                            if b.id is not None}
+        # 10.7: the pull-forward magnitude — the buffer's copy is drawn
+        # V*delay ahead of its interpolated position so it lands where the
+        # ghost was drawing it (buffer_pos + V*delay == ghost_pos). `delay`
+        # is the client's current adaptive delay (the render point is
+        # newest - delay).
+        _bdelay = self.latency.delay
         # 10.3d: the decoupled render offset (the handback fix). For each
         # missile whose ghost copy was just handed off (above), the
         # buffer's copy is INTERP_DELAY seconds BEHIND the ghost's
@@ -2618,6 +2692,28 @@ class Game:
                     and tuple(mid) in local_missile_ids:
                 _buf_skipped.append(tuple(mid))
                 continue   # drawn from the ghost (predicted) instead
+            # 10.7: the ghost's OWN gun shots — same dedup as missiles. The id's
+            # first element is the FIRING player's index, so:
+            #   * a bullet the ghost is still drawing (id in
+            #     local_bullet_ids) is SKIPPED (the ghost draws it,
+            #     predicted, immediate);
+            #   * a LOCAL bullet the ghost has handed off (id[0] ==
+            #     local_index, id NOT in local_bullet_ids) is drawn PULLED
+            #     FORWARD by V*delay — the closed-form handoff (buffer_pos
+            #     + V*delay == ghost_pos, a no-op visually);
+            #   * the REMOTE player's bullets (id[0] != local_index) are
+            #     drawn at their raw interpolated position (no pull — they
+            #     are not predicted by the ghost).
+            # Enemy bullets (mid is None) are drawn as-is.
+            if kind == 'player' and mid is not None:
+                _bid_t = tuple(mid)
+                if _bid_t in local_bullet_ids:
+                    _buf_skipped.append(_bid_t)
+                    continue   # drawn from the ghost (predicted) instead
+                _buf_drawn.append(_bid_t)
+                if _bid_t[0] == self.local_index:
+                    x += vx * _bdelay
+                    y += vy * _bdelay
             if kind == 'missile' and mid is not None:
                 _mid_t = tuple(mid)
                 _buf_drawn.append(_mid_t)
@@ -2636,8 +2732,10 @@ class Game:
                     x += _hgo[_mid_t][0]
                     y += _hgo[_mid_t][1]
             self._draw_remote_bullet(screen, x, y, vx, vy, kind, boost)
-        if local_missile_ids or _buf_drawn or _buf_skipped:
-            _mtel.log_dedup(self.sim_time, local_missile_ids,
+        if (local_missile_ids or local_bullet_ids or _buf_drawn
+                or _buf_skipped):
+            _mtel.log_dedup(self.sim_time,
+                            local_missile_ids | local_bullet_ids,
                             _buf_drawn, _buf_skipped)
         # Remote ships (Session 6.6, hulls drawn in 6.8): every player
         # EXCEPT the local one, from the buffer by index (Session 6.1:
@@ -2788,7 +2886,10 @@ class Game:
         # light at each lead point (mirrors _build_lights' guard so the
         # light and the reticle appear/disappear together).
         lights = self._remote_fog_lights(pos, self.ghost.ship, local_missile_ids,
-                                 handoff_offsets=self._missile_handoff_offsets)
+                                 handoff_offsets=self._missile_handoff_offsets,
+                                 local_bullet_ids=local_bullet_ids,
+                                 delay=_bdelay,
+                                 local_index=self.local_index)
         # The player's OWN gun shots glow too (Session 7.3) — mirrors the
         # host's _build_lights, which adds a LightSource per player bullet.
         for b in self.ghost.local_bullets:
@@ -2972,7 +3073,8 @@ class Game:
         pygame.draw.circle(screen, color, (int(s.x), int(s.y)), 2)
 
     def _remote_fog_lights(self, pos, local_ship, local_missile_ids=(),
-                       handoff_offsets=None):
+                       handoff_offsets=None, local_bullet_ids=(),
+                       delay=0.0, local_index=0):
         """LightSources for the client's fog of war (Session 7.2 —
         predicted_view previously skipped draw_fog entirely, so fire did
         not glow through the dark like on the host). Mirrors
@@ -2993,12 +3095,39 @@ class Game:
         offset for missiles just handed back to the buffer. The fog light
         is placed at the same offset position as the missile sprite, so
         the glow follows the missile smoothly during the handback
-        transition."""
+        transition.
+
+        10.7: `local_bullet_ids` (a set of the ghost's own bullet ids) is
+        used to SKIP the buffer's copy of the local player's own gun
+        shots — those glow from the ghost's predicted position instead
+        (added by the caller), so the same bullet does not light twice.
+        A LOCAL bullet the ghost has handed off (its id NOT in
+        local_bullet_ids, id[0] == local_index) is lit PULLED FORWARD by
+        V*delay (the closed-form handoff — the same pull the sprite gets),
+        so the glow follows the bullet. The REMOTE player's bullets
+        (id[0] != local_index) are lit at their raw position (no pull).
+        `local_index` is the local player's index (the id's first element
+        is the firing player's index, so it distinguishes local from
+        remote)."""
         lights = []
         for (x, y, vx, vy, kind, owner, boost, mid) in pos['bullets']:
             if kind == 'missile' and mid is not None \
                     and tuple(mid) in local_missile_ids:
                 continue   # glows from the ghost's predicted pos instead
+            # 10.7: the ghost's OWN gun shots — same skip as missiles. A bullet the
+            # ghost is still drawing is skipped (it glows from the ghost's
+            # predicted pos); a LOCAL bullet the ghost has handed off is
+            # lit PULLED FORWARD by V*delay (the closed-form handoff — the
+            # same pull the sprite gets). The REMOTE player's bullets
+            # (id[0] != local_index) are lit at their raw position (no
+            # pull — they are not predicted by the ghost).
+            if kind == 'player' and mid is not None:
+                _bid_t = tuple(mid)
+                if _bid_t in local_bullet_ids:
+                    continue   # glows from the ghost's predicted pos
+                if _bid_t[0] == local_index:
+                    x += vx * delay
+                    y += vy * delay
             # 10.3d: apply the handoff offset to the fog light (same
             # position as the missile sprite).
             if kind == 'missile' and mid is not None and handoff_offsets:

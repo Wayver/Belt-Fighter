@@ -16,7 +16,8 @@ Headless: sets SDL_VIDEODRIVER=dummy before pygame.init().
      ship and the REMOTE enemies were drawn from the interpolation buffer
      (client) / the RenderModel (host) with NO flame data, so they rendered
      with no exhaust at all. 10.6 promotes flame_mags to a synced field:
-       * Ship.snapshot is a 24-tuple (flame_mags LAST, index 23);
+       * Ship.snapshot is a 25-tuple (10.7: bullet_seq LAST, index 24;
+         flame_mags at index 23);
          apply_snapshot restores it; Ship.power_state() bundles the four
          power-presentation fields (brownout / power_factor / power_used /
          flame_mags) into one plain dict for future power features.
@@ -40,7 +41,8 @@ Headless: sets SDL_VIDEODRIVER=dummy before pygame.init().
      host-authoritative behavior).
 
 This test proves:
-  1. WIRE-SHAPE     — Ship.snapshot is a 24-tuple (flame_mags at [23]);
+  1. WIRE-SHAPE     — Ship.snapshot is a 25-tuple (flame_mags at [23],
+                       bullet_seq at [24]);
                       the enemy Game-snapshot entry is (tag, e_s) with
                       e_s = (ship_s, hp, id, ax, ay) and ship_s a 24-
                       tuple; JSON round-trip preserves flame_mags.
@@ -239,22 +241,23 @@ def main():
     screen, font, big_font, light_tex, fog_surf, light_surf = \
         make_resources()
 
-    # --- 1. WIRE-SHAPE: Ship.snapshot is a 24-tuple (flame_mags LAST,
-    #     index 23); the enemy Game-snapshot entry is (tag, e_s) with
-    #     e_s = (ship_s, hp, id, ax, ay) and ship_s a 24-tuple; JSON
-    #     round-trip preserves flame_mags. ---
+    # --- 1. WIRE-SHAPE: Ship.snapshot is a 25-tuple (10.7: bullet_seq
+    #     LAST, index 24; flame_mags at index 23); the enemy
+    #     Game-snapshot entry is (tag, e_s) with e_s = (ship_s, hp, id,
+    #     ax, ay) and ship_s a 25-tuple; JSON round-trip preserves
+    #     flame_mags. ---
     tmp = _scratch_game()
     tmp.players[0].flame_mags = dict(FLAME_FWD)
     tmp.enemies[ENEMY_IDX].ship.flame_mags = dict(FLAME_FWD)
     snap = tmp.snapshot()
     ship_s = snap[0][0]
-    assert isinstance(ship_s, tuple) and len(ship_s) == 24, \
-        "Ship.snapshot must be a 24-tuple, got len %d" % (len(ship_s),)
+    assert isinstance(ship_s, tuple) and len(ship_s) == 25, \
+        "Ship.snapshot must be a 25-tuple, got len %d" % (len(ship_s),)
     assert ship_s[23] == FLAME_FWD, \
         "flame_mags must be at ship_s[23]: %r" % (ship_s[23],)
     # The enemy Game-snapshot entry is (tag, e_s) where e_s =
     # AIEnemy.snapshot() = (ship_s, hp, id, ax, ay) — a 5-tuple whose
-    # FIRST element is the 24-tuple ship_s.
+    # FIRST element is the 25-tuple ship_s.
     e_entry = snap[1][ENEMY_IDX]
     assert isinstance(e_entry, tuple) and len(e_entry) == 2, \
         "enemy Game-snapshot entry must be (tag, e_s), got %r" % (e_entry,)
@@ -263,8 +266,8 @@ def main():
         "AIEnemy.snapshot must be a 5-tuple (ship_s, hp, id, ax, ay), " \
         "got %r" % (e_s,)
     e_ship_s = e_s[0]
-    assert isinstance(e_ship_s, tuple) and len(e_ship_s) == 24, \
-        "enemy ship_s must be a 24-tuple, got len %d" % (len(e_ship_s),)
+    assert isinstance(e_ship_s, tuple) and len(e_ship_s) == 25, \
+        "enemy ship_s must be a 25-tuple, got len %d" % (len(e_ship_s),)
     assert e_ship_s[23] == FLAME_FWD, \
         "enemy flame_mags must be at ship_s[23]: %r" % (e_ship_s[23],)
     # JSON round-trip (the wire): flame_mags survives as a dict.
@@ -272,8 +275,9 @@ def main():
     assert snap_j[0][0][23] == FLAME_FWD, "JSON ship flame_mags lost"
     assert snap_j[1][ENEMY_IDX][1][0][23] == FLAME_FWD, \
         "JSON enemy flame_mags lost"
-    print("PASS: WIRE-SHAPE — Ship.snapshot is a 24-tuple (flame_mags at "
-          "[23]); enemy entry (tag, e_s) w/ 24-tuple ship_s; JSON-safe")
+    print("PASS: WIRE-SHAPE — Ship.snapshot is a 25-tuple (flame_mags at "
+          "[23], bullet_seq at [24]); enemy entry (tag, e_s) w/ 25-tuple "
+          "ship_s; JSON-safe")
 
     # --- 2. POWER-STATE: Ship.power_state() bundles the four power-
     #     presentation fields and returns a COPY of flame_mags. ---

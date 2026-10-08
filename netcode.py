@@ -50,8 +50,12 @@ Snapshot layout (see Game.snapshot in game.py):
     [1] enemies_s tuple of (tag, e_s); e_s = AIEnemy.snapshot() =
                   (ship_s, hp, id, acc_x, acc_y) -> enemy pos = e_s[0][0], e_s[0][1]
     [2] bullets_s, [3] enemy_bullets_s, [4] missiles_s
-                  b_s = (pos.x, pos.y, vel.x, vel.y, owner, life)
-                  m_s = (pos.x, pos.y, vel.x, vel.y, owner, life, boost, target_id)
+                  b_s = (pos.x, pos.y, vel.x, vel.y, owner, life, id)
+                       (10.7: id = (player_index, bullet_seq), the
+                       client's dedup key; enemy bullets keep the 6-field
+                       form — the ghost only dedups its OWN shots)
+                  m_s = (pos.x, pos.y, vel.x, vel.y, owner, life, boost,
+                         target_id, id)
     [5] asteroids_s  tuple of Asteroid.snapshot() =
                      (id, pos.x, pos.y, vel.x, vel.y, size, angle, spin, verts)
     [6] rng_state, [7] game_over, [8] protect_timer, [9] next_id,
@@ -733,10 +737,12 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
     the remote enemy's exhaust renders (parity with the host's model
     path, which carries it in the model's enemy tuple too).
 
-    Each projectile entry carries `mid` (10.3b): the missile's unique id
-    (player_index, seq) for kind == 'missile', else None. The client uses
-    it to dedup its own ghost missiles against the buffer's copy of the
-    same missile (no double-draw) — see predicted_view.
+    Each projectile entry carries `mid` (10.3b / 10.7): the projectile's
+    unique id (player_index, seq) for kind == 'missile' (10.3b) AND
+    kind == 'player' (10.7 — the ghost's own gun shots), else None
+    (kind == 'enemy'). The client uses it to dedup its own ghost
+    projectiles against the buffer's copy of the same projectile (no
+    double-draw) — see predicted_view.
 
     Ships carry their `dead` flag too (Session 10.1): ship_s[20], taken
     from the CURRENT snapshot (membership follows curr). The remote peer
@@ -929,9 +935,12 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
     # 10.3b: missiles carry their unique id (player_index, seq) — the
     # client's dedup key (its own ghost missiles are suppressed against the
     # buffer's copy of the same id; the other player's missiles are drawn
-    # from the buffer). Bullets carry None (they are matched by position,
-    # not identity — see _match_bullets).
-    for kind, idx, boost_field, id_field in (("player", 2, None, None),
+    # from the buffer).
+    # 10.7: PLAYER bullets carry their id too (the 7th field of the bullet
+    # snapshot) — the same dedup idea for the ghost's own gun shots. Enemy
+    # bullets carry None (the ghost never dedups them — they are always
+    # drawn from the buffer).
+    for kind, idx, boost_field, id_field in (("player", 2, None, 6),
                                              ("enemy", 3, None, None),
                                              ("missile", 4, 6, 8)):
         prev_list = prev_s[idx]
@@ -1506,10 +1515,38 @@ class PredictedShip:
         # player's shots, so capping it at MAX_BULLETS is a faithful
         # (slightly generous) stand-in — the gun's own cooldown is the
         # real limiter.
+        # 10.7: each ghost bullet gets the SAME unique id the host assigns
+        # at fire — (player_index, per-ship bullet_seq) — and the ghost's
+        # bullet_seq is bumped to match (it is resynced to the host's via
+        # the ship snapshot on reconcile, so the ids stay aligned). The id
+        # is the no-double-draw dedup key: predicted_view skips the
+        # buffer's copy of a bullet whose id is in local_bullets (the
+        # ghost draws it, predicted, immediate). `pending` (set by
+        # handback_bullets) marks a bullet whose buffer copy is visible in
+        # the newest snapshot — predicted_view hands it off to the buffer
+        # once that copy has ADVANCED (the 10.3g wait-until-advancing
+        # rule, reused).
         for shot in shots:
             if len(self.local_bullets) < MAX_BULLETS:
-                self.local_bullets.append(
-                    Bullet(shot.pos, shot.vel, owner=shot.owner))
+                seq_before = s.bullet_seq
+                bid = (self.local_index, seq_before)
+                s.bullet_seq += 1
+                # 10.7 fix: the reconcile REWIND (reconcile_rewind) re-runs
+                # the fire tick after apply_snapshot has RESET bullet_seq
+                # to the host's pre-fire value — so the replay re-fires the
+                # SAME bullet with the SAME id the prediction already
+                # emitted in advance(). Without this guard the ghost would
+                # hold two Bullets of one id (the in-flight one + a fresh
+                # one at the muzzle): the player sees a double-draw and,
+                # because the buffer's copy is suppressed by the id-dedup,
+                # BOTH visible ones are collision-less ghost bullets. Skip
+                # the re-fire when the id is already in flight (the
+                # prediction's copy is the fresher one).
+                if any(tuple(b.id) == bid for b in self.local_bullets):
+                    continue
+                b = Bullet(shot.pos, shot.vel, owner=shot.owner, bid=bid)
+                b.pending = False   # 10.7: handback state (client-only)
+                self.local_bullets.append(b)
         # 10.3a: keep the ghost's own laser discharges as presentation
         # entries [local_start, end, age, ttl]. 10.4c (detach fix): the
         # muzzle is the HULL-LOCAL offset (beam.local_start), NOT the frozen
@@ -1810,6 +1847,60 @@ class PredictedShip:
                       tuple(m.id) for m in self.local_missiles),
                   h_culled=_mtel.fmt_ids(pending),
                   h_jump="|".join(jump_parts))
+        return {}
+
+    def handback_bullets(self, host_seq, latest_bullets=None):
+        """Mark the ghost's OWN bullets as handed back to the buffer
+        (10.7 — the lightweight mirror of `handback_missiles`).
+
+        A ghost bullet is marked `pending` (NOT culled) once BOTH hold:
+          * `seq < host_seq` — the snapshot's authoritative
+            `bullet_seq` (ship snapshot field 24) counts the bullets the
+            host had fired as of the snapshot, so a lower seq was fired
+            BEFORE the snapshot (exact, phase-free — same logic as the
+            missile seq comparison); AND
+          * the buffer's NEWEST snapshot actually carries a bullet with
+            this id (`latest_bullets` — the newest snapshot's player-
+            bullet list, each entry's id at field 6; None when the
+            buffer is empty).
+
+        The ghost KEEPS DRAWING a pending bullet; predicted_view hands it
+        off on the frame the buffer's copy is visible AND has ADVANCED
+        (the 10.3g wait-until-advancing rule, reused) — removing it from
+        local_bullets (so the buffer copy is no longer dedup-skipped) and
+        drawing the buffer copy PULLED FORWARD by V*delay (the closed-form
+        handoff — no offset state, no decay, no backward cap, because a
+        bullet is a straight line). The bullet is drawn continuously, by
+        the ghost until the buffer copy appears and by the buffer
+        (pulled forward) after.
+
+        (If the host's copy had already expired by the snapshot, the
+        ghost's copy — same age — would be dead too, so the pending mark
+        is a no-op: the bullet is life-culled by step_local_bullets before
+        the buffer copy is ever visible.)
+
+        RETURNS an empty dict (parity with handback_missiles)."""
+        if latest_bullets is None:
+            ids = None
+        else:
+            ids = {tuple(b[6]) for b in latest_bullets if b[6] is not None}
+        before = [tuple(b.id) for b in self.local_bullets
+                  if b.id is not None]
+        pending = []
+        for b in self.local_bullets:
+            ready = (b.id is not None and b.id[0] == self.local_index
+                     and b.id[1] < host_seq
+                     and (ids is None or tuple(b.id) in ids))
+            if ready and not b.pending:
+                b.pending = True
+                pending.append(tuple(b.id))
+        _mtel.log("HANDBACK", h_host_seq=host_seq,
+                  h_buf_ids=_mtel.fmt_ids(sorted(ids)) if ids else "",
+                  h_before=_mtel.fmt_ids(before),
+                  h_after=_mtel.fmt_ids(
+                      tuple(b.id) for b in self.local_bullets),
+                  h_culled=_mtel.fmt_ids(pending),
+                  h_jump="")
         return {}
 
     def advance(self, dt, inp, enemies=None):

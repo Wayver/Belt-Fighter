@@ -148,6 +148,12 @@ class Ship:
         # prediction ghost keeps the same counter (its ghost missiles get
         # the same ids the host's get — the no-double-draw dedup key).
         self.missile_seq = 0
+        # 10.7: per-ship gun-fire counter. The host assigns each fired
+        # bullet the id (player_index, bullet_seq) and bumps this; it is
+        # SYNCED via the ship snapshot exactly like missile_seq, so the
+        # client's prediction ghost derives the same ids (the
+        # no-double-draw dedup key for the ghost's own bullets).
+        self.bullet_seq = 0
 
         # sensors: passive ear (V) + active ping (G). The fitted part
         # decides which exist (0 range/cooldown = not fitted).
@@ -365,6 +371,11 @@ class Ship:
     #                              (the host bumps it on each launch; the
     #                              client's ghost resyncs it so its ghost
     #                              missiles get the same ids the host's do)
+    #   bullet_seq               10.7: per-ship gun-fire counter (the host
+    #                              bumps it on each fired bullet; the
+    #                              client's ghost resyncs it so its ghost
+    #                              bullets get the same ids the host's do —
+    #                              the no-double-draw dedup key)
     #   power_used                 10.3c: the live total power demand
     #                              (recomputed by _allocate every tick).
     #                              Serialized so the CLIENT can compute the
@@ -431,6 +442,7 @@ class Ship:
             self.missile_seq,   # 10.3b: per-ship missile launch counter
             self.power_used,   # 10.3c: live power demand (sensor signature)
             self.flame_mags,   # 10.6: per-thruster flame mags (remote exhaust)
+            self.bullet_seq,   # 10.7: per-ship gun-fire counter
         )
 
     def sync_render(self, alpha):
@@ -450,7 +462,8 @@ class Ship:
          dead,
          missile_seq,
          power_used,
-         flame_mags) = s   # 10.1: death; 10.3b: missile; 10.3c: power; 10.6: flames
+         flame_mags,
+         bullet_seq) = s   # 10.1: death; 10.3b: missile; 10.3c: power; 10.6: flames; 10.7: bullet seq
         self.pos = pygame.Vector2(px, py)
         self.vel = pygame.Vector2(vx, vy)
         self.angle = a
@@ -474,6 +487,7 @@ class Ship:
         self.id = ship_id
         self.dead = dead   # 10.1: per-player death
         self.missile_seq = missile_seq   # 10.3b: resync the launch counter
+        self.bullet_seq = bullet_seq   # 10.7: resync the gun-fire counter
         self.power_used = power_used   # 10.3c: render-consistent power demand
         # 10.6: restore the per-thruster flame mags (presentation only —
         # the remote peer draws the remote ship's exhaust from these).

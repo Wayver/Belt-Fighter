@@ -18,7 +18,8 @@ both peers — the same stand-in `_build_remote_enemy_standins` builds);
 `power_used` is the LIVE total power demand, recomputed every tick by
 `Ship._allocate` and NOT derivable client-side (the enemy's thruster state
 is not synced) — so it is carried on the wire:
-  * Ship.snapshot is a 24-tuple (power_used at index 22, before the
+  * Ship.snapshot is a 25-tuple (10.7: bullet_seq LAST, index 24;
+         power_used at index 22, before the
     10.6 flame_mags at 23); apply_snapshot restores it.
   * netcode.interp_positions carries power_used through the buffer's
     enemy entry (11-tuple, index 9), LERP'd across the window like the
@@ -39,7 +40,8 @@ mutates the ghost directly, and a reconcile does NOT flicker it off with
 the host's state (the host never saw the client's V/G/T).
 
 This test proves it:
-  1. WIRE-SHAPE   — Ship.snapshot is a 24-tuple (power_used at [22]); the
+  1. WIRE-SHAPE   — Ship.snapshot is a 25-tuple (power_used at [22],
+                       bullet_seq at [24]); the
                     enemy's nested ship snapshot carries it; JSON
                     round-trip preserves it.
   2. BUFFER-CARRIES — the buffer's enemy entry is an 11-tuple with
@@ -294,9 +296,9 @@ def main():
     screen, font, big_font, light_tex, fog_surf, light_surf = \
         make_resources()
 
-    # --- 1. WIRE-SHAPE: Ship.snapshot is a 24-tuple (power_used at
-    #     [22]); the enemy's nested ship snapshot carries it; JSON
-    #     round-trip preserves it. ---
+    # --- 1. WIRE-SHAPE: Ship.snapshot is a 25-tuple (10.7: bullet_seq
+    #     LAST, index 24; power_used at [22]); the enemy's nested ship
+    #     snapshot carries it; JSON round-trip preserves it. ---
     tmp = _scratch_game()
     ls = tmp.players[1]
     ls.pos = pygame.Vector2(WIDTH / 2, HEIGHT / 2)
@@ -305,13 +307,13 @@ def main():
     e.ship.power_used = ENEMY_POWER_USED
     snap = tmp.snapshot()
     ls_s = snap[0][1]
-    assert len(ls_s) == 24, "Ship.snapshot must be a 24-tuple, got %d" \
+    assert len(ls_s) == 25, "Ship.snapshot must be a 25-tuple, got %d" \
         % len(ls_s)
     # The enemy's Game-snapshot entry is (tag, e.snapshot()) where
     # e.snapshot() = (ship_s, hp, id, ax, ay) — the ship snapshot is at
     # [1][0].
     es_s = snap[1][ENEMY_IDX][1][0]
-    assert len(es_s) == 24, "enemy ship snapshot must be a 24-tuple, " \
+    assert len(es_s) == 25, "enemy ship snapshot must be a 25-tuple, " \
         "got %d" % len(es_s)
     assert abs(es_s[22] - ENEMY_POWER_USED) < 1e-9, \
         "enemy ship snapshot must carry power_used at [22]: %r" \
@@ -320,9 +322,9 @@ def main():
     assert abs(rt[1][ENEMY_IDX][1][0][22] - ENEMY_POWER_USED) < 1e-9, \
         "JSON round-trip must preserve power_used: %r" \
         % (rt[1][ENEMY_IDX][1][0][22],)
-    print("PASS: WIRE-SHAPE — Ship.snapshot is a 24-tuple (power_used at "
-          "[22]); the enemy's nested ship snapshot carries it; JSON "
-          "round-trip preserves it")
+    print("PASS: WIRE-SHAPE — Ship.snapshot is a 25-tuple (power_used at "
+          "[22], bullet_seq at [24]); the enemy's nested ship snapshot "
+          "carries it; JSON round-trip preserves it")
 
     # --- 2. BUFFER-CARRIES: the buffer's enemy entry is an 11-tuple with
     #     power_used at [9], lerp'd across the window. ---

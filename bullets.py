@@ -41,24 +41,41 @@ class Beam:
 
 
 class Bullet:
-    def __init__(self, pos, vel, owner=0):
+    def __init__(self, pos, vel, owner=0, bid=None):
         self.pos = pos
         self.prev_pos = pos.copy()      # NEW
         self.vel = vel
         self.life = BULLET_LIFE
         self.owner = owner
+        # 10.7: unique identity (player_index, bullet_seq) — the
+        # player-prefixed id the host assigns at fire (see Game._step).
+        # The client's ghost derives the SAME id deterministically and
+        # uses it to dedup its own predicted bullets against the
+        # buffer's copy of the same bullet (no double-draw). None for
+        # pre-10.7 snapshots / single-player (the id is presentation
+        # only — it never feeds the sim).
+        self.id = bid
+        # 10.7: handback state (client-only). Set True by
+        # PredictedShip.handback_bullets once the buffer's newest snapshot
+        # carries this bullet; predicted_view then hands it off to the
+        # buffer on the frame the buffer's copy ADVANCES. Always False on
+        # the host (the host never runs the ghost).
+        self.pending = False
 
     def snapshot(self):
+        # 10.7: the id (player_index, bullet_seq) is carried too (the
+        # client's dedup key); stored as a 2-tuple (None-safe).
         return (self.pos.x, self.pos.y, self.vel.x, self.vel.y,
-                self.owner, self.life)
+                self.owner, self.life, self.id)
 
     def apply_snapshot(self, s):
-        (px, py, vx, vy, owner, life) = s
+        (px, py, vx, vy, owner, life, bid) = s
         self.pos = pygame.Vector2(px, py)
         self.prev_pos = self.pos.copy()   # no interpolation artifact on restore
         self.vel = pygame.Vector2(vx, vy)
         self.owner = owner
         self.life = life
+        self.id = bid                     # 10.7: restore the unique id
 
     def update(self, dt):
         self.prev_pos = self.pos.copy()  # NEW

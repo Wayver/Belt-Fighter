@@ -244,13 +244,21 @@ def script_ttf(t):
            pygame.K_SPACE: 1 if (t // 30) % 2 == 0 else 0})
 
 
-def _run_rewind_case(res, delay_s):
+def _run_rewind_case(res, delay_s, echo=False):
     """Run the (l) dead-reckoning rewind case once.
 
     A real host Game is stepped with script_ttf(t); a client-side ghost is
     fed the SAME input (stamped `delay_s` in the past) and rewind-reconciled
     after every SNAPSHOT_INTERVAL ticks. Returns (max ghost-vs-host error,
     number of rewinds).
+
+    10.10: `echo=True` feeds the ghost's ECHO buffer (the host's ACTUAL
+    applied input, tagged at the tick START = the host's sim clock) instead
+    of its own input buffer, and leaves the own buffer EMPTY. The rewind's
+    replay is then driven by the echo buffer (the 10.10 replay swap) — and
+    because the own buffer is empty, a bit-exact result PROVES the echo
+    buffer is the replay source (if the code still read the own buffer, the
+    replay would have no input and the ghost would not move).
 
     Pinned facts (Session 7.6 — do NOT re-derive):
       * The input stamp is the tick's START (g.sim_time read BEFORE
@@ -282,7 +290,14 @@ def _run_rewind_case(res, delay_s):
             keys = script_ttf(t); inp = ShipInput.from_keys(keys)
             g.update(STEP, keys)                  # step the authoritative host
             ghost.advance(STEP, inp)              # step the ghost (lockstep)
-            ghost.record_input(stamp - delay_s, inp)
+            if echo:
+                # 10.10: feed the ECHO buffer (the host's actual applied
+                # input, tagged at the tick START = the host's sim clock)
+                # and leave the own buffer empty — the rewind's replay is
+                # driven by the echo buffer (the 10.10 replay swap).
+                ghost.record_echo(stamp, inp)
+            else:
+                ghost.record_input(stamp - delay_s, inp)
             snaps[t + 1] = g.snapshot()           # snapshot after t+1 updates
             if (t + 1) % SNAPSHOT_INTERVAL == 0:
                 snap_tick = t + 1 - SNAPSHOT_INTERVAL   # snapshot SNAP ticks ago
@@ -1844,6 +1859,25 @@ def main():
         ok = False
         print(f"FAIL: rewind 50ms-delay — max ghost-vs-host {e50:.1f}px "
               f"exceeds bound {bound:.1f}px over {n50} rewinds")
+    # (l.3) 10.10 ECHO-DRIVEN — the rewind's replay is driven by the
+    # ECHO buffer (the host's ACTUAL applied input, tagged at the tick
+    # START = the host's sim clock), not the client's own sent input. The
+    # own buffer is left EMPTY, so a bit-exact result PROVES the echo
+    # buffer is the replay source (if the code still read the own buffer,
+    # the replay would have no input and the ghost would not move). The
+    # echo is authoritative (no client-estimated delay), so this is a
+    # zero-loss case: bit-exact after each rewind.
+    ee, ne = _run_rewind_case(res, 0.0, echo=True)
+    if ee < 1e-6:
+        print(f"PASS: rewind echo-driven — ghost matches host to {ee:.1e}px "
+              f"(< 1e-6) after each of {ne} rewinds (replay driven by the "
+              f"echo buffer; own buffer empty, so the echo is the source)")
+    else:
+        ok = False
+        print(f"FAIL: rewind echo-driven — max ghost-vs-host {ee:.3e}px "
+              f"after {ne} rewinds (want < 1e-6): the replay is not "
+              f"driven by the echo buffer (own buffer empty, so the "
+              f"replay would have no input and the ghost would not move)")
 
     print(f"PASS: cadence knobs — SNAPSHOT_INTERVAL={SNAPSHOT_INTERVAL} "
           f"ticks, INTERP_DELAY={INTERP_DELAY}s, adaptive "

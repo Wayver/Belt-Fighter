@@ -66,6 +66,7 @@ __all__ = [
     "do_handshake_client", "do_handshake_host",
     "NetWorker",
     "T_JOIN", "T_WELCOME", "T_INPUT", "T_SNAP", "T_RESPAWN", "T_BEAM",
+    "T_ECHO",
 ]
 
 # 4-byte big-endian unsigned length prefix.
@@ -93,6 +94,24 @@ T_RESPAWN = "respawn"
 # way the ghost draws its OWN beams (10.3a). One-way LAN latency (~10-20 ms)
 # is imperceptible against a 0.15 s flash.
 T_BEAM = "beam"
+# 10.10: the input-echo — the input the host ACTUALLY applied to player 1
+# (the remote player), per sim tick. The client's dead-reckoning rewind
+# (reconcile_rewind) replays the ticks since the snapshot with the client's
+# OWN sent input, but the host applied the latest input it had RECEIVED
+# (up to one-way latency stale) — on an input CHANGE (turn/thrust) the
+# ghost predicts with the new input while the host is still on the old one,
+# and the reconcile snaps the ghost back (~MAX_SPEED x latency). The echo
+# closes that gap: the host tags each applied input with the tick's
+# sim_time and streams it near-real-time (the T_BEAM pattern — event data
+# that must not bloat the pruned snapshot rides a separate small message;
+# the snapshot stays pruned, D1). Shape:
+#   {"type": T_ECHO, "entries": [[sim_time, inp_dict], ...]}
+# where inp_dict is serialize_input's output (deserialize_input inverts
+# it). One message per sim-thread iteration that stepped >= 1 tick
+# (~60 msg/s, a few KB/s — negligible). A dropped echo degrades
+# gracefully: the replay holds the last echoed input — exactly what the
+# host itself did (pinned #5).
+T_ECHO = "echo"
 
 
 # --- framing: pure byte functions (no socket) -----------------------------
@@ -899,6 +918,32 @@ def _self_test():
     else:
         ok = False
         print("FAIL: ShipInput round-trip ->", back)
+
+    # --- 2c. T_ECHO round-trip (10.10): the input-echo message shape the
+    # sim thread sends (one per stepped iteration: a list of
+    # [sim_time, inp_dict] entries) must survive the wire and invert
+    # back to the exact (sim_time, ShipInput) pairs the host applied.
+    echo_inps = [ShipInput(turn=1.0, thrust_fwd=1.0),
+                 ShipInput(turn=-1.0, fire=True),
+                 ShipInput()]
+    echo_msg = {"type": T_ECHO,
+                "entries": [[i * 0.0166667, serialize_input(e)]
+                            for i, e in enumerate(echo_inps)]}
+    echo_msgs, echo_rest = extract_frames(encode_frame(echo_msg))
+    echo_ok = (echo_rest == b"" and len(echo_msgs) == 1
+               and echo_msgs[0].get("type") == T_ECHO
+               and len(echo_msgs[0]["entries"]) == len(echo_inps))
+    if echo_ok:
+        for (st, d), orig in zip(echo_msgs[0]["entries"], echo_inps):
+            if deserialize_input(d) != orig:
+                echo_ok = False
+                break
+    if echo_ok:
+        print("PASS: T_ECHO round-trip — %d entries, sim_time + input "
+              "intact" % len(echo_inps))
+    else:
+        ok = False
+        print("FAIL: T_ECHO round-trip ->", echo_msgs, echo_rest)
 
     # --- 2b. hull/loadout wire mapping (Session 6.5) ---
     from .hulls import (PLAYER_HULLS, COMPONENT_CATALOG, DEFAULT_HULL,

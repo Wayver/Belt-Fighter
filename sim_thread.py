@@ -58,7 +58,7 @@ import time
 
 from .game import STEP
 from .intent import ShipInput
-from .net import T_BEAM
+from .net import T_BEAM, T_ECHO, serialize_input
 
 
 class SimThread:
@@ -242,5 +242,19 @@ class SimThread:
                                            "owner": owner,
                                            "lx": lx, "ly": ly})
                     g._beam_events.clear()
+                    # 10.10: send the input the host ACTUALLY applied to
+                    # player 1 (the client's ship) on each tick stepped
+                    # this iteration, as ONE T_ECHO (the T_BEAM pattern —
+                    # per-tick event data that must not bloat the pruned
+                    # snapshot). The client's rewind replay uses these
+                    # instead of its own sent input — the high-speed
+                    # snapback fix (in-flight input). ~60 msg/s, a few
+                    # KB/s — negligible.
+                    echo = g.flush_remote_input_echo()
+                    if echo:
+                        self._worker.send({
+                            "type": T_ECHO,
+                            "entries": [[t, serialize_input(inp)]
+                                        for (t, inp) in echo]})
             # 4. sleep ~1 ms (bounds CPU + makes stop() prompt).
             self._stop.wait(self.WAIT)

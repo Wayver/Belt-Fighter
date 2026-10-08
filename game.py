@@ -669,6 +669,16 @@ class Game:
         # ride the snapshot's INTERP_DELAY window). Drained after each
         # sim step (sim_thread.py); cleared on reset/respawn.
         self._beam_events = []
+        # 10.10: the input-echo queue — (sim_time, ShipInput) pairs, one per
+        # sim tick, for the REMOTE player (index 1) only. _step appends the
+        # POST-CAP input it actually applied (the world-cap replace() may
+        # have stripped fire/missile_fire — the ghost's step() does NOT
+        # apply the world cap, so echoing the raw input would re-introduce
+        # a fire divergence when the world is full). The sim thread drains
+        # this after each stepped iteration and sends one T_ECHO
+        # (sim_thread.py); cleared on reset/respawn. Never touched in
+        # single-player (there is no player 1).
+        self._remote_input_echo = []
         self.enemy_bullets = []
         self.particles = []
         self.asteroids = []
@@ -859,6 +869,7 @@ class Game:
         self.enemy_bullets.clear()
         self.beams.clear()
         self._beam_events.clear()   # 10.4: stale beam events are gone
+        self._remote_input_echo.clear()   # 10.10: stale echoes are gone
         self.missiles.clear()
         self.particles.clear()
         self.asteroids.clear()
@@ -1376,6 +1387,22 @@ class Game:
                     p_inp = replace(p_inp, fire=False)   # world cap: no room
                 if p_inp.missile_fire and len(self.missiles) >= MAX_MISSILES:
                     p_inp = replace(p_inp, missile_fire=False)
+                if i == 1:
+                    # 10.10: echo the POST-CAP input the host actually
+                    # applied to player 1 this tick (the client's rewind
+                    # replay uses it instead of the client's own sent
+                    # input — see T_ECHO in net.py). MUST be post-cap: the
+                    # ghost's step() does NOT apply the world cap, so
+                    # echoing the raw input would re-introduce a fire
+                    # divergence when the world is full. Tagged with the
+                    # tick's START (self.sim_time - dt — sim_time was
+                    # already advanced to the tick's END at the top of
+                    # _step), matching the host's own-input convention and
+                    # the replay's "newest echo with sim_time <=
+                    # tick_START" selection (an end-tag would be off by
+                    # one tick).
+                    self._remote_input_echo.append(
+                        (self.sim_time - dt, p_inp))
                 shots, beams, missiles = p.update(dt, p_inp)
 
                 for shot in shots:
@@ -1476,6 +1503,17 @@ class Game:
         host calls this when an 'input' message arrives; _step applies it to
         player 1 (index 1) each tick. Single-player never calls it."""
         self.remote_input = inp
+
+    def flush_remote_input_echo(self):
+        """10.10: return + clear the input-echo queue (the sim thread calls
+        this after each stepped iteration and sends the entries as one
+        T_ECHO). Each entry is (sim_time, ShipInput) — the POST-CAP input
+        the host applied to player 1 on the tick that STARTS at sim_time
+        (see the capture in _step). Empty when the sim did not step player
+        1 (single-player, game_over, or a dead player-1 ship)."""
+        out = self._remote_input_echo
+        self._remote_input_echo = []
+        return out
 
     def _nearest_player(self, pos):
         """The player ship nearest to `pos` (Session 6.2a). Enemies target

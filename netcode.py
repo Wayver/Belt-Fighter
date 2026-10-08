@@ -1277,6 +1277,20 @@ class PredictedShip:
         # snapshot arriving at sim time T can replay the inputs the host
         # actually applied between T and now (see `reconcile_rewind`).
         self._input_buffer = []
+        # 10.10: the input-ECHO buffer — (sim_time, ShipInput) pairs, oldest
+        # first, bounded to INPUT_BUFFER_MAX seconds of sim time (the same
+        # bound as _input_buffer). These are the inputs the host ACTUALLY
+        # applied to the local player (player 1), echoed per tick over the
+        # wire (T_ECHO, see net.py) and stamped with the tick's sim_time —
+        # authoritative, unlike _input_buffer's client-estimated stamps.
+        # reconcile_rewind prefers them for the replay (the high-speed
+        # snapback fix: the host applied the latest input it had RECEIVED,
+        # up to one-way latency stale — the client's own sent input
+        # diverges from that on an input change). Falls back to
+        # _input_buffer when no echo covers a tick (initial transient /
+        # loss — a dropped echo holds the last echoed input, exactly what
+        # the host itself did).
+        self._echo_buffer = []
         # Session 7.3: the ghost's OWN gun shots, as presentation Bullets.
         # The client never runs the sim, so without this the player's own
         # shots appear only when the host's next snapshot arrives (~100 ms
@@ -1413,6 +1427,25 @@ class PredictedShip:
         while self._input_buffer and self._input_buffer[0][0] < cutoff:
             self._input_buffer.pop(0)
 
+    def record_echo(self, sim_time, inp):
+        """Record one input-echo entry (10.10): the input the host
+        ACTUALLY applied to the local player on the tick that STARTS at
+        `sim_time` (the T_ECHO message's stamp — the host's own sim clock,
+        not the client's estimate). The client loop calls this once per
+        T_ECHO entry, in arrival order (the wire is in-order TCP, so the
+        buffer stays ordered by sim_time).
+
+        Bounded to INPUT_BUFFER_MAX seconds of sim time (oldest dropped) —
+        the same bound as `record_input`: a rewind replays at most
+        (now - snap_time) of sim time, which is far less than 2 s.
+
+        `inp` is a fresh ShipInput (deserialize_input builds one per
+        entry), so it is stored by reference like record_input."""
+        self._echo_buffer.append((sim_time, inp))
+        cutoff = sim_time - self.INPUT_BUFFER_MAX
+        while self._echo_buffer and self._echo_buffer[0][0] < cutoff:
+            self._echo_buffer.pop(0)
+
     def reconcile_rewind(self, ship_s, snap_time, now, enemies=None):
         """Dead-reckoning reconcile (Session 7.6) — replaces the v1 full
         snap. Apply the authoritative ship snapshot taken at sim time
@@ -1457,7 +1490,20 @@ class PredictedShip:
         self._seeded = True
         self._restore_client_sensor_state()
         self._acc = 0.0
-        buf = self._input_buffer
+        # 10.10: the replay's input source is the host's ACTUAL applied
+        # input — the echo buffer (T_ECHO, stamped with the host's own sim
+        # clock) — when it has anything, else the client's own sent input
+        # (the 7.6 behavior: initial transient before the first echo, or
+        # total loss). Both buffers are (time, ShipInput) pairs ordered by
+        # time, so the pointer math below is a drop-in swap of the source.
+        # The echo kills the in-flight-input snapback: on an input CHANGE
+        # the client's own input is one-way-latency ahead of what the host
+        # actually applied, and the old replay (own input) diverged
+        # ~MAX_SPEED x latency before the reconcile yanked it back. A
+        # dropped echo degrades gracefully — the monotone pointer holds
+        # the last echoed input across the gap, exactly what the host
+        # itself did (pinned #5).
+        buf = self._echo_buffer or self._input_buffer
         if not buf:
             # 10.9: no replay — the pose is the snapshot's; anchor the
             # render interpolation on it (no phantom lerp).

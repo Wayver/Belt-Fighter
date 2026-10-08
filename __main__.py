@@ -30,7 +30,7 @@ from .net import (Host, connect, do_handshake_host, do_handshake_client,
                   serialize_snapshot, deserialize_snapshot,
                   serialize_input, deserialize_input,
                   NetWorker,
-                  T_INPUT, T_SNAP, T_RESPAWN, T_BEAM)
+                  T_INPUT, T_SNAP, T_RESPAWN, T_BEAM, T_ECHO)
 from .netcode import (PredictedShip, HostTimeEstimator, LatencyTracker,
                       RenderPoint, BEAM_TTL)
 from .ship import Ship
@@ -806,6 +806,20 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
                     (m.get("lx", 0.0), m.get("ly", 0.0)),
                     pygame.Vector2(m["ex"], m["ey"]),
                     0.0, BEAM_TTL, m.get("owner", 0)])
+            elif m.get("type") == T_ECHO:
+                # 10.10: the input the host ACTUALLY applied to OUR ship
+                # (player 1) on each tick — one (sim_time, input) pair per
+                # entry. Record each in the ghost's echo buffer (in
+                # arrival order — in-order TCP keeps it sorted by
+                # sim_time). reconcile_rewind prefers these over the
+                # client's own sent input for the replay: the host applied
+                # the latest input it had RECEIVED (up to one-way latency
+                # stale), so on an input change the client's own input
+                # diverges from what the host did — the high-speed
+                # snapback. A dropped echo degrades gracefully (the replay
+                # holds the last echoed input — what the host itself did).
+                for (st, d) in m.get("entries", []):
+                    game.ghost.record_echo(st, deserialize_input(d))
         # Session 8.2: the worker owns the socket now — read worker.closed (the
         # worker mirrors conn.closed) and never touch conn.* here. The
         # worker also does the drain_send() (off the render thread), so the

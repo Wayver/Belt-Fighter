@@ -260,13 +260,13 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
         # (the 8.5 caveat's outstanding item). last_telem_time anchors it
         # (0.0 -> the first line is immediate).
         last_telem_time = 0.0
-        TELEMETRY_PERIOD = SNAPSHOT_INTERVAL * STEP   # 0.1 s (10 Hz)
+        TELEMETRY_PERIOD = SNAPSHOT_INTERVAL * STEP   # 0.033 s (30 Hz, 10.8)
         # Session 7.10b: host-side frame-rate telemetry (F3-toggled, mirrors
         # the client's 7.10a columns). The client's CSV can't tell a WIRE
         # stall (host sent smoothly, packets queued + released in a burst)
         # from a HOST frame stall (the host's sim is tied to its frame loop,
         # so a host hiccup stalls the sim AND the snapshot sending). We log
-        # the host's raw frame time on each snapshot send (10 Hz) so the
+        # the host's raw frame time on each snapshot send (30 Hz, 10.8) so the
         # next re-test can be correlated: if the client's snapshot gap
         # (newest jumping 1.3-1.6 s) lines up with a host hiccup (dt_max
         # > 50 ms / low fps) at the same wall-clock time, it's a HOST stall

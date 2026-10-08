@@ -7,7 +7,7 @@ module is the wire that carries them between the two peers.
 
 Pinned decisions (see the pinned plan note — do NOT re-derive):
   * Transport: TCP, non-blocking. Reliable + ordered, so there is no loss or
-    reorder to handle. 10 Hz snapshots + 60 Hz input are tiny. The socket is
+    reorder to handle. 30 Hz snapshots + 60 Hz input are tiny. The socket is
     polled in the game loop (no threads, no shared state). Outgoing messages
     go to a send buffer that is drained each frame. Connection setup
     (connect/accept + the join/welcome handshake) is a separate, BLOCKING
@@ -517,7 +517,7 @@ def _disable_nagle(sock):
 
     For a real-time game we want small messages out IMMEDIATELY, not
     coalesced, so TCP_NODELAY is set on BOTH peers' sockets (the host's
-    accepted socket and the client's connecting socket). The 10 Hz snapshots
+    accepted socket and the client's connecting socket). The 30 Hz snapshots
     are large enough that Nagle would not hold them, but the small 60 Hz
     input messages are exactly the case Nagle + delayed-ACK breaks.
     """
@@ -633,7 +633,7 @@ class NetWorker:
       4. Host only: the main thread calls `set_latest_snapshot((sim_time,
          snap))` each frame; the worker's real-time timer (checked every
          ~1 ms, NOT once per frame) sends the latest snapshot every
-         `period` seconds of REAL time — a true 10 Hz independent of the
+         `period` seconds of REAL time — a true 30 Hz independent of the
          frame rate (the 7.10c in-loop timer was frame-quantized).
       5. `stop()` sets the stop flag and joins the thread. Idempotent.
 
@@ -655,7 +655,7 @@ class NetWorker:
     def __init__(self, conn, is_host=False, period=None):
         self._conn = conn
         self._is_host = is_host
-        # The host snapshot period in REAL seconds (10 Hz by default). The
+        # The host snapshot period in REAL seconds (30 Hz by default). The
         # client ignores it (it never sends snapshots).
         self._period = (SNAPSHOT_INTERVAL * TICK) if period is None else period
         self._out = queue.Queue()

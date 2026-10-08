@@ -38,7 +38,7 @@ Game.update — MAX_STEPS_PER_FRAME + ACC_BACKLOG_CAP):
      latest_model = game.render_model() (atomic reference swap; the
      render thread reads it and draws with it), and
      worker.set_latest_snapshot(game.sim_time, game.snapshot()) (moved
-     from the render loop to the sim thread — the worker's 10 Hz timer
+     from the render loop to the sim thread — the worker's 30 Hz timer
      now always has a fresh snapshot to send). Publishing only on a step
      keeps the model object STABLE between steps (the render clock
      detects a new model by identity and advances its alpha while the

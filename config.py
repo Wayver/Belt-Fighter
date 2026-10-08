@@ -136,13 +136,31 @@ MAX_FRAME_DT = 0.25  # clamp frame dt so a hiccup can't trigger a catch-up spira
 
 # --- networking: snapshot cadence + interpolation delay ---
 # The authoritative peer sends a Game.snapshot() every SNAPSHOT_INTERVAL sim
-# ticks (6 ticks at the 60 Hz sim = 10 snapshots/s). The remote peer renders
+# ticks (2 ticks at the 60 Hz sim = 30 snapshots/s). The remote peer renders
 # INTERP_DELAY seconds in the PAST, interpolating between the two snapshots
 # that bracket that time — so it always has the next snapshot in hand before
 # it needs to render the current one (no rubber-banding, no extrapolation).
-SNAPSHOT_INTERVAL = 6    # sim ticks between snapshots (6 -> 10 Hz at 60 Hz sim)
+#
+# 10.8: raised 10 Hz -> 30 Hz. The whole stack reads this one knob from
+# config (the NetWorker's real-time send timer, the SimThread hand-off, the
+# client's interpolation window, and the tests), so the cadence change is
+# just this constant. Bandwidth is a non-issue on a LAN (~183 KB/s at 30 Hz
+# for a steady field, ~223 KB/s worst case — measured); the one companion
+# change it requires is SNAPSHOT_BUFFER_MAX below (the interpolation buffer
+# must stay deep enough to bracket the render point at the higher rate).
+SNAPSHOT_INTERVAL = 2    # sim ticks between snapshots (2 -> 30 Hz at 60 Hz sim)
 INTERP_DELAY = 0.1       # seconds the remote render lags the sim
 NET_PORT = 7777          # default host listen port (2P host/client, Session 6.5)
+
+# 10.8: the client's interpolation buffer depth (max snapshots kept). The
+# render point is `newest - delay`, and the adaptive delay can grow to
+# INTERP_DELAY_MAX (0.35 s) under jitter, so the buffer must hold at least
+# (INTERP_DELAY_MAX / snapshot_interval) + 1 snapshots to BRACKET that point
+# — otherwise positions_at clamps to the oldest snapshot and the remote
+# render stalls exactly when the adaptive delay is doing its job. At 30 Hz
+# (interval 0.033 s) that is ceil(0.35/0.033)+1 = 12; 16 leaves margin.
+# (At the old 10 Hz the default of 8 covered 0.70 s — 2x the max delay.)
+SNAPSHOT_BUFFER_MAX = 16
 
 # --- adaptive interpolation delay (Session 7.5a) ---
 # The remote render's delay is INTERP_DELAY at rest and grows with the

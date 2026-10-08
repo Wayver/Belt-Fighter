@@ -66,7 +66,8 @@ import math
 import pygame
 
 from .config import (INTERP_DELAY, INTERP_DELAY_MIN, INTERP_DELAY_MAX,
-                    ADAPT_K, SNAPSHOT_INTERVAL, TICK, MAX_FRAME_DT,
+                    ADAPT_K, SNAPSHOT_INTERVAL, SNAPSHOT_BUFFER_MAX, TICK,
+                    MAX_FRAME_DT,
                     MAX_BULLETS, MAX_MISSILES,
                     MISSILE_SPEED, MISSILE_ACCEL, MISSILE_BOOST_TIME,
                     MISSILE_TURN_RATE, MISSILE_LIFE,
@@ -359,7 +360,7 @@ class LatencyTracker:
                       INTERP_DELAY_MIN, INTERP_DELAY_MAX)
 
     with EMA alpha = 0.2 (the same time constant as the estimator's
-    offset EMA — a 10 Hz sample stream settles in ~0.1 s). Two
+    offset EMA — the sample stream settles within a few snapshots). Two
     disciplines on top of the clamp:
 
       - the delay only ever moves by at most MAX_STEP = 1/60 s per
@@ -473,8 +474,8 @@ class RenderPoint:
 
     One subtlety: `newest - delay` on its own is a STAIRCASE. The newest
     stamp is flat between arrivals and jumps by one snapshot interval
-    (0.1 s) when a packet lands, so the raw anchor would jump 0.1 s
-    forward every 100 ms — a 6x telegraph, not a render. The point
+    when a packet lands, so the raw anchor would jump forward by a whole
+    snapshot interval every arrival — a telegraph, not a render. The point
     therefore CHASES the anchor: each frame it moves toward
     `newest - delay` at at most `dt` (the frame's REAL time), so the
     point advances at 1x real time — the same rate the anchor creeps
@@ -488,8 +489,8 @@ class RenderPoint:
     snapshots (the 7.8 log's 4.3 s drift on the Mac, ~4.6 s of stale
     data). Capped by `dt`, the point advances 1/47 s per frame at
     47 FPS — exactly 1x real time — and never drifts. The cap still
-    smooths the staircase (a 0.1 s anchor jump is covered over ~6 frames
-    at 60 FPS, ~5 at 47) and still bounds a hiccup (the caller clamps
+    smooths the staircase (a one-interval anchor jump is covered over a
+    couple of frames at 60 FPS) and still bounds a hiccup (the caller clamps
     `dt` to MAX_FRAME_DT, so one frame moves the point at most that far).
     The net per-frame advance is bounded by `dt` + MAX_STEP_DELAY (the
     chase step plus the delay's own per-frame movement) — the render
@@ -987,9 +988,15 @@ class SnapshotBuffer:
     and sim times, never touches sim state, and never mutates its inputs.
     """
 
-    def __init__(self, max_snapshots=8):
+    def __init__(self, max_snapshots=None):
         # (sim_time, snapshot) pairs, oldest first. Bounded so a stalled
         # authoritative peer can't grow the buffer without limit.
+        # 10.8: the default depth is config.SNAPSHOT_BUFFER_MAX (16) — deep
+        # enough to bracket the render point at the 30 Hz cadence even when
+        # the adaptive delay is at its INTERP_DELAY_MAX cap (see config).
+        # Pass an explicit value to override (tests use 200 for long sweeps).
+        if max_snapshots is None:
+            max_snapshots = SNAPSHOT_BUFFER_MAX
         self._snaps = []
         self._max = max_snapshots
 

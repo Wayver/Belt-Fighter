@@ -265,13 +265,6 @@ def main():
              hull=GUN_HULL, loadout=LOADOUT, seed=1234, players=2,
              local_index=LOCAL_INDEX)
     g.set_player_ship(LOCAL_INDEX, Ship(hull=GUN_HULL, loadout=LOADOUT))
-    cs = g.players[LOCAL_INDEX]
-    cs.pos = pygame.Vector2(0.0, 0.0)
-    cs.vel = pygame.Vector2(0.0, 0.0)
-    cs.angle = 0.0
-    for w in cs.weapons:
-        if w.comp.bullet_speed > 0:
-            w.cooldown = 999.0   # the ghost does NOT fire during the frame
     g.ghost = PredictedShip(hull=GUN_HULL, loadout=LOADOUT,
                             local_index=LOCAL_INDEX)
     g.host_time = HostTimeEstimator()
@@ -285,6 +278,18 @@ def main():
                fog_surf, light_surf, hull=GUN_HULL, loadout=LOADOUT,
                seed=1234, players=2)
     tmp.set_player_ship(LOCAL_INDEX, Ship(hull=GUN_HULL, loadout=LOADOUT))
+    # The ghost is SEEDED from tmp's snapshot (push_snapshot -> ghost.seed),
+    # so the ghost's ship pose — and thus the camera — comes from
+    # tmp.players[LOCAL_INDEX], NOT g.players[LOCAL_INDEX]. Set it at the
+    # origin so the camera centers there and the bullets land in the open
+    # (not under the top-left HUD, which is drawn after the fog).
+    cs = tmp.players[LOCAL_INDEX]
+    cs.pos = pygame.Vector2(0.0, 0.0)
+    cs.vel = pygame.Vector2(0.0, 0.0)
+    cs.angle = 0.0
+    for w in cs.weapons:
+        if w.comp.bullet_speed > 0:
+            w.cooldown = 999.0   # the ghost does NOT fire during the frame
     tmp.bullets = [
         Bullet(pygame.Vector2(300.0, 0.0), pygame.Vector2(BULLET_SPEED, 0.0),
                owner=1, bid=(LOCAL_INDEX, 0)),
@@ -331,13 +336,6 @@ def main():
               hull=GUN_HULL, loadout=LOADOUT, seed=1234, players=2,
               local_index=LOCAL_INDEX)
     g2.set_player_ship(LOCAL_INDEX, Ship(hull=GUN_HULL, loadout=LOADOUT))
-    cs2 = g2.players[LOCAL_INDEX]
-    cs2.pos = pygame.Vector2(0.0, 0.0)
-    cs2.vel = pygame.Vector2(0.0, 0.0)
-    cs2.angle = 0.0
-    for w in cs2.weapons:
-        if w.comp.bullet_speed > 0:
-            w.cooldown = 999.0
     g2.ghost = PredictedShip(hull=GUN_HULL, loadout=LOADOUT,
                              local_index=LOCAL_INDEX)
     g2.host_time = HostTimeEstimator()
@@ -349,6 +347,15 @@ def main():
                 fog_surf, light_surf, hull=GUN_HULL, loadout=LOADOUT,
                 seed=1234, players=2)
     tmp2.set_player_ship(LOCAL_INDEX, Ship(hull=GUN_HULL, loadout=LOADOUT))
+    # Same as gate 4: the ghost is seeded from tmp2's snapshot, so the
+    # ship pose (and camera) comes from tmp2.players[LOCAL_INDEX].
+    cs2 = tmp2.players[LOCAL_INDEX]
+    cs2.pos = pygame.Vector2(0.0, 0.0)
+    cs2.vel = pygame.Vector2(0.0, 0.0)
+    cs2.angle = 0.0
+    for w in cs2.weapons:
+        if w.comp.bullet_speed > 0:
+            w.cooldown = 999.0
     tmp2.bullets = [
         Bullet(pygame.Vector2(300.0, 0.0), pygame.Vector2(BULLET_SPEED, 0.0),
                owner=1, bid=(LOCAL_INDEX, 0)),

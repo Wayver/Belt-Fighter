@@ -2409,13 +2409,22 @@ class Game:
 
         inp = ShipInput.from_keys(keys)
         self.ghost.advance(dt, inp, enemies=ghost_enemies)
+        # 10.9: the ghost's INTERPOLATED render pose (lerp across the
+        # in-progress step, the same sub-step interpolation the host's local
+        # ship gets from _ship_pose). The local ship + its beams + the
+        # camera are drawn at this pose so they move together and glide
+        # instead of stepping in 60 Hz jumps. The fog still reads
+        # self.ghost.ship.pos (the current pose) — exactly like the host's
+        # _draw_local_ship, which sets the stand-in's current pose for the
+        # fog and draws the ship at the interpolated pose.
+        gpos, gangle = self.ghost.render_pose()
         # 10.1: advance + cull the client-side death bursts (presentation).
         self._step_death_bursts(dt)
         # 10.4: age + cull the remote player's laser beams (T_BEAM events).
         self._step_remote_beams(dt)
 
         screen = self.screen
-        self.cam.update(dt, self.ghost.ship.pos, self.ghost.ship.vel,
+        self.cam.update(dt, gpos, self.ghost.ship.vel,
                         self.ghost.ship.dampening)
         screen.fill(BG)
         for x, y, r in self.stars:
@@ -2810,15 +2819,13 @@ class Game:
         # space as the ghost moved during the 0.15 s flash (the same bug
         # the 10.4b remote path had — the ghost's OWN beams were the one
         # path that never got the re-anchoring). The ghost's pose
-        # (self.ghost.ship.pos/angle) is the same pose the local ship is
-        # drawn at below, so the beam origin stays glued to the drawn
-        # ship. The end is the buffer enemy's pos at fire time, so the
-        # beam lands where the host's beam lands (the buffer's enemy pos ~
-        # the host's at that instant). Same visual as the host's beam
-        # (LASER_COLOR line, width 2, fading over the ttl). Presentation
-        # only: no collision, no sim feedback.
-        gpos = self.ghost.ship.pos
-        gangle = self.ghost.ship.angle
+        # (gpos/gangle — the INTERPOLATED render pose from render_pose,
+        # 10.9) is the same pose the local ship is drawn at below, so the
+        # beam origin stays glued to the drawn ship. The end is the buffer
+        # enemy's pos at fire time, so the beam lands where the host's beam
+        # lands (the buffer's enemy pos ~ the host's at that instant). Same
+        # visual as the host's beam (LASER_COLOR line, width 2, fading over
+        # the ttl). Presentation only: no collision, no sim feedback.
         gfwd = pygame.Vector2(math.cos(gangle), math.sin(gangle))
         gright = pygame.Vector2(-gfwd.y, gfwd.x)
         for (local_start, end, age, ttl) in self.ghost.local_beams:
@@ -2835,13 +2842,15 @@ class Game:
         # client spawns its OWN explosion burst at the death pose.
         if self.ghost.ship.dead:
             if not self._local_was_dead:
-                self._death_burst(self.local_index,
-                                  pygame.Vector2(self.ghost.ship.pos))
+                self._death_burst(self.local_index, pygame.Vector2(gpos))
             self._local_was_dead = True
         else:
             self._local_was_dead = False
-            self.ghost.ship.draw(screen, self.cam,
-                                 self.ghost.ship.pos, self.ghost.ship.angle)
+            # 10.9: draw at the INTERPOLATED render pose (gpos/gangle) —
+            # the same sub-step interpolation the host's local ship gets,
+            # so the client's ship glides instead of stepping in 60 Hz
+            # jumps. (The raw self.ghost.ship.pos is the post-step pose.)
+            self.ghost.ship.draw(screen, self.cam, gpos, gangle)
 
         # The player's OWN gun shots (Session 7.3): the ghost's predicted
         # bullets, drawn immediately at their predicted positions so the
@@ -2925,11 +2934,11 @@ class Game:
         # expanding circle on a G press (Ship._draw_scan_pulse, driven
         # by the ghost's scan_pulse).
         if not self.ghost.ship.dead:
-            self.ghost.ship._draw_scan_pulse(screen, self.cam,
-                                             self.ghost.ship.pos)
+            # 10.9: the pulse ring + contacts anchor on the INTERPOLATED
+            # render pose (gpos) — the same pose the ship is drawn at.
+            self.ghost.ship._draw_scan_pulse(screen, self.cam, gpos)
             _draw_sensor_contacts_model(screen, self.cam, self.font,
-                                        self.ghost.ship.pos,
-                                        self.ghost.ship.contacts)
+                                        gpos, self.ghost.ship.contacts)
 
         # HUD: the LOCAL (ghost) ship's power/shield/velocity, and the real
         # (interpolated) enemy count from the buffer. self.ship is players[0]

@@ -1259,6 +1259,17 @@ class PredictedShip:
         # into whole STEP steps so the ghost runs at the sim's rate on any
         # display refresh rate.
         self._acc = 0.0
+        # 10.9: the ghost's pose at the START of the current in-progress
+        # step, for sub-step render interpolation (render_pose). The ghost
+        # is drawn at lerp(_prev, curr, acc/TICK) — the same interpolation
+        # the host's local ship gets from _ship_pose(step_alpha) — instead
+        # of its raw post-step pos (which moves in 60 Hz jumps on a ~62 Hz
+        # display = the "jagged" local ship). Set in advance() before each
+        # step; reset to curr in seed()/reconcile_rewind() so a reconcile
+        # never adds a phantom lerp from the pre-reconcile pose. None until
+        # the first seed (render_pose is only called once seeded).
+        self._prev_pos = None
+        self._prev_angle = None
         # Session 7.6: the local input buffer — (host_time, ShipInput) pairs,
         # oldest first, bounded to INPUT_BUFFER_MAX seconds of host time.
         # `host_time` is the client's estimate of the host's sim clock at the
@@ -1322,6 +1333,10 @@ class PredictedShip:
         snapshot) to the ghost. Subsequent snapshots use `reconcile`."""
         self._ship.apply_snapshot(ship_s)
         self._seeded = True
+        # 10.9: start the render interpolation from the seeded pose (no
+        # phantom lerp from a pre-seed pose).
+        self._prev_pos = pygame.Vector2(self._ship.pos)
+        self._prev_angle = self._ship.angle
 
     def reconcile(self, ship_s):
         """Snap the ghost to an authoritative ship snapshot.
@@ -1335,6 +1350,10 @@ class PredictedShip:
         self._ship.apply_snapshot(ship_s)
         self._seeded = True
         self._restore_client_sensor_state()
+        # 10.9: the reconcile moved the pose — restart the render
+        # interpolation from the new pose (no phantom lerp).
+        self._prev_pos = pygame.Vector2(self._ship.pos)
+        self._prev_angle = self._ship.angle
 
     def _capture_client_sensor_state(self):
         """10.6 V/G/T (option A): save the ghost's sensor fields before an
@@ -1440,6 +1459,10 @@ class PredictedShip:
         self._acc = 0.0
         buf = self._input_buffer
         if not buf:
+            # 10.9: no replay — the pose is the snapshot's; anchor the
+            # render interpolation on it (no phantom lerp).
+            self._prev_pos = pygame.Vector2(self._ship.pos)
+            self._prev_angle = self._ship.angle
             return
         # Walk the sim ticks from snap_time to now. `i` is the tick index
         # (0 = snap_time itself, the snapshot's own tick — already applied
@@ -1464,6 +1487,12 @@ class PredictedShip:
             self.step_local_bullets(TICK)
             self.step_local_beams(TICK)
             self.step_local_missiles(TICK, enemies)   # 10.3b
+        # 10.9: the replay (step, not advance) moved the pose — anchor the
+        # render interpolation on the final replayed pose. _acc is 0 here,
+        # so render_pose returns exactly this pose (no phantom lerp from
+        # the pre-reconcile _prev).
+        self._prev_pos = pygame.Vector2(self._ship.pos)
+        self._prev_angle = self._ship.angle
 
     def step(self, dt, inp, enemies=None):
         """Advance the ghost ONE fixed step with the LOCAL input.
@@ -1946,6 +1975,11 @@ class PredictedShip:
         """
         if self._ship.dead:
             self._acc = 0.0
+            # 10.9: a dead ghost is frozen — keep the render interpolation
+            # anchored on the (static) pose so render_pose returns it
+            # exactly (alpha 0 would otherwise lerp from a stale _prev).
+            self._prev_pos = pygame.Vector2(self._ship.pos)
+            self._prev_angle = self._ship.angle
             # 10.3a: a beam is a 0.15 s flash — age + cull it even while
             # the ghost is dead, mirroring the host (Game._step ages
             # self.beams outside the game_over guard). Without this a beam
@@ -1959,6 +1993,11 @@ class PredictedShip:
         self._acc += min(dt, MAX_FRAME_DT)
         n = 0
         while self._acc >= TICK:
+            # 10.9: capture the pose BEFORE the step so render_pose can
+            # interpolate across the in-progress step (the host's
+            # _ship_pose does the same from the model's prev/curr).
+            self._prev_pos = pygame.Vector2(self._ship.pos)
+            self._prev_angle = self._ship.angle
             self.step(TICK, inp, enemies=enemies)
             self.step_local_bullets(TICK)   # Session 7.3: advance + cull
             self.step_local_beams(TICK)     # 10.3a: age + cull
@@ -1966,6 +2005,36 @@ class PredictedShip:
             self._acc -= TICK
             n += 1
         return n
+
+    def render_pose(self):
+        """The ghost's INTERPOLATED render pose (10.9) — (pos, angle).
+
+        The ghost is stepped in fixed TICK chunks (advance), but the display
+        runs at its own rate, so drawing the raw post-step pos makes the
+        local ship move in 60 Hz jumps (the "jagged" local ship). This
+        returns the pose lerp'd between the start of the current in-progress
+        step (_prev_pos/_prev_angle, captured in advance) and the current
+        post-step pose, at alpha = acc/TICK — the SAME sub-step
+        interpolation the host's local ship gets from _ship_pose(step_alpha)
+        (game.py). alpha is clamped to [0, 1] (the 70460de rule: on a hiccup
+        the acc can exceed one step; render the latest simulated state, never
+        extrapolate past the current pose). The angle uses the shortest-arc
+        delta (the host's _ship_pose math).
+
+        This is a RENDER helper only — it does NOT touch self._ship.pos
+        (the ghost's actual simulated pose, which the no-teleport/rewind
+        gates and the handoff math read). Before the first seed _prev is
+        None: return the raw pose (the caller only renders once seeded).
+        """
+        s = self._ship
+        if self._prev_pos is None:
+            return pygame.Vector2(s.pos), s.angle
+        alpha = max(0.0, min(1.0, self._acc / TICK))
+        rpos = self._prev_pos.lerp(pygame.Vector2(s.pos), alpha)
+        a0, a1 = self._prev_angle, s.angle
+        da = (a1 - a0 + math.pi) % (2 * math.pi) - math.pi
+        rangle = a0 + da * alpha
+        return rpos, rangle
 
     def pos(self):
         """The ghost's current (x, y, angle) for rendering."""

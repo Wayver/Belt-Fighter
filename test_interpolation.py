@@ -192,8 +192,11 @@ from .intent import ShipInput
 from .bullets import Bullet
 
 WARMUP = 300   # ticks before the first pair of snapshots (sim is hot)
-K = 6          # ticks between snap_prev and snap_curr = one snapshot
-               # interval (SNAPSHOT_INTERVAL), the realistic netcode window
+K = SNAPSHOT_INTERVAL   # ticks between snap_prev and snap_curr = one
+               # snapshot interval (SNAPSHOT_INTERVAL), the realistic
+               # netcode window. 10.8: tracks the config so the test
+               # exercises the REAL cadence (30 Hz = 2 ticks), not a
+               # frozen 10 Hz value.
 W = 60         # turnover-stress window: 10x the snapshot interval — long
                # enough that splits/spawns/culls/respawns are likely
 RUN_TICKS = 600  # cadence test length (10 simulated seconds at 60 Hz)
@@ -1060,13 +1063,23 @@ def main():
     # HostTimeEstimator: the client's estimate of the host's sim clock.
     # (a) Steady 10 Hz samples, zero latency: the estimate must converge to
     # the true offset (here 1.0 s) — within 5 ms after 2 s of samples.
+    # 10.8: the arrival pattern uses the REAL snapshot cadence
+    # (SNAPSHOT_INTERVAL), and the query point sits WITHIN one snapshot
+    # interval (MAX_LEAD) of the newest sample — the estimator caps
+    # extrapolation at MAX_LEAD, so a query farther out would be clamped
+    # (a cap, not an estimate error). The old 10 Hz test queried 0.1 s past
+    # the newest sample, which at 30 Hz (MAX_LEAD 0.033 s) is beyond the cap.
+    est_interval = SNAPSHOT_INTERVAL * STEP
+    est_n = max(2, int(round(2.0 / est_interval)))   # ~2 s of samples
+    est_lead = 0.5 * est_interval                     # within MAX_LEAD
+    est_q = (est_n - 1) * est_interval + est_lead
     est = HostTimeEstimator()
-    for i in range(20):
-        est.record(i * 0.1, 1.0 + i * 0.1)
-    err_steady = abs(est.now(2.0) - 3.0)
+    for i in range(est_n):
+        est.record(i * est_interval, 1.0 + i * est_interval)
+    err_steady = abs(est.now(est_q) - (1.0 + est_q))
     if err_steady < 0.005:
-        print(f"PASS: host time estimator — steady 10 Hz samples, "
-              f"estimate error {err_steady * 1000:.2f} ms < 5 ms")
+        print(f"PASS: host time estimator — steady {1.0 / est_interval:.0f} Hz "
+              f"samples, estimate error {err_steady * 1000:.2f} ms < 5 ms")
     else:
         ok = False
         print(f"FAIL: host time estimator — steady samples, error "
@@ -1077,9 +1090,9 @@ def main():
     # after 2 s of samples. A wall-clock clock (the 6.6 behavior) would be
     # 400 ms off here.
     est2 = HostTimeEstimator()
-    for i in range(20):
-        est2.record(i * 0.1, 0.8 * i * 0.1)
-    err_slow = abs(est2.now(2.0) - 1.6)
+    for i in range(est_n):
+        est2.record(i * est_interval, 0.8 * i * est_interval)
+    err_slow = abs(est2.now(est_q) - 0.8 * est_q)
     if err_slow < 0.02:
         print(f"PASS: host time estimator — 0.8x-rate host, estimate "
               f"error {err_slow * 1000:.2f} ms < 20 ms (rate followed)")
@@ -1737,6 +1750,63 @@ def main():
               f"< 1e-9), resumed={resumed} (advance "
               f"{seg[-1] - seg[0] if len(seg) > 1 else -1:.2f}s over "
               f"[3.4, 5.0]), frames={len(track2)}")
+
+    # --- (k.2) buffer depth brackets the render point at the max adaptive
+    # delay (Session 10.8). The render point is `newest - delay`, and the
+    # adaptive delay can grow to INTERP_DELAY_MAX under jitter. The
+    # interpolation buffer must therefore hold at least
+    # ceil(INTERP_DELAY_MAX / snapshot_interval) + 1 snapshots, or
+    # positions_at clamps to the OLDEST snapshot and the remote render
+    # stalls exactly when the adaptive delay is doing its job. At the 30 Hz
+    # cadence (interval 0.033 s) the old default of 8 only covered 0.233 s
+    # (< 0.35 s) and would clamp-stall; SNAPSHOT_BUFFER_MAX (16) covers
+    # 0.5 s. This gate is the regression lock for that fix: it checks both
+    # the arithmetic (config depth >= required) and the empirical behavior
+    # (a real 30 Hz stream into the DEFAULT buffer still brackets
+    # newest - INTERP_DELAY_MAX).
+    interval = SNAPSHOT_INTERVAL * STEP
+    required = int(math.ceil(INTERP_DELAY_MAX / interval)) + 1
+    buf_depth = SnapshotBuffer()       # DEFAULT depth (SNAPSHOT_BUFFER_MAX)
+    if buf_depth._max < required:
+        ok = False
+        print(f"FAIL: buffer depth — default {buf_depth._max} < required "
+              f"{required} to bracket delay_max {INTERP_DELAY_MAX:.2f}s at "
+              f"{1.0 / interval:.0f} Hz (would clamp-stall)")
+    else:
+        print(f"PASS: buffer depth — default {buf_depth._max} >= required "
+              f"{required} to bracket delay_max {INTERP_DELAY_MAX:.2f}s at "
+              f"{1.0 / interval:.0f} Hz (covers "
+              f"{(buf_depth._max - 1) * interval:.3f}s)")
+    # Empirical: push a real cadence stream into the DEFAULT buffer and
+    # confirm the render point at the max delay still brackets (does not
+    # fall before the oldest snapshot).
+    AIEnemy._next_id = 1
+    Asteroid._next_id = 1
+    kb = Game(screen, font, big_font, light_tex, fog_surf, light_surf,
+              seed=SEED)
+    kbuf = SnapshotBuffer()            # DEFAULT depth
+    k_times = []
+    for t in range(4 * required):      # enough to fill the buffer
+        if t % SNAPSHOT_INTERVAL == 0:
+            kbuf.push(t * STEP, kb.snapshot())
+            k_times.append(t * STEP)
+        if t < 4 * required - 1:
+            kb.update(STEP, script_input(t))
+    k_newest = kbuf.newest_time()
+    k_render = k_newest - INTERP_DELAY_MAX
+    k_oldest = kbuf._snaps[0][0]
+    k_pos = kbuf.positions_at(k_render)
+    if (k_render >= k_oldest and k_pos is not None
+            and len(kbuf) == min(len(k_times), kbuf._max)):
+        print(f"PASS: buffer brackets render point — {len(kbuf)} snaps, "
+              f"render_t {k_render:.3f} >= oldest {k_oldest:.3f} at "
+              f"delay_max {INTERP_DELAY_MAX:.2f}s (no clamp-stall)")
+    else:
+        ok = False
+        print(f"FAIL: buffer brackets render point — render_t {k_render:.3f} "
+              f"vs oldest {k_oldest:.3f} (bracketed={k_render >= k_oldest}), "
+              f"positions_at={k_pos is not None}, len={len(kbuf)}: the "
+              f"render point fell behind the oldest snapshot (clamp-stall)")
 
     # --- (l) dead-reckoning rewind (Session 7.6): the ghost's reconcile is a
     # REWIND (apply the authoritative snapshot, then replay the buffered local

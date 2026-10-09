@@ -1524,12 +1524,11 @@ class PredictedShip:
         sensor state forward (the host never saw the client's V/G/T).
         """
         self._capture_client_sensor_state()
-        # 10.11: cache the sub-tick accumulator BEFORE the replay. The
-        # replay (step, not advance) moves the physics state but does NOT
-        # touch `_acc`, so restoring it after the replay keeps the render
-        # pose continuous (no jump at the reconcile). The physics clock
-        # (`_sim_time`) is set to snap_time + n*TICK after the replay.
-        original_acc = self._acc
+        # 10.11: the replay (step, not advance) moves the physics state but
+        # does NOT touch `_acc` or `_sim_time`. After the replay, the
+        # physics clock is set to max(now, snap_time + n*TICK) and the
+        # accumulator to the time since the last replayed step (see the
+        # end of this method).
         self._ship.apply_snapshot(ship_s)
         self._seeded = True
         self._restore_client_sensor_state()
@@ -1559,12 +1558,15 @@ class PredictedShip:
             # render interpolation on it (no phantom lerp).
             self._prev_pos = pygame.Vector2(self._ship.pos)
             self._prev_angle = self._ship.angle
-            # 10.11: no replay — the physics clock is the snapshot's time
-            # (the pose IS the snapshot's). Restore the cached accumulator
-            # (the render sub-tick state) so the next advance continues
-            # from where it was.
-            self._sim_time = snap_time
-            self._acc = original_acc
+            # 10.11: no replay — the pose IS the snapshot's (at snap_time).
+            # Set the physics clock to max(now, snap_time) and the
+            # accumulator to the time since the snapshot's pose (the same
+            # logic as the replayed path with n=0). Keeping the clock at
+            # `now` (not snap_time) avoids pulling it back, which would
+            # make the ghost fall behind the host (the negative
+            # replay_ticks / lag spikes).
+            self._sim_time = max(now, snap_time)
+            self._acc = self._sim_time - snap_time
             return
         # Walk the sim ticks from snap_time to now. `i` is the tick index
         # (0 = snap_time itself, the snapshot's own tick — already applied
@@ -1580,6 +1582,13 @@ class PredictedShip:
         # during that tick — the client records the input at the same
         # host-time the host samples it).
         n = int((now - snap_time) / TICK + 1e-9)
+        # 10.11: clamp n to >= 0. When the ghost's clock falls behind the
+        # snapshot (now < snap_time, from a lag spike), the replay span is
+        # negative. Replaying negative ticks is meaningless (the ghost is
+        # already behind the snapshot), so skip the replay (n=0) and let
+        # the accumulator clamp to 0 below. The ghost will catch up on the
+        # next reconcile (when now > snap_time again).
+        n = max(0, n)
         self._last_replay_ticks = n   # 10.11: net-debug CSV
         for i in range(n):
             t = snap_time + i * TICK
@@ -1590,14 +1599,20 @@ class PredictedShip:
             self.step_local_bullets(TICK)
             self.step_local_beams(TICK)
             self.step_local_missiles(TICK, enemies)   # 10.3b
-        # 10.11: the replay moved the physics state to snap_time + n*TICK.
-        # Update the physics clock to match. Restore the cached accumulator
-        # (the render sub-tick state) so the render pose is continuous
-        # across the reconcile (no jump). Anchor the render interpolation
-        # on the final replayed pose (no phantom lerp from the pre-reconcile
-        # _prev).
-        self._sim_time = snap_time + n * TICK
-        self._acc = original_acc
+        # 10.11: the replay moved the physics state to snap_time + n*TICK. Set the
+        # physics clock to max(now, snap_time + n*TICK):
+        #   - normal case (now >= snap_time): the clock stays at `now` (the
+        #     ghost's current sim time, AHEAD of the snapshot). This avoids
+        #     pulling the clock back (which caused the negative
+        #     replay_ticks / lag spikes).
+        #   - lag-spike case (now < snap_time, n=0): the clock advances to
+        #     snap_time (the ghost was behind the snapshot; the snapshot's
+        #     pose is authoritative, so the clock jumps forward to match).
+        # The accumulator is the time since the last step:
+        #   _sim_time - (snap_time + n*TICK), which is in [0, TICK) for the
+        #   normal case and 0 for the lag-spike case.
+        self._sim_time = max(now, snap_time + n * TICK)
+        self._acc = self._sim_time - (snap_time + n * TICK)
         self._prev_pos = pygame.Vector2(self._ship.pos)
         self._prev_angle = self._ship.angle
 

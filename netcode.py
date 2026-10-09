@@ -1259,6 +1259,17 @@ class PredictedShip:
         # into whole STEP steps so the ghost runs at the sim's rate on any
         # display refresh rate.
         self._acc = 0.0
+        # 10.11: the ghost's current PHYSICS sim time (the time of its pose,
+        # `s.pos`). The ghost advances in real time between reconciles (via
+        # `advance`), so `_sim_time` is AHEAD of the newest snapshot's stamp
+        # by the amount of time the ghost has advanced since that snapshot
+        # was taken. `reconcile_rewind` uses `_sim_time` as `now` (the replay
+        # target) instead of the host-time estimate (which is anchored on the
+        # newest snapshot and equals `snap_time` exactly — the 0-tick replay
+        # that caused the sawtooth). Updated in `advance` (add n*TICK per
+        # step) and `reconcile_rewind` (set to snap_time + n*TICK after the
+        # replay). 0.0 until the first seed/reconcile.
+        self._sim_time = 0.0
         # 10.9: the ghost's pose at the START of the current in-progress
         # step, for sub-step render interpolation (render_pose). The ghost
         # is drawn at lerp(_prev, curr, acc/TICK) — the same interpolation
@@ -1349,11 +1360,31 @@ class PredictedShip:
         """True once an authoritative snapshot has been applied."""
         return self._seeded
 
-    def seed(self, ship_s):
+    @property
+    def sim_time(self):
+        """The ghost's current PHYSICS sim time (10.11) — the time of its
+        pose, `s.pos`. The ghost advances in real time between reconciles
+        (via `advance`), so this is AHEAD of the newest snapshot's stamp by
+        the amount of time the ghost has advanced since that snapshot was
+        taken. `push_snapshot` passes this as `now` to `reconcile_rewind`
+        (the replay target) instead of the host-time estimate — the estimate
+        is anchored on the newest snapshot and equals `snap_time` exactly,
+        which made the replay 0 ticks and left the ghost's real-time advance
+        un-replayed (the sawtooth). Updated in `advance` (adds n*TICK per
+        step) and `reconcile_rewind` (sets snap_time + n*TICK after the
+        replay). 0.0 until the first seed/reconcile."""
+        return self._sim_time
+
+    def seed(self, ship_s, snap_time=0.0):
         """Apply the FIRST authoritative ship snapshot (index 0 of the Game
-        snapshot) to the ghost. Subsequent snapshots use `reconcile`."""
+        snapshot) to the ghost. Subsequent snapshots use `reconcile`.
+
+        10.11: `snap_time` (the snapshot's sim time) initializes the
+        ghost's physics clock (`_sim_time`) so the first `reconcile_rewind`
+        has a valid `now` (the ghost's current sim time) to replay from."""
         self._ship.apply_snapshot(ship_s)
         self._seeded = True
+        self._sim_time = snap_time   # 10.11: start the physics clock
         # 10.9: start the render interpolation from the seeded pose (no
         # phantom lerp from a pre-seed pose).
         self._prev_pos = pygame.Vector2(self._ship.pos)
@@ -1493,6 +1524,12 @@ class PredictedShip:
         sensor state forward (the host never saw the client's V/G/T).
         """
         self._capture_client_sensor_state()
+        # 10.11: cache the sub-tick accumulator BEFORE the replay. The
+        # replay (step, not advance) moves the physics state but does NOT
+        # touch `_acc`, so restoring it after the replay keeps the render
+        # pose continuous (no jump at the reconcile). The physics clock
+        # (`_sim_time`) is set to snap_time + n*TICK after the replay.
+        original_acc = self._acc
         self._ship.apply_snapshot(ship_s)
         self._seeded = True
         self._restore_client_sensor_state()
@@ -1522,6 +1559,12 @@ class PredictedShip:
             # render interpolation on it (no phantom lerp).
             self._prev_pos = pygame.Vector2(self._ship.pos)
             self._prev_angle = self._ship.angle
+            # 10.11: no replay — the physics clock is the snapshot's time
+            # (the pose IS the snapshot's). Restore the cached accumulator
+            # (the render sub-tick state) so the next advance continues
+            # from where it was.
+            self._sim_time = snap_time
+            self._acc = original_acc
             return
         # Walk the sim ticks from snap_time to now. `i` is the tick index
         # (0 = snap_time itself, the snapshot's own tick — already applied
@@ -1547,10 +1590,14 @@ class PredictedShip:
             self.step_local_bullets(TICK)
             self.step_local_beams(TICK)
             self.step_local_missiles(TICK, enemies)   # 10.3b
-        # 10.9: the replay (step, not advance) moved the pose — anchor the
-        # render interpolation on the final replayed pose. _acc is 0 here,
-        # so render_pose returns exactly this pose (no phantom lerp from
-        # the pre-reconcile _prev).
+        # 10.11: the replay moved the physics state to snap_time + n*TICK.
+        # Update the physics clock to match. Restore the cached accumulator
+        # (the render sub-tick state) so the render pose is continuous
+        # across the reconcile (no jump). Anchor the render interpolation
+        # on the final replayed pose (no phantom lerp from the pre-reconcile
+        # _prev).
+        self._sim_time = snap_time + n * TICK
+        self._acc = original_acc
         self._prev_pos = pygame.Vector2(self._ship.pos)
         self._prev_angle = self._ship.angle
 
@@ -2064,6 +2111,7 @@ class PredictedShip:
             self.step_local_missiles(TICK, enemies)   # 10.3b: home + cull
             self._acc -= TICK
             n += 1
+        self._sim_time += n * TICK   # 10.11: advance the physics clock
         return n
 
     def render_pose(self):

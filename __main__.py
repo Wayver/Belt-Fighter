@@ -774,9 +774,18 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
             if m.get("type") == T_SNAP:
                 if game.host_time.record(now, m["sim_time"]):
                     game.latency.update(game.host_time.last_jitter)
+                # 10.11: pass the ghost's CURRENT physics sim time as `now`
+                # (the replay target) instead of the host-time estimate. The
+                # estimate is anchored on the newest snapshot and equals
+                # `snap_time` exactly, which made the replay 0 ticks and left
+                # the ghost's real-time advance un-replayed (the sawtooth).
+                # The ghost's sim time is AHEAD of the snapshot's stamp by
+                # the amount of time the ghost has advanced since that
+                # snapshot was taken, so the replay rebuilds the prediction
+                # forward and the snap is ~0.
                 game.push_snapshot(m["sim_time"],
                                    deserialize_snapshot(m["snap"]),
-                                   now=game.host_time.now(now))
+                                   now=game.ghost.sim_time)
             elif m.get("type") == T_BEAM:
                 # 10.4: a laser beam the host fired — an EVENT (a 0.15 s
                 # flash, too short to ride the snapshot's INTERP_DELAY

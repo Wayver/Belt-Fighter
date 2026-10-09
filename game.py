@@ -2267,7 +2267,11 @@ class Game:
         self.snap_buf.push(sim_time, snap)
         local_s = snap[0][self.local_index]
         if not self.ghost.seeded:
-            self.ghost.seed(local_s)
+            # 10.11: pass the snapshot's sim time so the ghost's physics
+            # clock (`_sim_time`) starts at the right value. The first
+            # `reconcile_rewind` uses `ghost.sim_time` as `now` (the replay
+            # target), so it must be initialized to the snapshot's time.
+            self.ghost.seed(local_s, snap_time=sim_time)
         else:
             # 10.3a: the rewind replay steps the ghost with the local
             # inputs the host applied since the snapshot — and the host's

@@ -66,7 +66,7 @@ __all__ = [
     "do_handshake_client", "do_handshake_host",
     "NetWorker",
     "T_JOIN", "T_WELCOME", "T_INPUT", "T_SNAP", "T_RESPAWN", "T_BEAM",
-    "T_ECHO",
+    "T_ECHO", "T_PONG",
 ]
 
 # 4-byte big-endian unsigned length prefix.
@@ -112,6 +112,17 @@ T_BEAM = "beam"
 # gracefully: the replay holds the last echoed input — exactly what the
 # host itself did (pinned #5).
 T_ECHO = "echo"
+# 10.11b: the RTT-echo — the client tags each T_INPUT with a monotonic
+# `tag` + records its LOCAL send time; the host immediately replies
+# {"type": T_PONG, "tag": <same tag>} (no sim work — it is a pure
+# reflection, so the round trip is input-send -> host-receive ->
+# pong-send -> client-receive). The client computes
+# RTT = now - sent_time[tag], one-way L = RTT / 2 (EMA-smoothed), and
+# anchors the prediction ghost's clock at snap_time + L (the 10.11b
+# sawtooth fix: the ghost must sit at the real-time present, not at the
+# snapshot's time L in the past). A dropped pong just means no sample
+# that round — the EMA holds the last value.
+T_PONG = "pong"
 
 
 # --- framing: pure byte functions (no socket) -----------------------------
@@ -944,6 +955,21 @@ def _self_test():
     else:
         ok = False
         print("FAIL: T_ECHO round-trip ->", echo_msgs, echo_rest)
+
+    # --- 2d. T_PONG round-trip (10.11b): the RTT-echo message shape the
+    # host reflects back ({"type": T_PONG, "tag": <the client's tag>}) must
+    # survive the wire and carry the tag intact — the client matches it
+    # against its sent-time map to compute the one-way latency.
+    pong_msg = {"type": T_PONG, "tag": 42}
+    pong_msgs, pong_rest = extract_frames(encode_frame(pong_msg))
+    pong_ok = (pong_rest == b"" and len(pong_msgs) == 1
+               and pong_msgs[0].get("type") == T_PONG
+               and pong_msgs[0].get("tag") == 42)
+    if pong_ok:
+        print("PASS: T_PONG round-trip — tag 42 intact")
+    else:
+        ok = False
+        print("FAIL: T_PONG round-trip ->", pong_msgs, pong_rest)
 
     # --- 2b. hull/loadout wire mapping (Session 6.5) ---
     from .hulls import (PLAYER_HULLS, COMPONENT_CATALOG, DEFAULT_HULL,

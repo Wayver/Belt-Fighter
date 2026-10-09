@@ -30,7 +30,7 @@ from .net import (Host, connect, do_handshake_host, do_handshake_client,
                   serialize_snapshot, deserialize_snapshot,
                   serialize_input, deserialize_input,
                   NetWorker,
-                  T_INPUT, T_SNAP, T_RESPAWN, T_BEAM, T_ECHO)
+                  T_INPUT, T_SNAP, T_RESPAWN, T_BEAM, T_ECHO, T_PONG)
 from .netcode import (PredictedShip, HostTimeEstimator, LatencyTracker,
                       RenderPoint, BEAM_TTL)
 from .ship import Ship
@@ -325,6 +325,16 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
             for m in worker.poll():
                 if m.get("type") == T_INPUT:
                     game.set_remote_input(deserialize_input(m["inp"]))
+                    # 10.11b: reflect the client's RTT tag back IMMEDIATELY
+                    # (a pure reflection — no sim work, no queueing). The
+                    # client measures RTT = now - sent_time[tag] and derives
+                    # the one-way latency L = RTT / 2 that anchors its
+                    # prediction ghost's clock (snap_time + L). Without this
+                    # the client has no unambiguous L (the HostTimeEstimator
+                    # is anchored on the newest snapshot ≈ snap_time, so it
+                    # can't measure the latency).
+                    if "tag" in m:
+                        worker.send({"type": T_PONG, "tag": m["tag"]})
                 elif m.get("type") == T_RESPAWN:
                     # 10.1: the client's dead player asks to respawn.
                     # The client is player 1; the sim thread applies it
@@ -520,7 +530,7 @@ def _log_net_debug(game, inp):
         f = open(game._dbg_log_path, "w", newline="")
         f.write("t,snap_px,input,delay,jitter_ema,buf_depth,newest_stamp,"
                 "render_t,host_time_est,fps,dt_max,hic,n,"
-                "replay_ticks,replay_span\n")
+                "replay_ticks,replay_span,rtt_ow\n")
         game._dbg_log_f = f
     rp = game.render_point.now()
     newest = game.snap_buf.newest_time()
@@ -538,7 +548,7 @@ def _log_net_debug(game, inp):
     game._dbg_dt_sum = 0.0
     game._dbg_dt_max = 0.0
     game._dbg_hiccups = 0
-    f.write("%.3f,%.3f,%s,%.4f,%s,%d,%s,%s,%s,%.1f,%.4f,%d,%d,%d,%.4f\n" % (
+    f.write("%.3f,%.3f,%s,%.4f,%s,%d,%s,%s,%s,%.1f,%.4f,%d,%d,%d,%.4f,%.4f\n" % (
         time.time(), game.last_snap_px, _input_str(inp),
         game.latency.delay,
         ("%.4f" % jit) if jit is not None else "",
@@ -547,7 +557,8 @@ def _log_net_debug(game, inp):
         ("%.4f" % rp) if rp is not None else "",
         ("%.4f" % est) if est is not None else "",
         fps, dt_max, hic, n,
-        game.last_replay_ticks, game.last_replay_span))
+        game.last_replay_ticks, game.last_replay_span,
+        game._rtt_ow))
     f.flush()
 
 
@@ -640,6 +651,18 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
     # MAX), moved at most 1/60 s per frame. Fed by the estimator's
     # per-arrival jitter sample, ticked once per frame.
     game.latency = LatencyTracker()
+    # 10.11b: the RTT-echo state — the client tags each T_INPUT with a
+    # monotonic `tag` + records its LOCAL send time; the host immediately
+    # replies T_PONG with the same tag (a pure reflection, no sim work).
+    # On receipt the client computes RTT = now - sent_time[tag], one-way
+    # L = RTT / 2 (EMA-smoothed, clamped), and anchors the prediction
+    # ghost's clock at snap_time + L (the 10.11b sawtooth fix: the ghost
+    # must sit at the real-time present, not at the snapshot's time L in
+    # the past). A dropped pong just means no sample that round — the EMA
+    # holds the last value.
+    game._rtt_tag = 0
+    game._rtt_sent = {}
+    game._rtt_ow = 0.02   # one-way latency estimate (s); 20 ms LAN default
     # The render point (Session 7.5b): newest ARRIVED snapshot stamp
     # minus the adaptive delay, chased at a bounded per-frame rate so a
     # late packet holds the point on the last window instead of the
@@ -740,7 +763,15 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
         # Send the local input every frame (pinned #5: the host applies the
         # LATEST received input each tick). Session 8.2: queued to the
         # worker (it flushes to the socket off the render thread).
-        worker.send({"type": T_INPUT, "inp": serialize_input(inp)})
+        # 10.11b: tag it with a monotonic id + record the LOCAL send time —
+        # the host reflects the tag back in a T_PONG, and the RTT is the
+        # one-way-latency measurement that anchors the ghost's clock.
+        game._rtt_tag += 1
+        game._rtt_sent[game._rtt_tag] = time.time()
+        if len(game._rtt_sent) > 500:   # bound the map (a lost pong)
+            del game._rtt_sent[min(game._rtt_sent)]
+        worker.send({"type": T_INPUT, "inp": serialize_input(inp),
+                     "tag": game._rtt_tag})
         # 10.1: per-player death — R while the local ship is dead set
         # game._respawn_requested in handle_events; send the respawn
         # request to the host (it respawns player 1 — us — leaving the
@@ -774,18 +805,18 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
             if m.get("type") == T_SNAP:
                 if game.host_time.record(now, m["sim_time"]):
                     game.latency.update(game.host_time.last_jitter)
-                # 10.11: pass the ghost's CURRENT physics sim time as `now`
-                # (the replay target) instead of the host-time estimate. The
-                # estimate is anchored on the newest snapshot and equals
-                # `snap_time` exactly, which made the replay 0 ticks and left
-                # the ghost's real-time advance un-replayed (the sawtooth).
-                # The ghost's sim time is AHEAD of the snapshot's stamp by
-                # the amount of time the ghost has advanced since that
-                # snapshot was taken, so the replay rebuilds the prediction
-                # forward and the snap is ~0.
+                # 10.11b: anchor the ghost's clock at the REAL-TIME PRESENT —
+                # `snap_time + L`, where L is the RTT-measured one-way
+                # latency (game._rtt_ow). The snapshot's pose is the
+                # authority at snap_time (L in the past); the ghost must
+                # sit at the present, so the replay span is ~L and the
+                # replay rebuilds the prediction forward (the 10.11 bug was
+                # a free-run clock ≈ snap_time, so the span oscillated ±1
+                # tick across zero and the replay was skipped 44% of the
+                # time — the sawtooth).
                 game.push_snapshot(m["sim_time"],
                                    deserialize_snapshot(m["snap"]),
-                                   now=game.ghost.sim_time)
+                                   now=m["sim_time"] + game._rtt_ow)
             elif m.get("type") == T_BEAM:
                 # 10.4: a laser beam the host fired — an EVENT (a 0.15 s
                 # flash, too short to ride the snapshot's INTERP_DELAY
@@ -831,6 +862,17 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
                 # holds the last echoed input — what the host itself did).
                 for (st, d) in m.get("entries", []):
                     game.ghost.record_echo(st, deserialize_input(d))
+            elif m.get("type") == T_PONG:
+                # 10.11b: the host reflected our T_INPUT tag back. The RTT is
+                # now - the LOCAL time we sent that tag; one-way L = RTT / 2.
+                # EMA-smooth + clamp (a hiccup can't spike the anchor). A
+                # missing tag (the map was bounded) just skips the sample.
+                t0 = game._rtt_sent.pop(m.get("tag"), None)
+                if t0 is not None:
+                    rtt = max(0.0, time.time() - t0)
+                    ow = rtt / 2.0
+                    game._rtt_ow = 0.1 * ow + 0.9 * game._rtt_ow
+                    game._rtt_ow = max(0.002, min(0.25, game._rtt_ow))
         # Session 8.2: the worker owns the socket now — read worker.closed (the
         # worker mirrors conn.closed) and never touch conn.* here. The
         # worker also does the drain_send() (off the render thread), so the

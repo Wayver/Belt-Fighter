@@ -1291,6 +1291,13 @@ class PredictedShip:
         # loss — a dropped echo holds the last echoed input, exactly what
         # the host itself did).
         self._echo_buffer = []
+        # 10.11: the LAST reconcile's replay length, for the net-debug CSV
+        # (the sawtooth diagnosis). _last_replay_ticks = the whole-tick
+        # count `n` the rewind replayed; _last_replay_span = the raw
+        # (now - snap_time) seconds that `n` was truncated from. Both are
+        # 0/0 until the first reconcile (and on the no-replay path).
+        self._last_replay_ticks = 0
+        self._last_replay_span = 0.0
         # Session 7.3: the ghost's OWN gun shots, as presentation Bullets.
         # The client never runs the sim, so without this the player's own
         # shots appear only when the host's next snapshot arrives (~100 ms
@@ -1504,6 +1511,12 @@ class PredictedShip:
         # the last echoed input across the gap, exactly what the host
         # itself did (pinned #5).
         buf = self._echo_buffer or self._input_buffer
+        # 10.11: record the replay length for the net-debug CSV (the
+        # sawtooth diagnosis). `n` (whole ticks replayed) + the raw span
+        # (now - snap_time) are the two numbers that decide the ghost's
+        # post-reconcile pose. Set to 0/0 on the no-replay path.
+        self._last_replay_ticks = 0
+        self._last_replay_span = (now - snap_time)
         if not buf:
             # 10.9: no replay — the pose is the snapshot's; anchor the
             # render interpolation on it (no phantom lerp).
@@ -1524,6 +1537,7 @@ class PredictedShip:
         # during that tick — the client records the input at the same
         # host-time the host samples it).
         n = int((now - snap_time) / TICK + 1e-9)
+        self._last_replay_ticks = n   # 10.11: net-debug CSV
         for i in range(n):
             t = snap_time + i * TICK
             while j + 1 < len(buf) and buf[j + 1][0] <= t + 1e-9:

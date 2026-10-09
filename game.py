@@ -720,6 +720,10 @@ class Game:
         # overlay).
         self.debug_net = False
         self.last_snap_px = 0.0
+        # 10.11: the last reconcile's replay length (the sawtooth
+        # diagnosis) — set by push_snapshot, read by the net-debug CSV.
+        self.last_replay_ticks = 0
+        self.last_replay_span = 0.0
         self.snap_count = 0
         # 10.1: the client's R key (per-player death) sets this; the client
         # loop (run_client) drains it and sends a T_RESPAWN to the host.
@@ -2304,6 +2308,11 @@ class Game:
                 enemies=enemies)
             self.last_snap_px = math.hypot(
                 self.ghost.ship.pos.x - _bx, self.ghost.ship.pos.y - _by)
+            # 10.11: capture the replay length for the net-debug CSV (the
+            # sawtooth diagnosis) — the whole-tick count the rewind replayed
+            # + the raw (now - snap_time) span it was truncated from.
+            self.last_replay_ticks = self.ghost._last_replay_ticks
+            self.last_replay_span = self.ghost._last_replay_span
             self.snap_count += 1
             _mtel.log("RECONCILE", sim_t=sim_time, r_snap_t=sim_time,
                       r_snap_seq=local_s[21], r_seq_before=_seq_before,

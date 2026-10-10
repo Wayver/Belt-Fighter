@@ -751,7 +751,18 @@ class NetWorker:
     # -- worker thread ------------------------------------------------------
     def _run(self):
         conn = self._conn
-        last_snap = 0.0   # 0.0 -> the first host send is immediate
+        # 10.11d: the next snapshot deadline on the IDEAL grid (not the
+        # actual send time). The old code anchored to `now` (the actual
+        # send time), so the OS jitter (1-15 ms) accumulated into the
+        # phase — the send interval was 33.3 ms + jitter (std ~10 ms),
+        # and the snapshot's sim_time advanced by 1-7 ticks per snapshot
+        # (not always 2). Anchoring to the ideal grid (`next_snap +=
+        # period`) keeps the phase stable: the send fires within ~1 ms
+        # (plus OS jitter) of the ideal 33.3 ms grid, so the snapshot's
+        # sim_time advances by exactly 2 ticks per snapshot (in steady
+        # state — the 30 Hz send rate is 2x the 60 Hz sim rate, so the
+        # phase is locked to the wall clock).
+        next_snap = 0.0   # 0.0 -> the first host send is immediate
         while not self._stop.is_set():
             try:
                 # 1. send side: queue any pending messages, then flush.
@@ -769,16 +780,20 @@ class NetWorker:
                 #    frame-quantized and fired at 112-150 ms at 24 FPS).
                 if self._is_host:
                     now = time.monotonic()
-                    if now - last_snap >= self._period:
+                    if now >= next_snap:
                         latest = self._latest_snapshot
                         if latest is not None:
                             sim_time, snap = latest
                             conn.send({"type": T_SNAP, "sim_time": sim_time,
                                        "snap": serialize_snapshot(snap)})
-                        # Anchor to NOW (not last + period) so a slow
-                        # iteration can't build a send backlog that fires as
-                        # a burst.
-                        last_snap = now
+                        # Advance the deadline on the IDEAL grid (not the
+                        # actual send time), so the OS jitter doesn't
+                        # accumulate into the phase. If we're behind (a
+                        # stall), skip to the next deadline to avoid a
+                        # burst.
+                        next_snap += self._period
+                        if next_snap < now:
+                            next_snap = now + self._period
             except OSError:
                 # The socket went away out from under us (a stray close, or
                 # the peer reset in a way recv surfaces as OSError rather

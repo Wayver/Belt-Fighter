@@ -817,7 +817,9 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
                 # time — the sawtooth).
                 game.push_snapshot(m["sim_time"],
                                    deserialize_snapshot(m["snap"]),
-                                   now=m["sim_time"] + game._rtt_ow)
+                                   now=m["sim_time"] + game._rtt_ow,
+                                   real_time=now,
+                                   rate=game.host_time.rate)
             elif m.get("type") == T_BEAM:
                 # 10.4: a laser beam the host fired — an EVENT (a 0.15 s
                 # flash, too short to ride the snapshot's INTERP_DELAY
@@ -902,7 +904,8 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
             # render point. host_time keeps self.sim_time = the host's
             # clock as carried by the wire (7.1), for the ghost's
             # reconcile bookkeeping and diagnostics.
-            game.predicted_view(dt, keys, host_time=game.host_time.now(now))
+            game.predicted_view(dt, keys, host_time=game.host_time.now(now),
+                              real_time=now)
         # Session 7.8: net debug overlay + CSV log (F3-toggled, client only).
         # The overlay shows the live feel-layer state; the log appends one
         # line per reconcile (10 Hz) so the snap-size distribution + its

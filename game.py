@@ -2255,7 +2255,7 @@ class Game:
         draw_hud(screen, self.font, self.enemies, self.ship)
         return pos
 
-    def push_snapshot(self, sim_time, snap, now=None):
+    def push_snapshot(self, sim_time, snap, now=None, real_time=None, rate=1.0):
         """The single seam where a received authoritative snapshot enters
         the remote peer: record it in the interpolation buffer, then feed
         the local ship's prediction ghost — seed on the first snapshot,
@@ -2280,7 +2280,8 @@ class Game:
             # clock (`_sim_time`) starts at the right value. The first
             # `reconcile_rewind` uses `ghost.sim_time` as `now` (the replay
             # target), so it must be initialized to the snapshot's time.
-            self.ghost.seed(local_s, snap_time=sim_time)
+            self.ghost.seed(local_s, snap_time=sim_time, real_time=real_time,
+                         rate=rate)
         else:
             # 10.3a: the rewind replay steps the ghost with the local
             # inputs the host applied since the snapshot — and the host's
@@ -2326,7 +2327,7 @@ class Game:
                              if m.id is not None]
             self.ghost.reconcile_rewind(
                 local_s, sim_time, sim_time if now is None else now,
-                enemies=enemies)
+                enemies=enemies, real_time=real_time, rate=rate)
             self.last_snap_px = math.hypot(
                 self.ghost.ship.pos.x - _bx, self.ghost.ship.pos.y - _by)
             # 10.11: capture the replay length for the net-debug CSV (the
@@ -2395,7 +2396,7 @@ class Game:
                 local_s[24],
                 latest_bullets=_latest[2] if _latest is not None else None)
 
-    def predicted_view(self, dt, keys, host_time=None):
+    def predicted_view(self, dt, keys, host_time=None, real_time=None):
         """Draw the frame with the LOCAL ship taken from the prediction
         ghost instead of the sim (client-side prediction, Session 5b.4b).
 
@@ -2476,7 +2477,10 @@ class Game:
         ghost_enemies = self._ghost_enemy_proxies(pos)
 
         inp = ShipInput.from_keys(keys)
-        self.ghost.advance(dt, inp, enemies=ghost_enemies)
+        # 10.11c: pass the client's real time so the ghost's free-run clock
+        # is phase-locked to the host's tick grid (see PredictedShip.advance).
+        self.ghost.advance(dt, inp, enemies=ghost_enemies,
+                           real_time=real_time)
         # 10.9: the ghost's INTERPOLATED render pose (lerp across the
         # in-progress step, the same sub-step interpolation the host's local
         # ship gets from _ship_pose). The local ship + its beams + the

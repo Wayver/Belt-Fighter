@@ -1257,8 +1257,47 @@ class PredictedShip:
         self._seeded = False
         # Fixed-step accumulator (Session 7.1): converts real frame times
         # into whole STEP steps so the ghost runs at the sim's rate on any
-        # display refresh rate.
+        # display refresh rate. 10.11c: this is now DERIVED from the
+        # phase-locked sim clock (`_sim_time - last_step_time`) rather than
+        # free-running, so the render interpolation (render_pose) and the
+        # step trigger (advance) both read the same locked phase.
         self._acc = 0.0
+        # 10.11c: the ghost's REAL-TIME base (pygame ticks / 1000) of the
+        # last reconcile. The phase-locked sim clock is
+        #     _sim_time = snap_time + L + (now_real - _real_base)
+        # i.e. it advances at exactly 1x of real time between reconciles
+        # (no free-running accumulator, no phase drift). `advance` reads
+        # this to compute the clock and steps the physics once per crossed
+        # tick boundary (floor(_sim_time / TICK) increases) — so the ghost
+        # executes exactly 2 ticks per 2-tick snapshot interval (the host
+        # sim runs at 1x real time), not 1/2/3 (the 10.11b bimodal snap).
+        # 0.0 until the first reconcile (seed sets the clock but not the
+        # real-time base; the first advance with no base is a no-op step
+        # trigger, which is correct — the ghost is at the seed pose).
+        self._real_base = 0.0
+        # 10.11c: the SIM time at the last reconcile (= now = snap_time + L).
+        # The phase-locked clock is _sim_time = _sim_base + _rate *
+        # (real_time - _real_base). Set in reconcile_rewind; 0.0 until the
+        # first reconcile.
+        self._sim_base = 0.0
+        # 10.11c: the host's estimated SIM RATE (sim time per real time),
+        # from the client's HostTimeEstimator (game.host_time.rate). The
+        # phase-locked clock advances at this rate (not hardcoded 1x), so
+        # the ghost's sim time stays in phase with the host's tick grid
+        # even when the host runs slower than real time (a starved host —
+        # the same-machine-thread test artifact — or a slow production
+        # host). In a healthy game the rate is ~1.0 (no change). Set in
+        # reconcile_rewind / seed; 1.0 until the first reconcile.
+        self._rate = 1.0
+        # 10.11c: the last sim time at which a physics step was executed
+        # (the most recent crossed tick boundary). The step trigger in
+        # `advance` is `floor(_sim_time / TICK) > floor(_last_step_time /
+        # TICK)` — a step runs once per crossed boundary, and `_acc` is
+        # `_sim_time - _last_step_time` (the render interpolation phase).
+        # Set in seed() and reconcile_rewind() to the post-reconcile
+        # `_sim_time` (no step is owed at the reconcile itself — the
+        # replay/apply already put the pose at `_sim_time`).
+        self._last_step_time = 0.0
         # 10.11: the ghost's current PHYSICS sim time (the time of its pose,
         # `s.pos`). The ghost advances in real time between reconciles (via
         # `advance`), so `_sim_time` is AHEAD of the newest snapshot's stamp
@@ -1375,16 +1414,25 @@ class PredictedShip:
         replay). 0.0 until the first seed/reconcile."""
         return self._sim_time
 
-    def seed(self, ship_s, snap_time=0.0):
+    def seed(self, ship_s, snap_time=0.0, real_time=None, rate=1.0):
         """Apply the FIRST authoritative ship snapshot (index 0 of the Game
         snapshot) to the ghost. Subsequent snapshots use `reconcile`.
 
         10.11: `snap_time` (the snapshot's sim time) initializes the
         ghost's physics clock (`_sim_time`) so the first `reconcile_rewind`
-        has a valid `now` (the ghost's current sim time) to replay from."""
+        has a valid `now` (the ghost's current sim time) to replay from.
+
+        10.11c: `real_time` (the client's real time at the seed) anchors
+        the phase-locked free-run clock (see reconcile_rewind)."""
         self._ship.apply_snapshot(ship_s)
         self._seeded = True
         self._sim_time = snap_time   # 10.11: start the physics clock
+        # 10.11c: phase-lock the free-run clock to the seed. The pose is
+        # at snap_time, so _last_step_time = snap_time (render phase 0).
+        self._sim_base = snap_time
+        self._real_base = real_time if real_time is not None else 0.0
+        self._last_step_time = snap_time
+        self._rate = rate
         # 10.9: start the render interpolation from the seeded pose (no
         # phantom lerp from a pre-seed pose).
         self._prev_pos = pygame.Vector2(self._ship.pos)
@@ -1484,7 +1532,8 @@ class PredictedShip:
         while self._echo_buffer and self._echo_buffer[0][0] < cutoff:
             self._echo_buffer.pop(0)
 
-    def reconcile_rewind(self, ship_s, snap_time, now, enemies=None):
+    def reconcile_rewind(self, ship_s, snap_time, now, enemies=None,
+                     real_time=None, rate=1.0):
         """Dead-reckoning reconcile (Session 7.6) — replaces the v1 full
         snap. Apply the authoritative ship snapshot taken at sim time
         `snap_time`, then REPLAY the local inputs the host applied between
@@ -1567,6 +1616,15 @@ class PredictedShip:
             # replay_ticks / lag spikes).
             self._sim_time = max(now, snap_time)
             self._acc = self._sim_time - snap_time
+            # 10.11c: phase-lock the free-run clock to this reconcile.
+            # The clock is _sim_base + (real_time - _real_base); the next
+            # advance() steps the physics when it crosses a tick boundary.
+            # _last_step_time = the pose's time (snap_time, n=0) — the
+            # render interpolation phase is _sim_time - snap_time = L.
+            self._sim_base = self._sim_time
+            self._real_base = real_time if real_time is not None else 0.0
+            self._last_step_time = snap_time
+            self._rate = rate
             return
         # Walk the sim ticks from snap_time to now. `i` is the tick index
         # (0 = snap_time itself, the snapshot's own tick — already applied
@@ -1613,6 +1671,16 @@ class PredictedShip:
         #   normal case and 0 for the lag-spike case.
         self._sim_time = max(now, snap_time + n * TICK)
         self._acc = self._sim_time - (snap_time + n * TICK)
+        # 10.11c: phase-lock the free-run clock to this reconcile. The
+        # clock is _sim_base + (real_time - _real_base); the next advance()
+        # steps the physics when it crosses a tick boundary. _last_step_time
+        # = the pose's time (snap_time + n*TICK, the replay end) — the
+        # render interpolation phase is _sim_time - (snap_time + n*TICK) =
+        # the sub-tick remainder (0 to TICK).
+        self._sim_base = self._sim_time
+        self._real_base = real_time if real_time is not None else 0.0
+        self._last_step_time = snap_time + n * TICK
+        self._rate = rate
         self._prev_pos = pygame.Vector2(self._ship.pos)
         self._prev_angle = self._ship.angle
 
@@ -2061,7 +2129,7 @@ class PredictedShip:
                   h_jump="")
         return {}
 
-    def advance(self, dt, inp, enemies=None):
+    def advance(self, dt, inp, enemies=None, real_time=None):
         """Advance the ghost by real time `dt` (Session 7.1).
 
         Feeds `dt` into the fixed-step accumulator and steps the ghost
@@ -2094,6 +2162,16 @@ class PredictedShip:
         authority exactly: the snap size is 0 while dead. The accumulator
         is discarded (not kept) so the first advance after a respawn
         starts clean from the fresh snapshot.
+
+        10.11c: `real_time` (the client's current real time, pygame ticks
+        / 1000) drives the PHASE-LOCKED sim clock. When given, the clock
+        is `_sim_base + (real_time - _real_base)` (1x real time, anchored
+        at the last reconcile) and physics steps are triggered by tick-
+        boundary crossings — the ghost executes exactly 2 ticks per
+        2-tick snapshot interval (no phase drift, no bimodal snap). When
+        None (tests), the clock advances by the clamped frame time
+        (cumulative) — the pre-10.11c behavior, so the ghost-clock tests
+        still pass.
         """
         if self._ship.dead:
             self._acc = 0.0
@@ -2112,9 +2190,42 @@ class PredictedShip:
             # ages out too (no enemies while dead — it can no longer home).
             self.step_local_missiles(min(dt, MAX_FRAME_DT))
             return 0
-        self._acc += min(dt, MAX_FRAME_DT)
+        # 10.11c: the PHASE-LOCKED sim clock (smooth, 1x real time).
+        # _sim_time = _sim_base + (real_time - _real_base), where
+        # (_sim_base, _real_base) are set at the last reconcile. The clock
+        # advances at exactly 1x of real time (no free-running accumulator,
+        # no phase drift), so the ghost's sim time stays in PHASE with the
+        # host's sim time (both advance at 1x real time, anchored at the
+        # reconcile). The old accumulator was a STAIRCASE (advancing in
+        # TICK increments triggered by the client's real-time dt), so its
+        # phase drifted relative to the host's tick grid — the ghost
+        # executed 1/2/3 ticks per 2-tick snapshot interval instead of
+        # always 2, and the reconcile corrected the ±1-tick error with an
+        # 8.67px snap (the 10.11b bimodal snap).
+        # `real_time` is the client's current real time (pygame ticks /
+        # 1000). When given (the real client), the clock is the
+        # phase-locked formula, advancing at the host's estimated SIM
+        # RATE (self._rate, from the HostTimeEstimator) — not hardcoded
+        # 1x — so the ghost stays in phase with the host's tick grid even
+        # when the host runs slower than real time (a starved host: the
+        # same-machine-thread test artifact, or a slow production host).
+        # When None (tests, which drive advance() with a bare dt and no
+        # reconcile), the clock advances by the (clamped) frame time —
+        # cumulative, so the ghost-clock tests (which assert
+        # n_steps == floor(total/STEP)) still pass.
+        if real_time is None:
+            self._sim_time += min(dt, MAX_FRAME_DT)
+        else:
+            self._sim_time = self._sim_base + self._rate * (
+                real_time - self._real_base)
+        # Trigger physics steps when the sim time crosses a tick boundary
+        # (_sim_time - _last_step_time >= TICK). The step advances the pose
+        # by TICK and moves _last_step_time to the new boundary. The
+        # number of steps per snapshot interval is exactly 2 (the sim time
+        # advances 2*TICK per 2-tick interval, since the host sim runs at
+        # 1x real time) — not 1/2/3 (the phase-drift bug).
         n = 0
-        while self._acc >= TICK:
+        while self._sim_time - self._last_step_time >= TICK - 1e-9:
             # 10.9: capture the pose BEFORE the step so render_pose can
             # interpolate across the in-progress step (the host's
             # _ship_pose does the same from the model's prev/curr).
@@ -2124,9 +2235,11 @@ class PredictedShip:
             self.step_local_bullets(TICK)   # Session 7.3: advance + cull
             self.step_local_beams(TICK)     # 10.3a: age + cull
             self.step_local_missiles(TICK, enemies)   # 10.3b: home + cull
-            self._acc -= TICK
+            self._last_step_time += TICK
             n += 1
-        self._sim_time += n * TICK   # 10.11: advance the physics clock
+        # The render interpolation phase: the time since the last step
+        # (0 to TICK). render_pose lerps _prev -> curr at alpha = _acc/TICK.
+        self._acc = self._sim_time - self._last_step_time
         return n
 
     def render_pose(self):

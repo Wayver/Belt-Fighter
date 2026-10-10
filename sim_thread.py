@@ -256,5 +256,16 @@ class SimThread:
                             "type": T_ECHO,
                             "entries": [[t, serialize_input(inp)]
                                         for (t, inp) in echo]})
-            # 4. sleep ~1 ms (bounds CPU + makes stop() prompt).
-            self._stop.wait(self.WAIT)
+            # 4. DYNAMIC SLEEP: sleep until the next tick boundary.
+            #    After the step loop, `acc` is the remaining time (0 to
+            #    STEP). The next tick is due in (STEP - acc) seconds.
+            #    Sleeping for exactly that amount makes the thread wake
+            #    up on the tick boundary, so it steps exactly 1 tick per
+            #    wake-up (in steady state) instead of batching 1-7 ticks
+            #    (the old fixed 1ms sleep + OS scheduler imprecision made
+            #    the accumulator accumulate 1-7 ticks worth of time
+            #    between wake-ups — the root cause of the 10.11c bimodal
+            #    snap).
+            sleep_time = STEP - acc
+            if sleep_time > 0:
+                self._stop.wait(sleep_time)

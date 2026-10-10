@@ -694,6 +694,10 @@ class NetWorker:
         # thread each frame, read by the worker's timer. None until the main
         # thread provides one. A reference swap is atomic under the GIL.
         self._latest_snapshot = None
+        # 10.12: the host's client-input sink — a callable the worker thread
+        # invokes the moment a T_INPUT lands (see set_input_sink). None for
+        # the client's worker and the tests (the input is just queued).
+        self._input_sink = None
         self._stop = threading.Event()
         self._thread = None
         self._started = False
@@ -727,6 +731,41 @@ class NetWorker:
         handed off by reference (atomic swap under the GIL); the worker only
         ever reads it, never mutates it."""
         self._latest_snapshot = (sim_time, snap)
+
+    def set_input_sink(self, fn):
+        """Host only: register a callable the WORKER thread invokes the
+        moment a T_INPUT message lands (10.12). `fn` receives the WHOLE
+        parsed message dict (it needs the top-level 'tag' for the T_PONG
+        reflection, not just 'inp') and must return True if it consumed
+        the message (the worker then skips queueing it into in_queue) or
+        False/None to also queue it (the main thread still polls it).
+
+        WHY: the 10.11 host polled the client's input on the RENDER thread
+        (worker.poll() once per frame), but the host renders at ~42-47 FPS
+        (21-24 ms/frame), so the input sat in the worker's in_queue for up
+        to a full frame before the sim thread could apply it — a 0-24 ms
+        (mean ~12 ms) poll-phase added to the wire latency. The host
+        applies the LATEST received input each tick (pinned #5), so that
+        stale input diverged from the client's prediction ghost and the
+        reconcile snapped the ghost back (the in-flight-input snap). Moving
+        the hand-off to the worker thread (which drains the socket every
+        ~1 ms) cuts the poll-phase to ~1 ms.
+
+        OWNERSHIP: `fn` runs on the WORKER thread, not the main thread. The
+        host's sink (run_host) does a single reference swap
+        (game.set_remote_input) — atomic under the GIL, and the sim thread
+        only ever READS remote_input (pinned #5), so the swap is race-free
+        — and reflects the T_PONG via `worker.send()` (a thread-safe
+        queue.Queue put, safe from any thread). The sink must NOT touch
+        pygame or any other main-thread state. Reflecting the pong HERE
+        (worker thread, ~1 ms) instead of on the render thread keeps the
+        measured RTT honest: a render-thread reflection would add a full
+        frame (~21 ms at the host's 42-47 FPS) to the round trip and
+        inflate the client's one-way-latency estimate (10.11b).
+
+        Call BEFORE start() (the worker thread must not be running when the
+        reference is set)."""
+        self._input_sink = fn
 
     def start(self):
         """Flip the socket to non-blocking and launch the worker thread.
@@ -773,7 +812,20 @@ class NetWorker:
                         break
                 conn.drain_send()
                 # 2. receive side: drain the socket, parse JSON HERE, hand off.
+                # 10.12: a T_INPUT with a registered sink is handed to the
+                # sink HERE (on the worker thread, ~1 ms after landing)
+                # instead of sitting in in_queue until the main thread's
+                # next poll (up to a full render frame later — the host's
+                # input poll-phase). The sink receives the WHOLE message
+                # (it needs the top-level 'tag' for the T_PONG reflection,
+                # not just 'inp') and returns True when it consumed the
+                # message (skip the queue). The main thread still polls
+                # every other message type (T_RESPAWN, etc.).
                 for m in conn.poll():
+                    if (m.get("type") == T_INPUT
+                            and self._input_sink is not None
+                            and self._input_sink(m)):
+                        continue
                     self._in.put(m)
                 # 3. host: the real-time snapshot timer (checked every ~1 ms,
                 #    NOT once per frame — the 7.10c in-loop timer was

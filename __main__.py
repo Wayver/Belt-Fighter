@@ -224,6 +224,25 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
         # grabs the latest and sends it every 100 ms of REAL time. start()
         # flips the socket to non-blocking + launches the thread.
         worker = NetWorker(conn, is_host=True)
+        # 10.12: the client's input is applied by the WORKER thread the
+        # moment it lands (a reference swap, race-free — the sim thread
+        # only reads remote_input), NOT polled off the render thread once
+        # per frame. The host renders at ~42-47 FPS, so the old render-
+        # thread poll added a 0-24 ms (mean ~12 ms) poll-phase to the
+        # input latency; the worker drains the socket every ~1 ms, so the
+        # input now reaches the sim within ~1 ms. The sink ALSO reflects
+        # the T_PONG here (worker thread, ~1 ms) — worker.send() is a
+        # thread-safe queue put — because a render-thread reflection would
+        # add a full frame (~21 ms) to the measured RTT and inflate the
+        # client's one-way-latency estimate (10.11b). The sink returns
+        # True (consumed) so the T_INPUT is not also queued for the main
+        # thread.
+        def _client_input_sink(m):
+            game.set_remote_input(deserialize_input(m["inp"]))
+            if "tag" in m:
+                worker.send({"type": T_PONG, "tag": m["tag"]})
+            return True
+        worker.set_input_sink(_client_input_sink)
         worker.start()
 
         # --- 4. the authoritative game loop ---
@@ -313,26 +332,31 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
             if not game.handle_events(sim_thread.command):
                 return
             keys = pygame.key.get_pressed()
-            # Poll the client: apply its latest input (pinned #5: the host
-            # applies the LATEST received input each tick). Session 8.3:
-            # worker.poll() drains the input the worker thread already
-            # parsed off the render thread (the JSON decode no longer
-            # happens here). Session 9.x M3: the hand-off to the sim
-            # thread is a direct reference swap (game.remote_input = inp)
-            # — atomic under the GIL, and _step only READS the input
-            # (the world-cap replace() builds a new object), so the swap
-            # is race-free.
+            # Poll the client: 10.12 — the T_INPUT branch is GONE. The
+            # client's input is applied by the WORKER thread the moment it
+            # lands (worker.set_input_sink, above — a reference swap on
+            # game.remote_input, race-free because the sim thread only
+            # READS it). The old render-thread poll ran once per frame
+            # (~42-47 FPS here = 21-24 ms), so the input sat in the
+            # worker's in_queue for up to a full frame before the sim
+            # thread could apply it — a 0-24 ms (mean ~12 ms) poll-phase
+            # on top of the wire latency that the client's prediction
+            # ghost did not have (it used the input immediately). The
+            # worker drains the socket every ~1 ms, so the input now
+            # reaches the sim within ~1 ms. T_INPUT is consumed by the
+            # sink (not re-queued), so it never reaches this poll.
             for m in worker.poll():
                 if m.get("type") == T_INPUT:
+                    # 10.12: UNREACHABLE in the current wiring — the sink
+                    # (worker thread) applies the input AND reflects the
+                    # T_PONG (10.11b) the moment the message lands, then
+                    # consumes it (returns True), so it is never queued.
+                    # Kept as a fallback: if the sink is ever unset, the
+                    # input is still applied here (render thread) and the
+                    # RTT tag is still reflected (the client measures
+                    # RTT = now - sent_time[tag] -> one-way L = RTT / 2,
+                    # which anchors its prediction ghost's clock).
                     game.set_remote_input(deserialize_input(m["inp"]))
-                    # 10.11b: reflect the client's RTT tag back IMMEDIATELY
-                    # (a pure reflection — no sim work, no queueing). The
-                    # client measures RTT = now - sent_time[tag] and derives
-                    # the one-way latency L = RTT / 2 that anchors its
-                    # prediction ghost's clock (snap_time + L). Without this
-                    # the client has no unambiguous L (the HostTimeEstimator
-                    # is anchored on the newest snapshot ≈ snap_time, so it
-                    # can't measure the latency).
                     if "tag" in m:
                         worker.send({"type": T_PONG, "tag": m["tag"]})
                 elif m.get("type") == T_RESPAWN:

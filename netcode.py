@@ -1432,7 +1432,14 @@ class PredictedShip:
         self._sim_base = snap_time
         self._real_base = real_time if real_time is not None else 0.0
         self._last_step_time = snap_time
-        self._rate = rate
+        # 10.11d: the free-run clock advances at exactly 1x real time (not
+        # the noisy HostTimeEstimator rate EMA, which has std ~0.33 and
+        # makes the ghost's clock drift from the host's clock by ±1-2
+        # ticks between reconciles — the 10.11c bimodal snap). The host's
+        # sim runs at 1x real time overall (0.9999 over the run), so the
+        # ghost's clock should too. The `rate` param is kept for API
+        # compatibility but ignored.
+        self._rate = 1.0
         # 10.9: start the render interpolation from the seeded pose (no
         # phantom lerp from a pre-seed pose).
         self._prev_pos = pygame.Vector2(self._ship.pos)
@@ -1624,7 +1631,8 @@ class PredictedShip:
             self._sim_base = self._sim_time
             self._real_base = real_time if real_time is not None else 0.0
             self._last_step_time = snap_time
-            self._rate = rate
+            # 10.11d: exactly 1x real time (see seed()).
+            self._rate = 1.0
             return
         # Walk the sim ticks from snap_time to now. `i` is the tick index
         # (0 = snap_time itself, the snapshot's own tick — already applied
@@ -1680,7 +1688,8 @@ class PredictedShip:
         self._sim_base = self._sim_time
         self._real_base = real_time if real_time is not None else 0.0
         self._last_step_time = snap_time + n * TICK
-        self._rate = rate
+        # 10.11d: exactly 1x real time (see seed()).
+        self._rate = 1.0
         self._prev_pos = pygame.Vector2(self._ship.pos)
         self._prev_angle = self._ship.angle
 

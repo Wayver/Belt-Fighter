@@ -530,7 +530,7 @@ def _log_net_debug(game, inp):
         f = open(game._dbg_log_path, "w", newline="")
         f.write("t,snap_px,input,delay,jitter_ema,buf_depth,newest_stamp,"
                 "render_t,host_time_est,fps,dt_max,hic,n,"
-                "replay_ticks,replay_span,rtt_ow\n")
+                "replay_ticks,replay_span,rtt_ow,ghost_sim_time\n")
         game._dbg_log_f = f
     rp = game.render_point.now()
     newest = game.snap_buf.newest_time()
@@ -548,7 +548,7 @@ def _log_net_debug(game, inp):
     game._dbg_dt_sum = 0.0
     game._dbg_dt_max = 0.0
     game._dbg_hiccups = 0
-    f.write("%.3f,%.3f,%s,%.4f,%s,%d,%s,%s,%s,%.1f,%.4f,%d,%d,%d,%.4f,%.4f\n" % (
+    f.write("%.3f,%.3f,%s,%.4f,%s,%d,%s,%s,%s,%.1f,%.4f,%d,%d,%d,%.4f,%.4f,%.4f\n" % (
         time.time(), game.last_snap_px, _input_str(inp),
         game.latency.delay,
         ("%.4f" % jit) if jit is not None else "",
@@ -558,7 +558,8 @@ def _log_net_debug(game, inp):
         ("%.4f" % est) if est is not None else "",
         fps, dt_max, hic, n,
         game.last_replay_ticks, game.last_replay_span,
-        game._rtt_ow))
+        game._rtt_ow,
+        game.last_ghost_sim_time))
     f.flush()
 
 

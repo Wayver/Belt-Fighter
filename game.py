@@ -724,6 +724,15 @@ class Game:
         # diagnosis) — set by push_snapshot, read by the net-debug CSV.
         self.last_replay_ticks = 0
         self.last_replay_span = 0.0
+        # 10.11c: the ghost's PHYSICS clock captured BEFORE the reconcile
+        # (the phase-drift diagnosis). last_ghost_sim_time is ghost._sim_time
+        # just before reconcile_rewind runs. Comparing
+        # last_ghost_sim_time - snap_time across reconciles shows whether
+        # the ghost's free-run clock is locked to the host's tick grid or
+        # drifting by up to one tick (the bimodal snap: 0 when the ghost
+        # lands on the snapshot, ~1 tick when it lands one tick past it).
+        # Inert on the host (it never calls push_snapshot).
+        self.last_ghost_sim_time = 0.0
         self.snap_count = 0
         # 10.1: the client's R key (per-player death) sets this; the client
         # loop (run_client) drains it and sends a T_RESPAWN to the host.
@@ -2300,6 +2309,14 @@ class Game:
             # large value = the prediction diverged from authority (in-
             # flight input / clock error).
             _bx, _by = self.ghost.ship.pos.x, self.ghost.ship.pos.y
+            # 10.11c: capture the ghost's PHYSICS clock BEFORE the reconcile
+            # (the phase-drift diagnosis). ghost_sim_time - snap_time is
+            # the ghost's lead over the snapshot at reconcile time; if it
+            # oscillates between ~0 and ~1 tick across reconciles, the
+            # free-run clock is not phase-locked to the host's tick grid
+            # (the bimodal snap). snap_px already captures the pose
+            # displacement, so only the clock is logged.
+            self.last_ghost_sim_time = self.ghost._sim_time
             # TELEMETRY (10.3b): capture the ghost's missile_seq BEFORE the
             # rewind replay (the replay re-runs the fire tick and can bump it
             # again) and the snapshot's authoritative seq (local_s[21]) —

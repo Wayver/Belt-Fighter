@@ -57,15 +57,15 @@ from .sim_thread import SimThread
 class FakeWorker:
     """Just enough of a NetWorker for the SimThread: records the
     (sim_time, snapshot) the sim thread publishes via
-    set_latest_snapshot, and the messages it sends (T_BEAM / T_ECHO). The
-    real worker's 10 Hz timer is out of scope here (it is covered by the
-    net self-test + e2e)."""
+    publish_snapshot (10.13 — the worker sends it immediately; the real
+    worker's send path is covered by the net self-test + e2e), and the
+    messages it sends (T_BEAM / T_ECHO)."""
 
     def __init__(self):
         self.snapshots = []
         self.sent = []   # 10.4/10.10: the T_BEAM / T_ECHO messages sent
 
-    def set_latest_snapshot(self, sim_time, snap):
+    def publish_snapshot(self, sim_time, snap):
         self.snapshots.append((sim_time, snap))
 
     def send(self, msg):
@@ -226,7 +226,7 @@ def main():
         alphas.append(rc.advance(0.045, m))   # a ~22 FPS render frame
         time.sleep(0.045)
     st.stop()
-    # The worker receives set_latest_snapshot ONLY on a step. ~1 s of sim
+    # The worker receives publish_snapshot ONLY on a step. ~1 s of sim
     # time = ~60 steps, so ~60 snapshots. Before the fix the thread
     # published (and snapshotted) every ~1 ms iteration -> ~1000 in 1 s.
     # This is the direct "publish-on-step" signal.

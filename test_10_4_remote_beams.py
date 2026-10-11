@@ -178,14 +178,14 @@ def _advance_render_point(g):
 
 class FakeWorker:
     """Captures what the sim thread would send (send) + the snapshot
-    hand-off (set_latest_snapshot), so we can assert on the T_BEAM
+    hand-off (publish_snapshot, 10.13), so we can assert on the T_BEAM
     messages without a real socket."""
     def __init__(self):
         self.sent = []
         self.snaps = 0
     def send(self, msg):
         self.sent.append(msg)
-    def set_latest_snapshot(self, sim_time, snap):
+    def publish_snapshot(self, sim_time, snap):
         self.snaps += 1
 
 

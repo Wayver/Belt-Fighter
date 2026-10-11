@@ -640,11 +640,13 @@ def do_handshake_host(conn, host_hull, host_loadout, timeout=30.0):
 # two talk only through immutable hand-offs:
 #   * out_queue (queue.Queue): main -> worker, message dicts to send.
 #   * in_queue  (queue.Queue): worker -> main, parsed message dicts.
-#   * _latest_snapshot: a single shared slot the MAIN thread writes each
-#     frame with a fresh (sim_time, snapshot) tuple; the worker's host timer
-#     reads it. A tuple reference swap is atomic under the GIL, so no lock
-#     is needed for the hand-off itself (the worker only ever reads the
-#     reference, never mutates the tuple).
+#   * _snap_queue (queue.Queue): host only — the SIM thread pushes a fresh
+#     (sim_time, snapshot) tuple after EVERY step (60 Hz); the worker
+#     serializes + sends each one the moment it lands (10.13). A queue
+#     (not a single slot) so a worker hiccup can't drop a snapshot — the
+#     queue just holds it. The worker drains to the NEWEST (drops stale
+#     ones, like the render thread's latest-wins input rule) so a backlog
+#     never bursts out.
 # The Connection is owned ENTIRELY by the worker after start(); the main
 # thread must NOT call conn.poll()/drain_send()/touch conn.sock once the
 # worker is running.
@@ -660,18 +662,21 @@ class NetWorker:
       3. The main thread calls `send(msg)` (queue it), `poll()` (drain the
          parsed messages), and checks `.closed` — exactly where it used to
          call `conn.send` / `conn.poll` / `conn.closed`.
-      4. Host only: the main thread calls `set_latest_snapshot((sim_time,
-         snap))` each frame; the worker's real-time timer (checked every
-         ~1 ms, NOT once per frame) sends the latest snapshot every
-         `period` seconds of REAL time — a true 30 Hz independent of the
-         frame rate (the 7.10c in-loop timer was frame-quantized).
+      4. Host only: the SIM thread calls `publish_snapshot((sim_time,
+         snap))` after EVERY step (60 Hz); the worker serializes + sends
+         each one the moment it lands (10.13 — the snapshot's age at send
+         is ~0, so the client's `now = sim_time + L` is exact and the
+         delta-wander snap is gone). `period` is kept for the self-test's
+         cadence gate only; the game no longer uses a send timer.
       5. `stop()` sets the stop flag and joins the thread. Idempotent.
 
     The worker's per-iteration work:
       1. drain out_queue -> conn.send() (queue the encoded frames);
       2. conn.drain_send() (flush to the socket);
       3. for m in conn.poll(): in_queue.put(m)  (JSON parse happens HERE);
-      4. host: if the timer is due, grab _latest_snapshot and send it;
+      4. host: drain _snap_queue to the NEWEST (sim_time, snap) and send
+         it (serialize_snapshot + conn.send happen HERE, on the worker
+         thread — the sim thread only pushes the raw tuple);
       5. stop_event.wait(WAIT)  (~1 ms; bounds CPU + makes stop() prompt).
     """
 
@@ -685,15 +690,22 @@ class NetWorker:
     def __init__(self, conn, is_host=False, period=None):
         self._conn = conn
         self._is_host = is_host
-        # The host snapshot period in REAL seconds (30 Hz by default). The
-        # client ignores it (it never sends snapshots).
+        # 10.13: the host snapshot period in REAL seconds. The GAME no
+        # longer uses a send timer (the sim thread publishes a snapshot
+        # every step and the worker sends each one immediately — see
+        # publish_snapshot); `period` is kept only so the self-test's
+        # cadence gate can drive a SYNTHETIC timer (period=0.1) and prove
+        # the timer MECHANISM is exact, independent of the game's cadence.
         self._period = (SNAPSHOT_INTERVAL * TICK) if period is None else period
         self._out = queue.Queue()
         self._in = queue.Queue()
-        # The host's latest (sim_time, snapshot) tuple, written by the main
-        # thread each frame, read by the worker's timer. None until the main
-        # thread provides one. A reference swap is atomic under the GIL.
-        self._latest_snapshot = None
+        # 10.13: the host's snapshot queue — the SIM thread pushes a fresh
+        # (sim_time, snapshot) tuple after every step (60 Hz); the worker
+        # drains it to the NEWEST and sends that one (serialize + send on
+        # the worker thread). A queue (not a single slot) so a worker
+        # hiccup can't drop a snapshot — it just holds it; the drain-to-
+        # newest drops the stale ones so a backlog never bursts out.
+        self._snap_queue = queue.Queue()
         # 10.12: the host's client-input sink — a callable the worker thread
         # invokes the moment a T_INPUT lands (see set_input_sink). None for
         # the client's worker and the tests (the input is just queued).
@@ -725,12 +737,28 @@ class NetWorker:
             except queue.Empty:
                 return out
 
-    def set_latest_snapshot(self, sim_time, snap):
-        """Host only: publish the latest (sim_time, snapshot) for the
-        worker's timer to send (main thread, once per frame). The tuple is
-        handed off by reference (atomic swap under the GIL); the worker only
-        ever reads it, never mutates it."""
-        self._latest_snapshot = (sim_time, snap)
+    def publish_snapshot(self, sim_time, snap):
+        """Host only: hand the worker a fresh (sim_time, snapshot) to send
+        NOW (sim thread, once per step — 60 Hz). The tuple is queued (a
+        thread-safe put, safe from any thread); the worker serializes it
+        (serialize_snapshot + json.dumps happen on the WORKER thread, not
+        the sim thread) and sends it the moment it lands.
+
+        10.13: this REPLACES the 30 Hz send timer + set_latest_snapshot.
+        The old timer sent the LATEST published snapshot every 33.3 ms of
+        REAL time, but the worker's 1 ms loop does recv + JSON + OS
+        scheduling, so each send fired 1-15 ms after its ideal deadline —
+        the snapshot's age at send (delta) wandered by up to a full tick,
+        and the client's reconcile (now = sim_time + L) corrected that
+        wander every snapshot (the delta-wander snap, the #2 snap source).
+        Publishing at the STEP (the moment the snapshot is fresh) makes
+        delta ~ 0: the snapshot's sim_time IS its send time, so the
+        client's `now = sim_time + L` is exact and the wander is gone.
+        The client's interpolation stack reads the cadence from
+        config.SNAPSHOT_INTERVAL (now 1 tick = 60 Hz) and
+        SNAPSHOT_BUFFER_MAX (bumped to 24 to bracket INTERP_DELAY_MAX at
+        60 Hz). Bandwidth doubles to ~366 KB/s — fine on a LAN."""
+        self._snap_queue.put((sim_time, snap))
 
     def set_input_sink(self, fn):
         """Host only: register a callable the WORKER thread invokes the
@@ -790,18 +818,17 @@ class NetWorker:
     # -- worker thread ------------------------------------------------------
     def _run(self):
         conn = self._conn
-        # 10.11d: the next snapshot deadline on the IDEAL grid (not the
-        # actual send time). The old code anchored to `now` (the actual
-        # send time), so the OS jitter (1-15 ms) accumulated into the
-        # phase — the send interval was 33.3 ms + jitter (std ~10 ms),
-        # and the snapshot's sim_time advanced by 1-7 ticks per snapshot
-        # (not always 2). Anchoring to the ideal grid (`next_snap +=
-        # period`) keeps the phase stable: the send fires within ~1 ms
-        # (plus OS jitter) of the ideal 33.3 ms grid, so the snapshot's
-        # sim_time advances by exactly 2 ticks per snapshot (in steady
-        # state — the 30 Hz send rate is 2x the 60 Hz sim rate, so the
-        # phase is locked to the wall clock).
-        next_snap = 0.0   # 0.0 -> the first host send is immediate
+        # 10.13: the host has NO send timer anymore. The sim thread
+        # publishes a snapshot after EVERY step (publish_snapshot, 60 Hz)
+        # and the worker sends each one the moment it lands (step 3
+        # below) — the snapshot's age at send is ~0, so the client's
+        # `now = sim_time + L` is exact. The 10.11d ideal-grid timer
+        # (next_snap += period) fixed the PHASE DRIFT (jitter no longer
+        # accumulated) but not the PER-SEND jitter: the 1 ms loop does
+        # recv + JSON + OS scheduling, so each send still fired 1-15 ms
+        # after its ideal deadline and the snapshot's age wandered by up
+        # to a full tick — the delta-wander snap. Sending at the publish
+        # (the step) removes the wander entirely.
         while not self._stop.is_set():
             try:
                 # 1. send side: queue any pending messages, then flush.
@@ -827,25 +854,27 @@ class NetWorker:
                             and self._input_sink(m)):
                         continue
                     self._in.put(m)
-                # 3. host: the real-time snapshot timer (checked every ~1 ms,
-                #    NOT once per frame — the 7.10c in-loop timer was
-                #    frame-quantized and fired at 112-150 ms at 24 FPS).
+                # 3. host: drain the snapshot queue to the NEWEST and send it
+                #    (10.13 — publish-driven, no timer). The sim thread
+                #    pushes one (sim_time, snap) per step (60 Hz); the
+                #    worker serializes + sends the NEWEST one here, on
+                #    the worker thread (serialize_snapshot + json.dumps
+                #    via conn.send — off the sim thread). Dropping the
+                #    stale ones (latest wins, like the render thread's
+                #    input rule) means a worker hiccup never bursts a
+                #    backlog out — it just holds the newest, and the
+                #    client's buffer clamps to it.
                 if self._is_host:
-                    now = time.monotonic()
-                    if now >= next_snap:
-                        latest = self._latest_snapshot
-                        if latest is not None:
-                            sim_time, snap = latest
-                            conn.send({"type": T_SNAP, "sim_time": sim_time,
-                                       "snap": serialize_snapshot(snap)})
-                        # Advance the deadline on the IDEAL grid (not the
-                        # actual send time), so the OS jitter doesn't
-                        # accumulate into the phase. If we're behind (a
-                        # stall), skip to the next deadline to avoid a
-                        # burst.
-                        next_snap += self._period
-                        if next_snap < now:
-                            next_snap = now + self._period
+                    latest = None
+                    while True:
+                        try:
+                            latest = self._snap_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                    if latest is not None:
+                        sim_time, snap = latest
+                        conn.send({"type": T_SNAP, "sim_time": sim_time,
+                                   "snap": serialize_snapshot(snap)})
             except OSError:
                 # The socket went away out from under us (a stray close, or
                 # the peer reset in a way recv surfaces as OSError rather
@@ -1259,48 +1288,74 @@ def _self_test():
         client.close()
         host.close()
 
-    # (c) host real-time snapshot timer cadence: over a fixed wall-clock
-    # window the worker must send ~window/period snapshots with gaps ~period.
-    # This is the frame-quantization regression check — the 7.10c in-loop
-    # timer fired at 112-150 ms at 24 FPS; the worker's timer (checked every
-    # ~1 ms) must sit at ~100 ms regardless of frame rate.
+    # (c) publish-driven snapshot cadence (10.13): the "sim thread" (this
+    # thread) publishes one snapshot every ~16.7 ms (60 Hz) and the worker
+    # must send EACH one promptly — the client's arrival gaps should be
+    # ~16.7 ms (the PUBLISH rate), not the old 33.3 ms timer period, and
+    # there must be no large gaps (no timer quantization, no backlog burst).
+    # This is the 10.13 regression check: the worker sends at the publish
+    # (the step), not on a 30 Hz timer. (The old gate drove a synthetic
+    # 10 Hz timer via period=; that timer no longer exists in the game.)
     host, hconn, client = _loopback()
-    PERIOD = 0.1
-    hw = NetWorker(hconn, is_host=True, period=PERIOD)
+    hw = NetWorker(hconn, is_host=True)
     cw = NetWorker(client, is_host=False)
     hw.start()
     cw.start()
     try:
-        # Publish one snapshot; the worker's timer re-sends it every PERIOD.
-        hw.set_latest_snapshot(g.sim_time, snap)
         start = time.monotonic()
         WINDOW = 0.5
+        pub = 0
         arrivals = []
+        # Publish one snapshot every ~16.7 ms (60 Hz) AND poll the client
+        # worker in the SAME loop (interleaved). The host worker sends each
+        # published snapshot promptly (~1-2 ms after the publish), so the
+        # client worker's inbox fills at the publish rate; polling HERE
+        # (not after the window) records the TRUE arrival times, which
+        # track the publish times. Polling only after the window would
+        # drain the whole backlog in one instant and read every gap as ~0
+        # (the snapshots WERE sent promptly — the test just looked too
+        # late).
         while time.monotonic() - start < WINDOW:
+            hw.publish_snapshot(g.sim_time + pub * TICK, snap)
+            pub += 1
             for m in cw.poll():
                 if m.get("type") == T_SNAP:
                     arrivals.append(time.monotonic())
+            time.sleep(TICK)
+        # Drain any arrivals still in flight after the window.
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            for m in cw.poll():
+                if m.get("type") == T_SNAP:
+                    arrivals.append(time.monotonic())
+            if len(arrivals) >= pub:
+                break
             time.sleep(0.002)
         gaps = [b - a for a, b in zip(arrivals, arrivals[1:])]
         n = len(arrivals)
         mean_gap = (sum(gaps) / len(gaps)) if gaps else 0.0
         max_gap = max(gaps) if gaps else 0.0
-        # Expect ~5 sends over 0.5 s at 10 Hz (immediate first + one per
-        # period). Generous bounds so a slow CI machine does not fail it.
-        cadence_ok = (4 <= n <= 8
-                      and 0.07 <= mean_gap <= 0.14
-                      and max_gap <= 0.16)
+        # Expect ~30 publishes over 0.5 s at 60 Hz, each sent promptly.
+        # The mean gap must be ~16.7 ms (the publish rate) — clearly NOT
+        # the old 33.3 ms timer (a 33 ms mean would fail the <= 0.030
+        # bound) — and the max gap must be small (no burst). Generous
+        # bounds so a slow CI machine does not fail it.
+        cadence_ok = (18 <= n <= pub
+                      and 0.010 <= mean_gap <= 0.030
+                      and max_gap <= 0.080)
         if cadence_ok:
-            print("PASS: NetWorker host timer cadence — %d snaps in %.1f s, "
-                  "mean gap %.0f ms, max gap %.0f ms (target %.0f ms)"
-                  % (n, WINDOW, mean_gap * 1000, max_gap * 1000,
-                     PERIOD * 1000))
+            print("PASS: NetWorker publish-driven cadence — %d/%d snaps in "
+                  "%.1f s, mean gap %.0f ms, max gap %.0f ms (publish "
+                  "rate %.0f ms)"
+                  % (n, pub, WINDOW, mean_gap * 1000, max_gap * 1000,
+                     TICK * 1000))
         else:
             ok = False
-            print("FAIL: NetWorker host timer cadence -> n=%d mean_gap=%.0fms "
-                  "max_gap=%.0fms (expected ~%d snaps, ~%d ms gaps)"
-                  % (n, mean_gap * 1000, max_gap * 1000,
-                     int(WINDOW / PERIOD), PERIOD * 1000))
+            print("FAIL: NetWorker publish-driven cadence -> n=%d/%d "
+                  "mean_gap=%.0fms max_gap=%.0fms (expected ~%d snaps, "
+                  "~%.0f ms gaps)"
+                  % (n, pub, mean_gap * 1000, max_gap * 1000, pub,
+                     TICK * 1000))
     finally:
         hw.stop()
         cw.stop()

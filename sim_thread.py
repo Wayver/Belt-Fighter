@@ -10,10 +10,10 @@ unified single-player onto the same thread — SP is now the host loop
 minus the NetWorker (worker=None), so there is exactly ONE sim
 architecture in the game.
 
-Threading model (the NetWorker `_latest_snapshot` pattern, everywhere):
+Threading model (the NetWorker hand-off patterns, everywhere):
   * All cross-thread hand-offs are single reference swaps (atomic under
-    the GIL) or a queue the consumer drains for the newest item. No
-    locks, no shared mutable state.
+    the GIL) or a queue the consumer drains for the newest item (the
+    snapshot queue, 10.13). No locks, no shared mutable state.
   * The sim thread OWNS the Game: it is the only thread that calls
     _step / reset / fire_scan / attribute writes on ships. The render
     thread never mutates the Game — it publishes input (a fresh
@@ -37,9 +37,11 @@ Game.update — MAX_STEPS_PER_FRAME + ACC_BACKLOG_CAP):
      step_alpha is the sim's real acc/STEP), then
      latest_model = game.render_model() (atomic reference swap; the
      render thread reads it and draws with it), and
-     worker.set_latest_snapshot(game.sim_time, game.snapshot()) (moved
-     from the render loop to the sim thread — the worker's 30 Hz timer
-     now always has a fresh snapshot to send). Publishing only on a step
+     worker.publish_snapshot(game.sim_time, game.snapshot()) (10.13 —
+     the worker serializes + sends it the moment it lands, so the
+     snapshot's age at send is ~0 and the client's `now = sim_time + L`
+     is exact; this REPLACES the old set_latest_snapshot + the worker's
+     30 Hz timer). Publishing only on a step
      keeps the model object STABLE between steps (the render clock
      detects a new model by identity and advances its alpha while the
      same model is re-read) and avoids ~94% wasted render_model() calls
@@ -228,8 +230,13 @@ class SimThread:
                 g.acc = acc
                 self.latest_model = g.render_model()
                 if self._worker is not None:
-                    self._worker.set_latest_snapshot(g.sim_time,
-                                                     g.snapshot())
+                    # 10.13: hand the worker the fresh snapshot to send NOW
+                    # (it serializes + sends on the worker thread). The
+                    # snapshot's age at send is ~0, so the client's
+                    # `now = sim_time + L` is exact (the delta-wander snap
+                    # is gone). Replaces the old set_latest_snapshot + the
+                    # worker's 30 Hz timer.
+                    self._worker.publish_snapshot(g.sim_time, g.snapshot())
                     # 10.4: send any laser beams fired this step as T_BEAM
                     # events (drained here, on the sim thread — the only
                     # thread that touches g._beam_events). The client draws

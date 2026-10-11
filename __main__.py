@@ -216,13 +216,15 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
         game.set_player_ship(1, Ship(hull=chull, loadout=clout))
         # Session 8.3: the socket I/O + the 10 Hz snapshot send move to a
         # NetWorker thread (the "Network Queue" pattern). The worker owns the
-        # Connection: it drains the client's input off the render thread and
-        # runs the REAL-TIME snapshot timer (checked every ~1 ms, NOT once
-        # per frame — the 7.10c in-loop timer was frame-quantized and fired
-        # at 112-150 ms at 24 FPS). The main thread publishes a fresh
-        # snapshot each frame via set_latest_snapshot; the worker's timer
-        # grabs the latest and sends it every 100 ms of REAL time. start()
-        # flips the socket to non-blocking + launches the thread.
+        # Connection: it drains the client's input off the render thread
+        # (10.12: applies it via the input sink the moment it lands) and
+        # sends snapshots the moment the SIM thread publishes them
+        # (10.13: the sim thread calls worker.publish_snapshot after every
+        # step — 60 Hz — and the worker serializes + sends each one
+        # immediately; there is no send timer anymore, so the snapshot's
+        # age at send is ~0 and the client's `now = sim_time + L` is
+        # exact). start() flips the socket to non-blocking + launches the
+        # thread.
         worker = NetWorker(conn, is_host=True)
         # 10.12: the client's input is applied by the WORKER thread the
         # moment it lands (a reference swap, race-free — the sim thread
@@ -250,15 +252,15 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
         # SimThread — a daemon thread that steps the Game at a real-time
         # 60 Hz clock (a monotonic accumulator, NOT tied to the frame
         # rate) and publishes the plain-data RenderModel via an atomic
-        # reference swap (the NetWorker _latest_snapshot pattern). The
+        # reference swap (the NetWorker hand-off pattern). The
         # render thread becomes a LOCAL CLIENT of that sim: it publishes
         # the latest local input + T/V/G/R/F commands, and reads
         # sim_thread.latest_model to draw. The snapshot hand-off to the
-        # worker (set_latest_snapshot) moves to the sim thread too — the
-        # worker's 10 Hz real-time timer (unchanged) now always has a
-        # fresh snapshot to send, and the snapshot is still stamped with
-        # game.sim_time (the host's sim clock, 1x real time regardless of
-        # frame rate), so the client's interpolation window is unchanged.
+        # worker (publish_snapshot, 10.13) happens on the sim thread —
+        # the worker serializes + sends each snapshot the moment it lands
+        # (60 Hz, age ~0), and the snapshot is stamped with game.sim_time
+        # (the host's sim clock, 1x real time regardless of frame rate),
+        # so the client's interpolation window is unchanged.
         # `game` is now OWNED by the sim thread: the render thread never
         # calls game.update() or mutates sim state — it publishes input
         # (a fresh ShipInput per frame), commands (a queue), and reads
@@ -279,13 +281,13 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
         # (the 8.5 caveat's outstanding item). last_telem_time anchors it
         # (0.0 -> the first line is immediate).
         last_telem_time = 0.0
-        TELEMETRY_PERIOD = SNAPSHOT_INTERVAL * STEP   # 0.033 s (30 Hz, 10.8)
+        TELEMETRY_PERIOD = SNAPSHOT_INTERVAL * STEP   # 0.0167 s (60 Hz, 10.13)
         # Session 7.10b: host-side frame-rate telemetry (F3-toggled, mirrors
         # the client's 7.10a columns). The client's CSV can't tell a WIRE
         # stall (host sent smoothly, packets queued + released in a burst)
         # from a HOST frame stall (the host's sim is tied to its frame loop,
         # so a host hiccup stalls the sim AND the snapshot sending). We log
-        # the host's raw frame time on each snapshot send (30 Hz, 10.8) so the
+        # the host's raw frame time on each telemetry tick (60 Hz, 10.13) so the
         # next re-test can be correlated: if the client's snapshot gap
         # (newest jumping 1.3-1.6 s) lines up with a host hiccup (dt_max
         # > 50 ms / low fps) at the same wall-clock time, it's a HOST stall

@@ -733,6 +733,26 @@ class Game:
         # lands on the snapshot, ~1 tick when it lands one tick past it).
         # Inert on the host (it never calls push_snapshot).
         self.last_ghost_sim_time = 0.0
+        # 10.14: the ghost's STEP clock captured BEFORE the reconcile (the
+        # phase-offset diagnosis). last_ghost_last_step_time is
+        # ghost._last_step_time just before reconcile_rewind runs — the tick
+        # boundary the ghost's SIM pose actually sits on. The reconcile snaps
+        # the pose from that boundary to snap_time, so the snap size is set
+        # by (snap_time - last_ghost_last_step_time): ~0 when the ghost's
+        # step grid is aligned with the host's snapshot grid, ~1 tick (8.67 px
+        # at MAX_SPEED) when it is one tick behind. last_ghost_acc is
+        # ghost._acc (the render interpolation phase, 0..TICK) captured the
+        # same moment — the phase the RENDERED pose (render_pose) sits at,
+        # which is what the player actually sees. Inert on the host.
+        self.last_ghost_last_step_time = 0.0
+        self.last_ghost_acc = 0.0
+        # 10.14: the phase offset (snap_time - ghost._last_step_time) in
+        # TICK units, captured before the reconcile. This is the single
+        # number that sets the snap size: snap_px ~= |v| * phase_ticks *
+        # TICK. ~0 (or an integer) = the ghost's step grid is aligned with
+        # the host's snapshot grid; ~1 = the ghost is one tick behind
+        # (the 8.67 px bimodal snap at MAX_SPEED). Inert on the host.
+        self.last_ghost_phase_ticks = 0.0
         self.snap_count = 0
         # 10.1: the client's R key (per-player death) sets this; the client
         # loop (run_client) drains it and sends a T_RESPAWN to the host.
@@ -2318,6 +2338,19 @@ class Game:
             # (the bimodal snap). snap_px already captures the pose
             # displacement, so only the clock is logged.
             self.last_ghost_sim_time = self.ghost._sim_time
+            # 10.14: capture the ghost's STEP clock BEFORE the reconcile
+            # (the phase-offset diagnosis). _last_step_time is the tick
+            # boundary the ghost's sim pose sits on; the reconcile snaps the
+            # pose from there to snap_time, so (snap_time - _last_step_time)
+            # is the phase offset that sets the snap size. _acc is the render
+            # interpolation phase (what the player actually sees).
+            self.last_ghost_last_step_time = self.ghost._last_step_time
+            self.last_ghost_acc = self.ghost._acc
+            # 10.14: the phase offset in TICK units — how far the ghost's
+            # step grid (_last_step_time) sits behind the snapshot's stamp.
+            # This is what the reconcile corrects, so it bounds snap_px.
+            self.last_ghost_phase_ticks = (
+                sim_time - self.ghost._last_step_time) / STEP
             # TELEMETRY (10.3b): capture the ghost's missile_seq BEFORE the
             # rewind replay (the replay re-runs the fire tick and can bump it
             # again) and the snapshot's authoritative seq (local_s[21]) —

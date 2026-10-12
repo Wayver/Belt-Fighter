@@ -2510,10 +2510,18 @@ class Game:
         ghost_enemies = self._ghost_enemy_proxies(pos)
 
         inp = ShipInput.from_keys(keys)
-        # 10.11c: pass the client's real time so the ghost's free-run clock
-        # is phase-locked to the host's tick grid (see PredictedShip.advance).
+        # 10.15: pass the client's real time + the HostTimeEstimator + the
+        # RTT-measured one-way latency so the ghost's sim clock is the
+        # HOST's clock (host_time.now(real_time) + rtt_ow), not the
+        # client's real time. The ghost's step grid is therefore locked to
+        # the host's tick grid — the phase offset at the next reconcile is
+        # 0 (not the 1-tick drift of the client-real-time free-run clock),
+        # so the reconcile's pose correction is 0 (the 8.67 px bimodal
+        # snap is gone). See PredictedShip.advance.
         self.ghost.advance(dt, inp, enemies=ghost_enemies,
-                           real_time=real_time)
+                           real_time=real_time,
+                           host_time=getattr(self, "host_time", None),
+                           rtt_ow=getattr(self, "_rtt_ow", 0.0))
         # 10.9: the ghost's INTERPOLATED render pose (lerp across the
         # in-progress step, the same sub-step interpolation the host's local
         # ship gets from _ship_pose). The local ship + its beams + the

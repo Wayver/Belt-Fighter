@@ -2138,7 +2138,8 @@ class PredictedShip:
                   h_jump="")
         return {}
 
-    def advance(self, dt, inp, enemies=None, real_time=None):
+    def advance(self, dt, inp, enemies=None, real_time=None,
+                host_time=None, rtt_ow=0.0):
         """Advance the ghost by real time `dt` (Session 7.1).
 
         Feeds `dt` into the fixed-step accumulator and steps the ghost
@@ -2172,15 +2173,14 @@ class PredictedShip:
         is discarded (not kept) so the first advance after a respawn
         starts clean from the fresh snapshot.
 
-        10.11c: `real_time` (the client's current real time, pygame ticks
-        / 1000) drives the PHASE-LOCKED sim clock. When given, the clock
-        is `_sim_base + (real_time - _real_base)` (1x real time, anchored
-        at the last reconcile) and physics steps are triggered by tick-
-        boundary crossings — the ghost executes exactly 2 ticks per
-        2-tick snapshot interval (no phase drift, no bimodal snap). When
-        None (tests), the clock advances by the clamped frame time
-        (cumulative) — the pre-10.11c behavior, so the ghost-clock tests
-        still pass.
+        10.15: `host_time` (the client's HostTimeEstimator) and `rtt_ow`
+        (the RTT-measured one-way latency) drive the ghost's sim clock
+        directly from the HOST's clock: `_sim_time = host_time.now(real_time)
+        + rtt_ow`. The ghost's step grid is now locked to the host's tick
+        grid (not the client's real time), so the phase offset at reconcile
+        is 0 and the snap is 0. When `host_time` is None (tests), the
+        clock falls back to the pre-10.15 behavior (free-run from the
+        last reconcile anchor).
         """
         if self._ship.dead:
             self._acc = 0.0
@@ -2224,6 +2224,17 @@ class PredictedShip:
         # n_steps == floor(total/STEP)) still pass.
         if real_time is None:
             self._sim_time += min(dt, MAX_FRAME_DT)
+        elif host_time is not None and host_time.ready:
+            # 10.15: the ghost's clock IS the host's clock (the estimator's
+            # point-slope model) plus the one-way latency — the host's sim
+            # time at the moment the client is rendering. The ghost's step
+            # grid (_last_step_time) is therefore locked to the host's tick
+            # grid: the phase offset at the next reconcile is 0 (not the
+            # 1-tick drift of the client-real-time free-run clock), so the
+            # reconcile's pose correction is 0 (the 8.67 px bimodal snap is
+            # gone). The estimator re-anchors on every snapshot arrival, so
+            # this tracks the host's clock without any client-side drift.
+            self._sim_time = host_time.now(real_time) + rtt_ow
         else:
             self._sim_time = self._sim_base + self._rate * (
                 real_time - self._real_base)

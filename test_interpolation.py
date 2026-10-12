@@ -305,9 +305,15 @@ def _run_rewind_case(res, delay_s, echo=False):
                 now = g.sim_time                        # host's current clock
                 ghost.reconcile_rewind(snaps[snap_tick][0][0], snap_time, now)
                 n += 1
+                # 10.16: check the RENDER pose (what's drawn), not the
+                # physics state. The physics state is one tick ahead
+                # (the prediction), but the render pose interpolates
+                # between the snapshot and the prediction, so it should
+                # match the host's current pose.
+                rpos, _ = ghost.render_pose()
                 max_err = max(max_err, math.hypot(
-                    ghost.ship.pos.x - g.ship.pos.x,
-                    ghost.ship.pos.y - g.ship.pos.y))
+                    rpos.x - g.ship.pos.x,
+                    rpos.y - g.ship.pos.y))
         return max_err, n
     finally:
         _gm.update_field = orig

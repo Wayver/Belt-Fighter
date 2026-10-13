@@ -281,6 +281,12 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
         # (the 8.5 caveat's outstanding item). last_telem_time anchors it
         # (0.0 -> the first line is immediate).
         last_telem_time = 0.0
+        # 10.17: the last-read value of the sim thread's cumulative step
+        # counter (the host CSV's per-window `steps` column is the delta).
+        # Seeded from the current value so the first line covers only the
+        # window after the loop starts (the sim thread may have stepped a
+        # few ticks during setup).
+        last_steps_total = sim_thread._steps_total
         TELEMETRY_PERIOD = SNAPSHOT_INTERVAL * STEP   # 0.0167 s (60 Hz, 10.13)
         # Session 7.10b: host-side frame-rate telemetry (F3-toggled, mirrors
         # the client's 7.10a columns). The client's CSV can't tell a WIRE
@@ -424,7 +430,7 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
                     f = game._dbg_log_f
                     if f is None:
                         f = open(game._dbg_log_path, "w", newline="")
-                        f.write("t,sim_time,fps,dt_max,hic,n\n")
+                        f.write("t,sim_time,fps,dt_max,hic,n,steps\n")
                         game._dbg_log_f = f
                     n = game._dbg_frames
                     fps = (1.0 / (game._dbg_dt_sum / n)) if n > 0 else 0.0
@@ -434,10 +440,14 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
                     game._dbg_dt_sum = 0.0
                     game._dbg_dt_max = 0.0
                     game._dbg_hiccups = 0
-                    f.write("%.3f,%.4f,%.1f,%.4f,%d,%d\n" % (
+                    # 10.17: the sim thread's fixed steps this window (the
+                    # snapshot cadence — see _steps_total in sim_thread).
+                    steps = sim_thread._steps_total - last_steps_total
+                    last_steps_total = sim_thread._steps_total
+                    f.write("%.3f,%.4f,%.1f,%.4f,%d,%d,%d\n" % (
                         time.time(),
                         model["sim_time"] if model else 0.0,
-                        fps, dt_max, hic, n))
+                        fps, dt_max, hic, n, steps))
                     f.flush()
             # Session 9.x M3: draw the PUBLISHED model (the M3 seam:
             # draw(dt, model) — the model is built by the sim thread, not
@@ -554,10 +564,11 @@ def _log_net_debug(game, inp):
     f = game._dbg_log_f
     if f is None:
         f = open(game._dbg_log_path, "w", newline="")
-        f.write("t,snap_px,input,delay,jitter_ema,buf_depth,newest_stamp,"
-                "render_t,host_time_est,fps,dt_max,hic,n,"
-                "replay_ticks,replay_span,rtt_ow,ghost_sim_time,"
-                "ghost_last_step_time,ghost_acc,phase_ticks\n")
+        f.write("t,snap_px,render_snap_px,input,delay,jitter_ema,"
+                "buf_depth,newest_stamp,render_t,host_time_est,fps,dt_max,"
+                "hic,n,replay_ticks,replay_span,rtt_ow,ghost_sim_time,"
+                "ghost_last_step_time,ghost_acc,phase_ticks,advance_steps,"
+                "frame_dt,host_rate\n")
         game._dbg_log_f = f
     rp = game.render_point.now()
     newest = game.snap_buf.newest_time()
@@ -575,9 +586,10 @@ def _log_net_debug(game, inp):
     game._dbg_dt_sum = 0.0
     game._dbg_dt_max = 0.0
     game._dbg_hiccups = 0
-    f.write("%.3f,%.3f,%s,%.4f,%s,%d,%s,%s,%s,%.1f,%.4f,%d,%d,%d,%.4f,%.4f,%.4f,"
-        "%.4f,%.4f,%.4f\n" % (
-        time.time(), game.last_snap_px, _input_str(inp),
+    f.write("%.3f,%.3f,%.3f,%s,%.4f,%s,%d,%s,%s,%s,%.1f,%.4f,%d,%d,%d,%.4f,"
+        "%.4f,%.4f,%.4f,%.4f,%.4f,%d,%.4f,%.4f\n" % (
+        time.time(), game.last_snap_px, game.last_render_snap_px,
+        _input_str(inp),
         game.latency.delay,
         ("%.4f" % jit) if jit is not None else "",
         len(game.snap_buf),
@@ -590,7 +602,10 @@ def _log_net_debug(game, inp):
         game.last_ghost_sim_time,
         game.last_ghost_last_step_time,
         game.last_ghost_acc,
-        game.last_ghost_phase_ticks))
+        game.last_ghost_phase_ticks,
+        game.last_advance_steps,
+        game.last_frame_dt,
+        game.host_time.rate))
     f.flush()
 
 

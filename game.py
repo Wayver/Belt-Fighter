@@ -753,6 +753,32 @@ class Game:
         # the host's snapshot grid; ~1 = the ghost is one tick behind
         # (the 8.67 px bimodal snap at MAX_SPEED). Inert on the host.
         self.last_ghost_phase_ticks = 0.0
+        # 10.17: the RENDER pose's displacement across the reconcile
+        # (render_pose before vs after) — what the player actually sees.
+        # last_snap_px is the PHYSICS pose's displacement (ship.pos); the
+        # two differ because the 10.16 pre-step puts the physics pose
+        # ahead of the render interpolation. The sawtooth diagnosis needs
+        # both: if render_snap_px is 0 while snap_px is 8.67, the snap is
+        # invisible to the player (a physics-pose bookkeeping artifact);
+        # if render_snap_px is 8.67, the player sees it. Inert on the host.
+        self.last_render_snap_px = 0.0
+        # 10.17: the number of physics steps the ghost took BETWEEN the previous
+        # reconcile and this one (predicted_view accumulates advance()'s
+        # return value in _dbg_steps_since_reconcile; push_snapshot reads
+        # it into last_advance_steps + resets the accumulator). The
+        # sawtooth hypothesis: that count oscillates 0/1/2 per snapshot
+        # interval (depending on the frame dt's phase relative to the tick
+        # grid), and that oscillation is what moves the pose across the
+        # reconcile. A stable 1-per-interval (60 Hz snapshots) means the
+        # clock is phase-locked; a 0/1/2 oscillation means it is not.
+        # Inert on the host.
+        self.last_advance_steps = 0
+        self._dbg_steps_since_reconcile = 0
+        # 10.17: the raw frame dt of the frame that ran the last
+        # predicted_view (the frame whose advance() produced
+        # last_advance_steps). Lets the CSV correlate the step count with
+        # the frame's timing (the jitter hypothesis). Inert on the host.
+        self.last_frame_dt = 0.0
         self.snap_count = 0
         # 10.1: the client's R key (per-player death) sets this; the client
         # loop (run_client) drains it and sends a T_RESPAWN to the host.
@@ -2351,6 +2377,9 @@ class Game:
             # This is what the reconcile corrects, so it bounds snap_px.
             self.last_ghost_phase_ticks = (
                 sim_time - self.ghost._last_step_time) / STEP
+            # 10.17: capture the RENDER pose BEFORE the reconcile (the sawtooth
+            # diagnosis) — the player sees render_pose, not ship.pos.
+            _br, _ = self.ghost.render_pose()
             # TELEMETRY (10.3b): capture the ghost's missile_seq BEFORE the
             # rewind replay (the replay re-runs the fire tick and can bump it
             # again) and the snapshot's authoritative seq (local_s[21]) —
@@ -2363,11 +2392,20 @@ class Game:
                 enemies=enemies, real_time=real_time, rate=rate)
             self.last_snap_px = math.hypot(
                 self.ghost.ship.pos.x - _bx, self.ghost.ship.pos.y - _by)
+            # 10.17: the render pose's displacement across the reconcile.
+            _ar, _ = self.ghost.render_pose()
+            self.last_render_snap_px = math.hypot(
+                _ar.x - _br.x, _ar.y - _br.y)
             # 10.11: capture the replay length for the net-debug CSV (the
             # sawtooth diagnosis) — the whole-tick count the rewind replayed
             # + the raw (now - snap_time) span it was truncated from.
             self.last_replay_ticks = self.ghost._last_replay_ticks
             self.last_replay_span = self.ghost._last_replay_span
+            # 10.17: the steps the ghost took between the previous
+            # reconcile and this one (the sawtooth diagnosis) — read +
+            # reset the accumulator predicted_view feeds.
+            self.last_advance_steps = self._dbg_steps_since_reconcile
+            self._dbg_steps_since_reconcile = 0
             self.snap_count += 1
             _mtel.log("RECONCILE", sim_t=sim_time, r_snap_t=sim_time,
                       r_snap_seq=local_s[21], r_seq_before=_seq_before,
@@ -2518,10 +2556,26 @@ class Game:
         # 0 (not the 1-tick drift of the client-real-time free-run clock),
         # so the reconcile's pose correction is 0 (the 8.67 px bimodal
         # snap is gone). See PredictedShip.advance.
-        self.ghost.advance(dt, inp, enemies=ghost_enemies,
-                           real_time=real_time,
-                           host_time=getattr(self, "host_time", None),
-                           rtt_ow=getattr(self, "_rtt_ow", 0.0))
+        # 10.17: accumulate the step count + capture the frame dt (the sawtooth
+        # diagnosis). advance() returns the number of fixed steps it took
+        # this frame; we ACCUMULATE across frames (the reconcile happens
+        # earlier in the frame, before this advance, so the per-frame count
+        # at log time would be the steps AFTER the reconcile, not the ones
+        # between this and the previous reconcile). push_snapshot reads +
+        # resets the accumulator, so last_advance_steps = the steps the
+        # ghost took between the previous reconcile and this one. The
+        # sawtooth hypothesis: that count oscillates 0/1/2 (depending on
+        # the frame dt's phase relative to the tick grid), and that
+        # oscillation is what moves the pose across the reconcile.
+        self._dbg_steps_since_reconcile += self.ghost.advance(
+            dt, inp, enemies=ghost_enemies,
+            real_time=real_time,
+            host_time=getattr(self, "host_time", None),
+            rtt_ow=getattr(self, "_rtt_ow", 0.0))
+        # dt is the (clamped) frame time of the frame that also ran the
+        # reconcile (the log line is written in this same frame, after
+        # predicted_view) — the frame's timing context for the snap.
+        self.last_frame_dt = dt
         # 10.9: the ghost's INTERPOLATED render pose (lerp across the
         # in-progress step, the same sub-step interpolation the host's local
         # ship gets from _ship_pose). The local ship + its beams + the

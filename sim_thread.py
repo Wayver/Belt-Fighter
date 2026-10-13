@@ -112,6 +112,16 @@ class SimThread:
         # reference each iteration. None until the first publish. The
         # render thread reads this and calls game.draw(dt, model).
         self.latest_model = None
+        # 10.17: cumulative fixed steps run by the sim thread (written by
+        # the sim thread, read by the render thread's telemetry — a
+        # monotone int, so the render thread computes the per-window delta
+        # without a read/reset race). The host CSV logs the delta per
+        # telemetry line: a stable 1-per-line (60 Hz) means the sim thread
+        # steps exactly one tick per iteration (the dynamic-sleep design);
+        # 0/2+ oscillation means it is batching (the 10.11c root cause),
+        # which makes the snapshot stamps jump and is a candidate driver
+        # of the client's sawtooth snap.
+        self._steps_total = 0
         self._stop = threading.Event()
         self._thread = None
         self._started = False
@@ -208,6 +218,9 @@ class SimThread:
                 g._step(STEP, inp)
                 acc -= STEP
                 steps += 1
+            # 10.17: the host CSV's per-window step count (see
+            # _steps_total in __init__).
+            self._steps_total += steps
             # 3. publish ONLY when the sim actually stepped. Publishing a
             #    fresh model every ~1 ms iteration (even when nothing
             #    changed) caused two problems: (a) the render clock

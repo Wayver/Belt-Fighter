@@ -13,13 +13,25 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
 import math
+import sys
 import pygame
 
-from .config import TICK
-from .hulls import SILAS_HULL, default_loadout
-from .ship import Ship
-from .intent import ShipInput
-from .netcode import PredictedShip
+# This script lives in tools/ (outside the ship5 package). Put the dir
+# that makes `import ship5` resolve on sys.path. The repo root is the
+# parent of tools/; the package is importable from the repo root (if
+# ship5/ is a subdir) or from the repo root's parent (if ship5 is a
+# sibling symlink, as in this checkout). Add both so it works either way.
+# Run from the repo root:  python tools/verify_10_11b.py
+_repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _p in (_repo, os.path.dirname(_repo)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from ship5.config import TICK
+from ship5.hulls import SILAS_HULL, default_loadout
+from ship5.ship import Ship
+from ship5.intent import ShipInput
+from ship5.netcode import PredictedShip
 
 EPS = 1e-6
 

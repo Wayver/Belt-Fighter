@@ -10,6 +10,14 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 import traceback
 import pygame
 
+# tools/ bootstrap: make `import ship5` resolve (repo root, or its parent
+# if ship5 is a sibling symlink). Run from the repo root:  python tools/_probe_sensor.py
+import sys as _sys
+_repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _p in (_repo, os.path.dirname(_repo)):
+    if _p not in _sys.path:
+        _sys.path.insert(0, _p)
+
 from ship5.config import WIDTH, HEIGHT, SENSOR_SIGNATURE_THRESHOLD
 from ship5.fog import make_light_texture
 from ship5.game import Game, _GhostEnemyProxy

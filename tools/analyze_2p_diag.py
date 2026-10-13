@@ -7,7 +7,9 @@ Run:  python analyze_2p_diag.py
 import csv
 import os
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+# The game writes its debug CSVs to the package dir (the parent of tools/,
+# where game.py lives) — not to tools/ where this script sits.
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def load(name):

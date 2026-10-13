@@ -26,7 +26,10 @@ magnitude at the ship's speed. It measures (B) directly (snap_px).
 import csv, os, statistics as st
 
 def load(name):
-    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+    # The game writes its debug CSVs to the package dir (the parent of
+    # tools/, where game.py lives) — not to tools/ where this script sits.
+    pkg = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    p = os.path.join(pkg, name)
     with open(p) as f:
         return list(csv.DictReader(f))
 

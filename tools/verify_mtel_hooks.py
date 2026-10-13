@@ -3,26 +3,38 @@ handback -> render paths with telemetry enabled and confirm each hook
 (FIRE / RECONCILE / HANDBACK / DEDUP) emits a row. Proves the hooks are
 wired to the actual call sites, not just that mt.log works.
 
-Run from the repo root:  python -m ship5.verify_mtel_hooks
+Run from the repo root:  python tools/verify_mtel_hooks.py
 """
 import os
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
+import sys
 import pygame
 
-from .config import TICK, WIDTH, HEIGHT
-from .hulls import (HullType, FORWARD_S, FORWARD_P, REVERSE, RCS_LEFT,
-                    RCS_RIGHT, GUN, MISSILE, REACTOR, COMPUTER, SHIELD,
-                    SENSOR, default_loadout)
-from .ship import Ship
-from .intent import ShipInput
-from .netcode import (PredictedShip, GhostMissile, RenderPoint,
-                      LatencyTracker, HostTimeEstimator)
-from .game import Game, _GhostEnemyProxy
-from .bullets import Missile
-from .fog import make_light_texture
-from . import missile_telemetry as mt
+# This script lives in tools/ (outside the ship5 package). Put the dir
+# that makes `import ship5` resolve on sys.path. The repo root is the
+# parent of tools/; the package is importable from the repo root (if
+# ship5/ is a subdir) or from the repo root's parent (if ship5 is a
+# sibling symlink, as in this checkout). Add both so it works either way.
+# Run from the repo root:  python tools/verify_mtel_hooks.py
+_repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _p in (_repo, os.path.dirname(_repo)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from ship5.config import TICK, WIDTH, HEIGHT
+from ship5.hulls import (HullType, FORWARD_S, FORWARD_P, REVERSE, RCS_LEFT,
+                         RCS_RIGHT, GUN, MISSILE, REACTOR, COMPUTER, SHIELD,
+                         SENSOR, default_loadout)
+from ship5.ship import Ship
+from ship5.intent import ShipInput
+from ship5.netcode import (PredictedShip, GhostMissile, RenderPoint,
+                           LatencyTracker, HostTimeEstimator)
+from ship5.game import Game, _GhostEnemyProxy
+from ship5.bullets import Missile
+from ship5.fog import make_light_texture
+from ship5 import missile_telemetry as mt
 
 MISSILE_HULL = HullType(
     id='mtel', polygon=((18, 0), (14, 3.5), (8, 6.5), (0, 8), (-8, 8),

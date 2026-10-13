@@ -67,7 +67,7 @@ import pygame
 
 from .config import (INTERP_DELAY, INTERP_DELAY_MIN, INTERP_DELAY_MAX,
                     ADAPT_K, SNAPSHOT_INTERVAL, SNAPSHOT_BUFFER_MAX, TICK,
-                    MAX_FRAME_DT,
+                    MAX_FRAME_DT, ROT_SPEED,
                     MAX_BULLETS, MAX_MISSILES,
                     MISSILE_SPEED, MISSILE_ACCEL, MISSILE_BOOST_TIME,
                     MISSILE_TURN_RATE, MISSILE_LIFE,
@@ -1314,6 +1314,29 @@ class PredictedShip:
         # the first seed (render_pose is only called once seeded).
         self._prev_pos = None
         self._prev_angle = None
+        # 10.18: RENDER-ONLY pre-step state (the sawtooth fix). The physics
+        # pose (s.pos) sits at the replay end (snap_time + n*TICK), but the
+        # render clock (_sim_time) is L = rtt_ow AHEAD of it (the reconcile
+        # sets _sim_time = max(now, snap_time + n*TICK) with now =
+        # snap_time + L). Rendering the physics pose directly pins the
+        # render to snap_time while the clock is at snap_time + L — each
+        # reconcile then jumps the pose 1 tick (the 8.67 px sawtooth).
+        # The fix: render at the CLOCK's time. _render_base is the pose
+        # at the replay end (== s.pos at reconcile time); _render_next is
+        # the pose ONE TICK ahead (a kinematic pre-step — see
+        # _render_pre_step). render_pose lerps _render_base -> _render_next
+        # at alpha = L/TICK, so the render pose sits at snap_time + L
+        # (the clock's time) and is continuous across the reconcile.
+        # None until the first seed/reconcile.
+        self._render_base = None
+        self._render_base_angle = None
+        self._render_next = None
+        self._render_next_angle = None
+        # 10.18: the last ShipInput the ghost was stepped with (set in
+        # step()). The render pre-step reads its .turn to predict the
+        # angular motion over the L gap. None before the first step (the
+        # pre-step then coasts straight — no turn).
+        self._last_inp = None
         # Session 7.6: the local input buffer — (host_time, ShipInput) pairs,
         # oldest first, bounded to INPUT_BUFFER_MAX seconds of host time.
         # `host_time` is the client's estimate of the host's sim clock at the
@@ -1726,6 +1749,9 @@ class PredictedShip:
         call it directly to step the ghost at exactly the sim's rate.
         """
         s = self._ship
+        # 10.18: remember the input for the render pre-step (it reads
+        # .turn to predict the angular motion over the L gap).
+        self._last_inp = inp
         s.tracked = 0
         s.laser_target = self._pick_laser_target(s, enemies)
         # 10.3b: pick the ghost's missile target from the proxies (the SAME
@@ -2262,32 +2288,91 @@ class PredictedShip:
         self._acc = self._sim_time - self._last_step_time
         return n
 
-    def render_pose(self):
-        """The ghost's INTERPOLATED render pose (10.9) — (pos, angle).
+    def _render_pre_step(self):
+        """10.18: compute the RENDER-ONLY pre-step pose (the sawtooth fix).
 
-        The ghost is stepped in fixed TICK chunks (advance), but the display
-        runs at its own rate, so drawing the raw post-step pos makes the
-        local ship move in 60 Hz jumps (the "jagged" local ship). This
-        returns the pose lerp'd between the start of the current in-progress
-        step (_prev_pos/_prev_angle, captured in advance) and the current
-        post-step pose, at alpha = acc/TICK — the SAME sub-step
-        interpolation the host's local ship gets from _ship_pose(step_alpha)
-        (game.py). alpha is clamped to [0, 1] (the 70460de rule: on a hiccup
-        the acc can exceed one step; render the latest simulated state, never
-        extrapolate past the current pose). The angle uses the shortest-arc
-        delta (the host's _ship_pose math).
+        The physics pose (s.pos) sits at the replay end (snap_time +
+        n*TICK), but the render clock (_sim_time) is L = rtt_ow AHEAD of it.
+        Rendering the physics pose pins the render to snap_time while the
+        clock is at snap_time + L, so each reconcile jumps the pose 1 tick
+        (the 8.67 px sawtooth). The fix: render at the CLOCK's time by
+        lerping the pose at the replay end (snap_time + n*TICK) toward the
+        pose ONE TICK ahead (snap_time + (n+1)*TICK) at alpha = L/TICK.
+
+        The "one tick ahead" pose is a KINEMATIC pre-step, NOT a full
+        physics step: it integrates the CURRENT velocity (pos += vel*TICK)
+        and applies the CURRENT turn input (angle += turn*ROT_SPEED*
+        turn_rate_factor*TICK) — the same motion the next real step would
+        produce for the first sub-tick, without re-running the full
+        pipeline (weapons, power, shield, sensors). That is exactly the
+        motion the render needs to fill the L gap, and it is cheap (no
+        side effects, no shots/beams/missiles). It is RECOMPUTED every
+        frame from the current physics pose + input, so it always tracks
+        the live pose (the pose advances in TICK chunks between reconciles,
+        and the pre-step advances with it).
+
+        Sets _render_base/_render_base_angle (the pose at the replay end,
+        == s.pos) and _render_next/_render_next_angle (the pose one tick
+        ahead). Called by render_pose each frame.
+        """
+        s = self._ship
+        # The pose at the replay end (the physics pose, at snap_time +
+        # n*TICK). This is the "base" of the render lerp.
+        self._render_base = pygame.Vector2(s.pos)
+        self._render_base_angle = s.angle
+        # The pose ONE TICK ahead: integrate the current velocity + apply
+        # the current turn input (the kinematic pre-step). `inp` is the
+        # last input the ghost was stepped with (set in advance/step);
+        # None before the first step (then the pre-step is pure coasting).
+        inp = self._last_inp
+        turn = inp.turn if inp is not None else 0.0
+        next_pos = s.pos + s.vel * TICK
+        next_angle = s.angle + turn * ROT_SPEED * s.hull.turn_rate_factor * TICK
+        self._render_next = next_pos
+        self._render_next_angle = next_angle
+
+    def render_pose(self):
+        """The ghost's INTERPOLATED render pose (10.18) — (pos, angle).
+
+        The render pose sits at the CLOCK's time (_sim_time), NOT the
+        physics pose's time (the replay end, snap_time + n*TICK). The
+        reconcile sets _sim_time = max(now, snap_time + n*TICK) with
+        now = snap_time + L (L = rtt_ow), so the clock is L AHEAD of the
+        physics pose. Rendering the physics pose directly pins the render
+        to snap_time while the clock is at snap_time + L — each reconcile
+        then jumps the pose 1 tick (the 8.67 px sawtooth).
+
+        The fix (10.18): lerp the pose at the replay end (snap_time +
+        n*TICK, == s.pos) toward the pose ONE TICK ahead (snap_time +
+        (n+1)*TICK, the kinematic pre-step) at alpha = L/TICK, where
+        L = _sim_time - (snap_time + n*TICK) = _acc. That puts the render
+        pose at snap_time + L (the clock's time) and makes it CONTINUOUS
+        across the reconcile: the pre-reconcile render pose (at the old
+        snap_time + L) and the post-reconcile render pose (at the new
+        snap_time + L) are the SAME point in the ship's trajectory (the
+        new snap_time is 1 tick ahead, so the new base is where the old
+        "next" was), so there is no jump.
 
         This is a RENDER helper only — it does NOT touch self._ship.pos
         (the ghost's actual simulated pose, which the no-teleport/rewind
-        gates and the handoff math read). Before the first seed _prev is
-        None: return the raw pose (the caller only renders once seeded).
+        gates and the handoff math read). Before the first seed the render
+        state is None: return the raw pose (the caller only renders once
+        seeded).
         """
         s = self._ship
-        if self._prev_pos is None:
+        if self._render_base is None:
             return pygame.Vector2(s.pos), s.angle
+        # Recompute the pre-step from the CURRENT physics pose + input so
+        # it tracks the live pose (the pose advances in TICK chunks between
+        # reconciles; the pre-step advances with it).
+        self._render_pre_step()
+        # alpha = L/TICK, where L = _sim_time - (snap_time + n*TICK) =
+        # _acc (the render interpolation phase, in [0, TICK)). Clamped to
+        # [0, 1] (on a hiccup the acc can exceed one step; render the
+        # latest simulated state, never extrapolate past the pre-step).
         alpha = max(0.0, min(1.0, self._acc / TICK))
-        rpos = self._prev_pos.lerp(pygame.Vector2(s.pos), alpha)
-        a0, a1 = self._prev_angle, s.angle
+        rpos = self._render_base.lerp(self._render_next, alpha)
+        a0, a1 = self._render_base_angle, self._render_next_angle
         da = (a1 - a0 + math.pi) % (2 * math.pi) - math.pi
         rangle = a0 + da * alpha
         return rpos, rangle

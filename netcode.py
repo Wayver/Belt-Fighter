@@ -1680,38 +1680,16 @@ class PredictedShip:
         self._last_step_time = snap_time + n * TICK
         # Branch 3 free-runs at exactly 1x real time (see seed()).
         self._rate = 1.0
-        # KNOWN TEMPORARY WORKAROUND (10.16) — to be replaced by the clock/phase
-        # rewrite (step 4). Step the ghost ONCE more (to snap_time +
-        # (n+1)*TICK) so the render pose is lerp(pose at snap_time+n*TICK,
-        # pose at snap_time+(n+1)*TICK, _acc/TICK) — a smooth interpolation
-        # between two simulated poses, not a pin to the snapshot's pose.
-        # The step loop in advance() never fires (because _sim_time -
-        # _last_step_time = L < TICK), so the ghost was stuck at the
-        # snapshot's pose and each new snapshot (1 tick ahead) caused an
-        # 8.67 px snap. Stepping once here gives the ghost the "next" pose
-        # to interpolate to. Use the latest input (the input at
-        # snap_time + n*TICK, the start of the prediction step — same
-        # selection as the replay loop).
-        #
-        # WHY IT IS A HACK: it advances the PHYSICS pose one tick ahead of
-        # the ghost's own clock (_sim_time), so after a reconcile the pose
-        # is at snap_time+(n+1)*TICK while _sim_time is at snap_time+n*TICK.
-        # test_interpolation had to check render_pose() (not ship.pos)
-        # because of this. The phase rewrite makes the pose and the clock
-        # agree, which removes the need for this extra step.
-        t_next = snap_time + n * TICK
-        while j + 1 < len(buf) and buf[j + 1][0] <= t_next + 1e-9:
-            j += 1
-        inp_next = buf[j][1] if j >= 0 else buf[0][1]
-        self._prev_pos = pygame.Vector2(self._ship.pos)
-        self._prev_angle = self._ship.angle
-        self.step(TICK, inp_next, enemies=enemies)
-        self.step_local_bullets(TICK)
-        self.step_local_beams(TICK)
-        self.step_local_missiles(TICK, enemies)
-        # ship.pos is now the pose at snap_time + (n+1)*TICK.
-        # _last_step_time stays at snap_time + n*TICK (the pose's time
-        # BEFORE the prediction step), so the render interpolation phase
+        # 10.16 pre-step REMOVED (10.17). It advanced the PHYSICS pose one tick
+        # ahead of the ghost's own clock (_sim_time), so after a reconcile
+        # the pose was at snap_time+(n+1)*TICK while _sim_time was at
+        # snap_time+n*TICK. That made the pose and the clock disagree, and
+        # the render interpolation (which lerps _prev -> curr at
+        # _acc/TICK) had a "next" pose to chase that was one tick ahead of
+        # where the clock said the ghost was. The phase rewrite (step 4)
+        # makes the pose and the clock agree, so the pre-step is gone.
+        # The pose is now at snap_time + n*TICK (the replay end), and
+        # _last_step_time is the same, so the render interpolation phase
         # is _acc = _sim_time - _last_step_time (in [0, TICK)).
 
     def step(self, dt, inp, enemies=None):

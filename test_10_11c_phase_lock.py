@@ -68,9 +68,11 @@ def main():
         ticks_per_interval.append(steps)
 
         # Step the reference Ship (the host) 2 ticks (its sim time advances
-        # by SNAP_INTERVAL = 2 ticks at 1x real time).
+        # by SNAP_INTERVAL = 2 ticks at 1x real time). Ship.update() is the
+        # fixed-step integrator (it returns (shots, beams, missiles), which
+        # we discard — this reference ship only needs its pose to advance).
         for _ in range(2):
-            host.step(TICK, thrust)
+            host.update(TICK, thrust)
         host_sim += SNAP_INTERVAL
         real_time += SNAP_INTERVAL
 

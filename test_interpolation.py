@@ -405,8 +405,10 @@ def _snap_bullets(s):
     exactly what interp_positions must return for the 'bullets' key."""
     out = []
     # 10.3b: missile entries carry their unique id (field 8 of the missile
-    # snapshot); bullets carry None.
-    for kind, idx, boost_field, id_field in (("player", 2, None, None),
+    # snapshot). 10.7: PLAYER bullets carry their id too (field 6 of the
+    # bullet snapshot) — the same dedup key the ghost uses. Enemy bullets
+    # carry None (the ghost never dedups them).
+    for kind, idx, boost_field, id_field in (("player", 2, None, 6),
                                              ("enemy", 3, None, None),
                                              ("missile", 4, 6, 8)):
         for b in s[idx]:
@@ -570,8 +572,10 @@ def id_oracle(prev_s, curr_s, alpha, dt=None):
     if dt is None:
         dt = SNAPSHOT_INTERVAL * (1.0 / 60.0)
     bullets = []
-    # 10.3b: missile entries carry their unique id (field 8); bullets None.
-    for kind, idx, boost_field, id_field in (("player", 2, None, None),
+    # 10.3b: missile entries carry their unique id (field 8). 10.7: PLAYER
+    # bullets carry their id too (field 6) — the same dedup key the ghost
+    # uses. Enemy bullets carry None. (Read from curr, like interp_positions.)
+    for kind, idx, boost_field, id_field in (("player", 2, None, 6),
                                              ("enemy", 3, None, None),
                                              ("missile", 4, 6, 8)):
         prev_list, curr_list = prev_s[idx], curr_s[idx]

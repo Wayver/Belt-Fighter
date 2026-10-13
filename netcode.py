@@ -1255,39 +1255,33 @@ class PredictedShip:
         # no reference to Game, so it can be stepped in isolation.
         self._ship = Ship(hull=hull, loadout=loadout)
         self._seeded = False
-        # Fixed-step accumulator (Session 7.1): converts real frame times
-        # into whole STEP steps so the ghost runs at the sim's rate on any
-        # display refresh rate. 10.11c: this is now DERIVED from the
-        # phase-locked sim clock (`_sim_time - last_step_time`) rather than
-        # free-running, so the render interpolation (render_pose) and the
-        # step trigger (advance) both read the same locked phase.
+        # The render interpolation phase: _sim_time - _last_step_time, in
+        # [0, TICK). advance() recomputes it each call from the clock
+        # (see the GHOST CLOCK CONTRACT in advance()); render_pose lerps
+        # _prev -> curr at alpha = _acc / TICK. 0.0 until the first
+        # advance.
         self._acc = 0.0
-        # 10.11c: the ghost's REAL-TIME base (pygame ticks / 1000) of the
-        # last reconcile. The phase-locked sim clock is
-        #     _sim_time = snap_time + L + (now_real - _real_base)
-        # i.e. it advances at exactly 1x of real time between reconciles
-        # (no free-running accumulator, no phase drift). `advance` reads
-        # this to compute the clock and steps the physics once per crossed
-        # tick boundary (floor(_sim_time / TICK) increases) — so the ghost
-        # executes exactly 2 ticks per 2-tick snapshot interval (the host
-        # sim runs at 1x real time), not 1/2/3 (the 10.11b bimodal snap).
-        # 0.0 until the first reconcile (seed sets the clock but not the
-        # real-time base; the first advance with no base is a no-op step
-        # trigger, which is correct — the ghost is at the seed pose).
+        # --- branch-3 (test-only) free-run clock state --------------------------
+        # These three fields exist ONLY for advance()'s branch 3 (real_time
+        # given but host_time not ready — the pre-first-snapshot window and
+        # some tests, e.g. test_10_11c). They are NOT the live client clock:
+        # on a real client host_time is always ready, so branch 2
+        # (_sim_time = host_time.now(real_time) + rtt_ow) is used and these
+        # are never read. See the GHOST CLOCK CONTRACT in advance().
+        #
+        # _real_base: the ghost's REAL-TIME base (pygame ticks / 1000) of
+        # the last reconcile. Branch 3 free-runs at 1x real time from it:
+        # _sim_time = _sim_base + _rate * (real_time - _real_base). 0.0
+        # until the first reconcile.
         self._real_base = 0.0
-        # 10.11c: the SIM time at the last reconcile (= now = snap_time + L).
-        # The phase-locked clock is _sim_time = _sim_base + _rate *
-        # (real_time - _real_base). Set in reconcile_rewind; 0.0 until the
-        # first reconcile.
+        # _sim_base: the SIM time at the last reconcile (= now =
+        # snap_time + L). The branch-3 anchor's sim time. Set in
+        # reconcile_rewind; 0.0 until the first reconcile.
         self._sim_base = 0.0
-        # 10.11c: the host's estimated SIM RATE (sim time per real time),
-        # from the client's HostTimeEstimator (game.host_time.rate). The
-        # phase-locked clock advances at this rate (not hardcoded 1x), so
-        # the ghost's sim time stays in phase with the host's tick grid
-        # even when the host runs slower than real time (a starved host —
-        # the same-machine-thread test artifact — or a slow production
-        # host). In a healthy game the rate is ~1.0 (no change). Set in
-        # reconcile_rewind / seed; 1.0 until the first reconcile.
+        # _rate: the branch-3 free-run rate (sim time per real time).
+        # Always 1.0 (the host sim runs at 1x real time); the 10.11d
+        # decision dropped the noisy HostTimeEstimator rate EMA here. Set
+        # in reconcile_rewind / seed; 1.0 until the first reconcile.
         self._rate = 1.0
         # 10.11c: the last sim time at which a physics step was executed
         # (the most recent crossed tick boundary). The step trigger in
@@ -1422,23 +1416,21 @@ class PredictedShip:
         ghost's physics clock (`_sim_time`) so the first `reconcile_rewind`
         has a valid `now` (the ghost's current sim time) to replay from.
 
-        10.11c: `real_time` (the client's real time at the seed) anchors
-        the phase-locked free-run clock (see reconcile_rewind)."""
+        `real_time` (the client's real time at the seed) anchors the
+        branch-3 free-run clock (see the GHOST CLOCK CONTRACT in
+        advance())."""
         self._ship.apply_snapshot(ship_s)
         self._seeded = True
         self._sim_time = snap_time   # 10.11: start the physics clock
-        # 10.11c: phase-lock the free-run clock to the seed. The pose is
-        # at snap_time, so _last_step_time = snap_time (render phase 0).
+        # Anchor the branch-3 free-run clock to the seed. The pose is at
+        # snap_time, so _last_step_time = snap_time (render phase 0).
         self._sim_base = snap_time
         self._real_base = real_time if real_time is not None else 0.0
         self._last_step_time = snap_time
-        # 10.11d: the free-run clock advances at exactly 1x real time (not
-        # the noisy HostTimeEstimator rate EMA, which has std ~0.33 and
-        # makes the ghost's clock drift from the host's clock by ±1-2
-        # ticks between reconciles — the 10.11c bimodal snap). The host's
-        # sim runs at 1x real time overall (0.9999 over the run), so the
-        # ghost's clock should too. The `rate` param is kept for API
-        # compatibility but ignored.
+        # Branch 3 free-runs at exactly 1x real time (the host sim runs at
+        # 1x real time overall). The `rate` param is kept for API
+        # compatibility but ignored (the 10.11d decision dropped the noisy
+        # HostTimeEstimator rate EMA).
         self._rate = 1.0
         # 10.9: start the render interpolation from the seeded pose (no
         # phantom lerp from a pre-seed pose).
@@ -1623,15 +1615,14 @@ class PredictedShip:
             # replay_ticks / lag spikes).
             self._sim_time = max(now, snap_time)
             self._acc = self._sim_time - snap_time
-            # 10.11c: phase-lock the free-run clock to this reconcile.
-            # The clock is _sim_base + (real_time - _real_base); the next
-            # advance() steps the physics when it crosses a tick boundary.
-            # _last_step_time = the pose's time (snap_time, n=0) — the
-            # render interpolation phase is _sim_time - snap_time = L.
+            # Anchor the branch-3 free-run clock to this reconcile (see the
+            # GHOST CLOCK CONTRACT in advance()). _last_step_time = the
+            # pose's time (snap_time, n=0) — the render interpolation phase
+            # is _sim_time - snap_time = L.
             self._sim_base = self._sim_time
             self._real_base = real_time if real_time is not None else 0.0
             self._last_step_time = snap_time
-            # 10.11d: exactly 1x real time (see seed()).
+            # Branch 3 free-runs at exactly 1x real time (see seed()).
             self._rate = 1.0
             return
         # Walk the sim ticks from snap_time to now. `i` is the tick index
@@ -1679,27 +1670,35 @@ class PredictedShip:
         #   normal case and 0 for the lag-spike case.
         self._sim_time = max(now, snap_time + n * TICK)
         self._acc = self._sim_time - (snap_time + n * TICK)
-        # 10.11c: phase-lock the free-run clock to this reconcile. The
-        # clock is _sim_base + (real_time - _real_base); the next advance()
-        # steps the physics when it crosses a tick boundary. _last_step_time
-        # = the pose's time (snap_time + n*TICK, the replay end) — the
-        # render interpolation phase is _sim_time - (snap_time + n*TICK) =
-        # the sub-tick remainder (0 to TICK).
+        # Anchor the branch-3 free-run clock to this reconcile (see the
+        # GHOST CLOCK CONTRACT in advance()). _last_step_time = the pose's
+        # time (snap_time + n*TICK, the replay end) — the render
+        # interpolation phase is _sim_time - (snap_time + n*TICK) = the
+        # sub-tick remainder (0 to TICK).
         self._sim_base = self._sim_time
         self._real_base = real_time if real_time is not None else 0.0
         self._last_step_time = snap_time + n * TICK
-        # 10.11d: exactly 1x real time (see seed()).
+        # Branch 3 free-runs at exactly 1x real time (see seed()).
         self._rate = 1.0
-        # 10.16: step the ghost ONCE more (to snap_time + (n+1)*TICK) so the
-        # render pose is lerp(pose at snap_time+n*TICK, pose at
-        # snap_time+(n+1)*TICK, _acc/TICK) — a smooth interpolation between
-        # two simulated poses, not a pin to the snapshot's pose. The step
-        # loop in advance() never fires (because _sim_time - _last_step_time
-        # = L < TICK), so the ghost was stuck at the snapshot's pose and
-        # each new snapshot (1 tick ahead) caused an 8.67 px snap. Stepping
-        # once here gives the ghost the "next" pose to interpolate to.
-        # Use the latest input (the input at snap_time + n*TICK, the start
-        # of the prediction step — same selection as the replay loop).
+        # KNOWN TEMPORARY WORKAROUND (10.16) — to be replaced by the clock/phase
+        # rewrite (step 4). Step the ghost ONCE more (to snap_time +
+        # (n+1)*TICK) so the render pose is lerp(pose at snap_time+n*TICK,
+        # pose at snap_time+(n+1)*TICK, _acc/TICK) — a smooth interpolation
+        # between two simulated poses, not a pin to the snapshot's pose.
+        # The step loop in advance() never fires (because _sim_time -
+        # _last_step_time = L < TICK), so the ghost was stuck at the
+        # snapshot's pose and each new snapshot (1 tick ahead) caused an
+        # 8.67 px snap. Stepping once here gives the ghost the "next" pose
+        # to interpolate to. Use the latest input (the input at
+        # snap_time + n*TICK, the start of the prediction step — same
+        # selection as the replay loop).
+        #
+        # WHY IT IS A HACK: it advances the PHYSICS pose one tick ahead of
+        # the ghost's own clock (_sim_time), so after a reconcile the pose
+        # is at snap_time+(n+1)*TICK while _sim_time is at snap_time+n*TICK.
+        # test_interpolation had to check render_pose() (not ship.pos)
+        # because of this. The phase rewrite makes the pose and the clock
+        # agree, which removes the need for this extra step.
         t_next = snap_time + n * TICK
         while j + 1 < len(buf) and buf[j + 1][0] <= t_next + 1e-9:
             j += 1
@@ -2164,45 +2163,64 @@ class PredictedShip:
                 host_time=None, rtt_ow=0.0):
         """Advance the ghost by real time `dt` (Session 7.1).
 
-        Feeds `dt` into the fixed-step accumulator and steps the ghost
-        `floor(acc / STEP)` times at exactly `STEP` — the same
-        accumulator pattern the authoritative `Game.update` uses. The
-        ghost therefore integrates at the SIM's rate no matter the
-        display's refresh rate: a 144 Hz monitor yields ~2.4 steps per
-        16.7 ms of sim time on average, never 2.4 steps per display
-        frame. `dt` is clamped to MAX_FRAME_DT first (imported from
-        config, not game.py) so a hiccup can't trigger a catch-up spiral.
+        THE GHOST CLOCK CONTRACT — the single source of truth for how the
+        ghost's sim clock and step grid work. Read this before touching
+        advance / reconcile_rewind / render_pose.
 
-        `inp` is the CURRENT local input; every step this call takes uses
-        it (the host applies the latest received input each tick — the
-        same rule). Returns the number of fixed steps taken (0 when the
-        frame is shorter than one STEP of accumulated time).
+        The ghost is a presentation copy of the local ship. It must sit at
+        the HOST's sim time (not the client's display time) so that when a
+        snapshot lands, the reconcile's pose correction is ~0. Three
+        quantities define its state:
 
-        10.3a: `enemies` (a list of lightweight enemy proxies from the
-        interpolation buffer, see `step`) is fed to every step this call
-        takes, so the ghost's laser target tracks the buffer's enemies
-        and the ghost fires a beam on the same tick the host does. The
-        ghost's local beams are aged + culled each step (mirrors the
-        host's beam ttl).
+          _sim_time        the ghost's current sim time (the time of its
+                           physics pose; advanced by the clock below).
+          _last_step_time  the tick boundary the last physics step ran at
+                           (the step grid). A step runs when
+                           _sim_time - _last_step_time >= TICK.
+          _acc             _sim_time - _last_step_time, in [0, TICK) — the
+                           render interpolation phase. render_pose lerps
+                           _prev -> curr at alpha = _acc / TICK.
 
-        10.1: a DEAD ghost does not advance. The host freezes a dead
-        ship (no movement, no firing — Game._step skips it), so the
-        authoritative snapshot of a dead ship is STATIC. Predicting a
-        static ship with the local input would race ahead and every
-        reconcile yank it back — the reported "freezing and snapping".
-        Freezing the ghost (no advance, no local-bullet steps) matches
-        authority exactly: the snap size is 0 while dead. The accumulator
-        is discarded (not kept) so the first advance after a respawn
-        starts clean from the fresh snapshot.
+        The clock sets _sim_time each call. Three branches, in priority
+        order:
 
-        10.15: `host_time` (the client's HostTimeEstimator) and `rtt_ow`
-        (the RTT-measured one-way latency) drive the ghost's sim clock
-        directly from the HOST's clock: `_sim_time = host_time.now(real_time)
-        + rtt_ow`. The ghost's step grid is now locked to the host's tick
-        grid (not the client's real time), so the phase offset at reconcile
-        is 0 and the snap is 0. When `host_time` is None (tests), the
-        clock falls back to the pre-10.15 behavior (free-run from the
-        last reconcile anchor).
+          1. real_time is None (tests that drive advance with a bare dt
+             and no reconcile): _sim_time += clamped dt — a simple
+             free-run. The only branch the pure ghost-clock tests
+             (n_steps == floor(total/STEP)) use.
+          2. host_time is ready (the LIVE client — host_time is always set
+             on a real client): _sim_time = host_time.now(real_time) +
+             rtt_ow. The ghost's clock IS the host's clock (the
+             HostTimeEstimator's point-slope model) plus the one-way
+             latency. This locks the step grid to the host's tick grid, so
+             the phase offset at the next reconcile is 0 and the
+             reconcile's pose correction is ~0. This is the branch that
+             matters for 2P smoothness.
+          3. real_time given but host_time not ready (the window before the
+             first snapshot, and some tests — e.g. test_10_11c): free-run
+             from the last reconcile anchor, _sim_time = _sim_base +
+             _rate * (real_time - _real_base). _sim_base/_real_base/_rate
+             exist ONLY for this branch; they are NOT the live clock
+             (branch 2 supersedes them once host_time is ready).
+
+        Physics steps run on tick-boundary crossings (the while loop
+        below), so the ghost integrates at the SIM's rate no matter the
+        display's refresh rate. `dt` is clamped to MAX_FRAME_DT so a
+        hiccup can't trigger a catch-up spiral. `inp` is the CURRENT local
+        input; every step this call takes uses it (the host applies the
+        latest received input each tick). Returns the number of fixed
+        steps taken.
+
+        `enemies` (10.3a): a list of lightweight enemy proxies from the
+        interpolation buffer, fed to every step so the ghost's laser
+        target tracks the buffer's enemies and it fires a beam on the same
+        tick the host does.
+
+        A DEAD ghost does not advance (10.1): the host freezes a dead
+        ship, so predicting it with the local input would race ahead and
+        every reconcile yank it back. Freezing matches authority exactly
+        (snap size 0 while dead); the accumulator is discarded so the
+        first advance after a respawn starts clean.
         """
         if self._ship.dead:
             self._acc = 0.0
@@ -2221,42 +2239,24 @@ class PredictedShip:
             # ages out too (no enemies while dead — it can no longer home).
             self.step_local_missiles(min(dt, MAX_FRAME_DT))
             return 0
-        # 10.11c: the PHASE-LOCKED sim clock (smooth, 1x real time).
-        # _sim_time = _sim_base + (real_time - _real_base), where
-        # (_sim_base, _real_base) are set at the last reconcile. The clock
-        # advances at exactly 1x of real time (no free-running accumulator,
-        # no phase drift), so the ghost's sim time stays in PHASE with the
-        # host's sim time (both advance at 1x real time, anchored at the
-        # reconcile). The old accumulator was a STAIRCASE (advancing in
-        # TICK increments triggered by the client's real-time dt), so its
-        # phase drifted relative to the host's tick grid — the ghost
-        # executed 1/2/3 ticks per 2-tick snapshot interval instead of
-        # always 2, and the reconcile corrected the ±1-tick error with an
-        # 8.67px snap (the 10.11b bimodal snap).
-        # `real_time` is the client's current real time (pygame ticks /
-        # 1000). When given (the real client), the clock is the
-        # phase-locked formula, advancing at the host's estimated SIM
-        # RATE (self._rate, from the HostTimeEstimator) — not hardcoded
-        # 1x — so the ghost stays in phase with the host's tick grid even
-        # when the host runs slower than real time (a starved host: the
-        # same-machine-thread test artifact, or a slow production host).
-        # When None (tests, which drive advance() with a bare dt and no
-        # reconcile), the clock advances by the (clamped) frame time —
-        # cumulative, so the ghost-clock tests (which assert
-        # n_steps == floor(total/STEP)) still pass.
+        # The clock (see the GHOST CLOCK CONTRACT in the docstring above).
+        # Branch 1: tests that drive advance with a bare dt, no reconcile.
         if real_time is None:
             self._sim_time += min(dt, MAX_FRAME_DT)
+        # Branch 2: the LIVE client. The ghost's clock IS the host's clock
+        # (the estimator's point-slope model) plus the one-way latency —
+        # the host's sim time at the moment the client is rendering. This
+        # locks the step grid to the host's tick grid, so the phase offset
+        # at the next reconcile is 0 and the reconcile's pose correction is
+        # ~0. The estimator re-anchors on every snapshot arrival, so this
+        # tracks the host's clock without any client-side drift.
         elif host_time is not None and host_time.ready:
-            # 10.15: the ghost's clock IS the host's clock (the estimator's
-            # point-slope model) plus the one-way latency — the host's sim
-            # time at the moment the client is rendering. The ghost's step
-            # grid (_last_step_time) is therefore locked to the host's tick
-            # grid: the phase offset at the next reconcile is 0 (not the
-            # 1-tick drift of the client-real-time free-run clock), so the
-            # reconcile's pose correction is 0 (the 8.67 px bimodal snap is
-            # gone). The estimator re-anchors on every snapshot arrival, so
-            # this tracks the host's clock without any client-side drift.
             self._sim_time = host_time.now(real_time) + rtt_ow
+        # Branch 3: real_time given but host_time not ready (the window
+        # before the first snapshot, and some tests — e.g. test_10_11c).
+        # Free-run from the last reconcile anchor. _sim_base/_real_base/
+        # _rate exist ONLY for this branch; they are NOT the live clock
+        # (branch 2 supersedes them once host_time is ready).
         else:
             self._sim_time = self._sim_base + self._rate * (
                 real_time - self._real_base)

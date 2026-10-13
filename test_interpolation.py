@@ -1150,6 +1150,53 @@ def main():
               f"{est3_val:.3f} vs newest stamp {newest3:.3f} (lead "
               f"{lead3 * 1000:.0f} ms): the estimate outran the data")
 
+    # (d) 11.x SMOOTH render clock (now_smooth): the render's host clock.
+    # The raw now() is noisy frame-to-frame (the anchor re-anchors on every
+    # snapshot arrival, the rate wobbles, the MAX_LEAD cap freezes-then-
+    # jumps), and the ghost's render pose is `physics_pose + v * _acc` with
+    # _acc driven by this clock — so a noisy clock is a wobbling ship.
+    # now_smooth must be MONOTONIC (never backward) and have BOUNDED
+    # per-frame deltas (no freeze-then-jump), while still tracking the
+    # host's clock. Feed steady 60 Hz samples + a hiccup (a 100 ms gap),
+    # then query at a 62.5 Hz render rate.
+    est4 = HostTimeEstimator()
+    t = 0.0
+    render_t = 0.0
+    prev = None
+    max_delta = 0.0
+    backward = 0
+    for i in range(400):
+        # A hiccup at i == 200: the host's next snapshot is 100 ms late
+        # (a stall), so the raw estimate's anchor lags -> a large residual.
+        if i == 200:
+            t += 0.100
+        else:
+            t += est_interval
+        est4.record(t, 1.0 + t)  # 1x host, 1.0 s offset
+        # Render at 62.5 Hz: query now_smooth every 16 ms.
+        while render_t < t + 0.05:
+            render_t += 0.016
+            v = est4.now_smooth(render_t)
+            if prev is not None:
+                d = v - prev
+                if d < -1e-9:
+                    backward += 1
+                max_delta = max(max_delta, abs(d))
+            prev = v
+    # The clock must never go backward and its per-frame delta must be
+    # bounded (a smooth 62.5 Hz frame advances ~16 ms; the correction adds
+    # at most SMOOTH_MAX_JUMP, so the bound is generous).
+    smooth_ok = backward == 0 and max_delta < 0.040
+    if smooth_ok:
+        print(f"PASS: host time estimator — smooth render clock monotonic "
+              f"(0 backward) + bounded per-frame delta "
+              f"(max {max_delta * 1000:.1f} ms < 40 ms) through a 100 ms hiccup")
+    else:
+        ok = False
+        print(f"FAIL: host time estimator — smooth render clock: "
+              f"{backward} backward frames, max per-frame delta "
+              f"{max_delta * 1000:.1f} ms (want 0 backward, < 40 ms)")
+
     # --- (h) full remote rendering (Session 7.2): the buffer now carries
     # what the client needs to draw REAL remote enemies (angle, tag, vel,
     # id) and ALL projectiles (the D3 + D4 defects). The alpha/turnover

@@ -208,8 +208,16 @@ class HostTimeEstimator:
     `now()` remains available for diagnostics (the 7.8 overlay).
     """
 
-    RATE_ALPHA = 0.5
+    RATE_ALPHA = 0.1
     RATE_MIN, RATE_MAX = 0.4, 1.5
+    # 11.x: the SMOOTH render clock (now_smooth) — see its docstring.
+    # SMOOTH_ALPHA is the per-frame correction rate toward the raw (capped)
+    # estimate: a slow pull, not a snap, so a noisy anchor can't jerk the
+    # render. SMOOTH_MAX_JUMP bounds the per-frame correction (s) so a single
+    # large residual (a hiccup / a burst after a stall) can't yank the clock
+    # more than this in one frame.
+    SMOOTH_ALPHA = 0.05
+    SMOOTH_MAX_JUMP = 0.02
     # Session 7.9: no OFFSET_ALPHA — the offset is no longer an EMA of
     # `host_time - rate * local_time` (that form's leverage made the error
     # grow over the session). The offset is the point-slope anchor itself
@@ -224,6 +232,11 @@ class HostTimeEstimator:
         self._anchor = None  # (local_time, host_time) of the newest sample
         self._rate = 1.0     # EMA host sim rate (local-time units)
         self._last_jitter = None  # Session 7.5a: per-arrival jitter sample
+        # 11.x: the smooth render clock's state (see now_smooth). _smooth is
+        # the smoothed host-time estimate; _smooth_t is the local time it
+        # was last advanced to (None until the first now_smooth call).
+        self._smooth = None
+        self._smooth_t = None
 
     @property
     def ready(self):
@@ -344,6 +357,63 @@ class HostTimeEstimator:
             return None
         t_anchor, h_anchor = self._anchor
         return h_anchor + self._rate * (local_time - t_anchor)
+
+    def now_smooth(self, local_time):
+        """The SMOOTH host-time estimate (11.x) — the render clock.
+
+        `now()` (the raw point-slope estimate) is correct on average but
+        NOISY frame-to-frame: the anchor re-anchors on every snapshot
+        arrival (~43 Hz on a real LAN, not 60), the rate EMA wobbles, and
+        the MAX_LEAD cap freezes the estimate at `newest + MAX_LEAD` and
+        then jumps it when a new snapshot releases it. The ghost's render
+        pose is `physics_pose + v * _acc`, and `_acc` is driven by this
+        clock — so every wobble in the clock is a wobble in the rendered
+        ship. Measured on a real 2P session: 15% of frames the clock
+        FROZE (cap binding), 10% it JUMPED (cap release / re-anchor), 1.5%
+        it went BACKWARD — the "ship jumps even while coasting" symptom.
+
+        This is the render's clock instead. It advances at the smoothed
+        rate (1x real time in steady state) and applies a SLOW, bounded
+        correction toward the raw capped estimate (`now`), clamped so it
+        never moves more than SMOOTH_MAX_JUMP per frame and never goes
+        BACKWARD (monotonic). The result is a clock that:
+          - tracks the host's clock (the slow correction pulls it to the
+            data, so it can't drift away over a session);
+          - is smooth (a noisy anchor can't jerk it — the correction is a
+            slow pull, and the per-frame jump is bounded);
+          - is monotonic (no backward jumps — the render never reverses).
+        The raw `now()` / `now_raw()` are unchanged (diagnostics + the
+        existing estimator tests); only the RENDER reads this.
+        """
+        if self._anchor is None:
+            return None
+        target = self.now(local_time)  # the raw capped estimate
+        if self._smooth is None:
+            # First call: seed on the raw estimate (no correction yet).
+            self._smooth = target
+            self._smooth_t = local_time
+            return self._smooth
+        prev = self._smooth
+        # Advance at the smoothed rate (1x real time in steady state) —
+        # this is the smooth part. `local_time` is monotonic, so this
+        # never goes backward.
+        dt = max(0.0, local_time - self._smooth_t)
+        self._smooth += self._rate * dt
+        self._smooth_t = local_time
+        # Slow, bounded correction toward the raw estimate (the tracking
+        # part). The residual is small in steady state (the anchor is
+        # recent), so this is a gentle pull; on a hiccup it's large, so
+        # the clamp keeps it to a bounded per-frame nudge.
+        err = target - self._smooth
+        corr = self.SMOOTH_ALPHA * err
+        corr = max(-self.SMOOTH_MAX_JUMP, min(self.SMOOTH_MAX_JUMP, corr))
+        self._smooth += corr
+        # Monotonic: never go backward (a backward clock reverses the
+        # render). The advance is non-negative; the correction can be
+        # negative, so clamp the net to >= the previous value.
+        if self._smooth < prev:
+            self._smooth = prev
+        return self._smooth
 
 
 class LatencyTracker:
@@ -2310,7 +2380,17 @@ class PredictedShip:
             # whether the MAX_LEAD cap is binding (now_raw > now).
             _ht_raw = host_time.now_raw(real_time)
             _ht_cap = host_time.now(real_time)
-            self._sim_time = _ht_cap + rtt_ow
+            # 11.x: the RENDER clock is the SMOOTH estimate (now_smooth),
+            # not the raw capped one. The raw estimate is noisy frame-to-
+            # frame (anchor re-anchors ~43 Hz, the rate wobbles, the cap
+            # freezes-then-jumps 18% of frames) — and the render pose is
+            # `physics_pose + v * _acc`, with _acc driven by this clock, so
+            # every wobble in the raw clock is a wobble in the rendered
+            # ship (measured: 15% freeze / 10% jump / 1.5% backward frames).
+            # now_smooth advances at the smoothed rate + a slow bounded
+            # correction toward the raw estimate, and is monotonic — so the
+            # render clock is smooth while still tracking the host's clock.
+            self._sim_time = host_time.now_smooth(real_time) + rtt_ow
         # Branch 3: real_time given but host_time not ready (the window
         # before the first snapshot, and some tests — e.g. test_10_11c).
         # Free-run from the last reconcile anchor. _sim_base/_real_base/

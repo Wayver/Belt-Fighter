@@ -333,6 +333,18 @@ class HostTimeEstimator:
             return newest + self.MAX_LEAD
         return est
 
+    def now_raw(self, local_time):
+        """The UNCAPPED estimate (11.x diagnostics): same as `now()` but
+        without the MAX_LEAD cap. Exposed so the ghost-clock
+        instrumentation (ghost_clock.csv) can see whether the cap is
+        binding — if `now_raw` is ahead of `now` by the cap, the
+        estimate is being held at `newest + MAX_LEAD`. None before the
+        first snapshot."""
+        if self._anchor is None:
+            return None
+        t_anchor, h_anchor = self._anchor
+        return h_anchor + self._rate * (local_time - t_anchor)
+
 
 class LatencyTracker:
     """The adaptive interpolation delay (Session 7.5a).
@@ -1249,6 +1261,15 @@ class PredictedShip:
     # 60 Hz input sampling is ~120 entries).
     INPUT_BUFFER_MAX = 2.0
 
+    # 11.x diagnostics: an optional callable the game loop sets (when
+    # debug_net is on) to receive per-call ghost-clock records. Signature:
+    # fn(kind, rec) where kind is 'ADV' (one per advance() call) or
+    # 'REC' (one per reconcile_rewind() call) and rec is a dict of
+    # plain floats/ints. None by default (tests + the host's ghost): the
+    # hook is a no-op. The client loop (run_client) sets it to a writer
+    # that appends to ghost_clock.csv.
+    diag_sink = None
+
     def __init__(self, hull=None, loadout=None, local_index=0):
         # A self-contained Ship: __init__ builds components/thrusters/
         # weapons/shield/sensors/collision from the hull+loadout and holds
@@ -1595,6 +1616,8 @@ class PredictedShip:
         sensor state forward (the host never saw the client's V/G/T).
         """
         self._capture_client_sensor_state()
+        # 11.x diagnostics: the pre-reconcile clock state (the REC record).
+        _pre_sim, _pre_last = self._sim_time, self._last_step_time
         # 10.11: the replay (step, not advance) moves the physics state but
         # does NOT touch `_acc` or `_sim_time`. After the replay, the
         # physics clock is set to max(now, snap_time + n*TICK) and the
@@ -1647,6 +1670,13 @@ class PredictedShip:
             self._last_step_time = snap_time
             # Branch 3 free-runs at exactly 1x real time (see seed()).
             self._rate = 1.0
+            # 11.x diagnostics: the no-replay REC record.
+            self._diag('REC', {'real_time': real_time, 'snap_time': snap_time,
+                                'now': now, 'n': 0,
+                                'pre_sim': _pre_sim, 'pre_last': _pre_last,
+                                'post_sim': self._sim_time,
+                                'post_last': self._last_step_time,
+                                'post_acc': self._acc})
             return
         # Walk the sim ticks from snap_time to now. `i` is the tick index
         # (0 = snap_time itself, the snapshot's own tick — already applied
@@ -1703,6 +1733,13 @@ class PredictedShip:
         self._last_step_time = snap_time + n * TICK
         # Branch 3 free-runs at exactly 1x real time (see seed()).
         self._rate = 1.0
+        # 11.x diagnostics: the replayed REC record.
+        self._diag('REC', {'real_time': real_time, 'snap_time': snap_time,
+                            'now': now, 'n': n,
+                            'pre_sim': _pre_sim, 'pre_last': _pre_last,
+                            'post_sim': self._sim_time,
+                            'post_last': self._last_step_time,
+                            'post_acc': self._acc})
         # 10.16 pre-step REMOVED (10.17). It advanced the PHYSICS pose one tick
         # ahead of the ghost's own clock (_sim_time), so after a reconcile
         # the pose was at snap_time+(n+1)*TICK while _sim_time was at
@@ -2242,9 +2279,22 @@ class PredictedShip:
             # 10.3b: a missile in flight at the moment of death coasts +
             # ages out too (no enemies while dead — it can no longer home).
             self.step_local_missiles(min(dt, MAX_FRAME_DT))
+            self._diag('ADV', {'real_time': real_time,
+                                'pre_sim': self._sim_time,
+                                'pre_last': self._last_step_time,
+                                'pre_acc': self._acc,
+                                'ht_raw': None, 'ht_cap': None,
+                                'rtt_ow': rtt_ow, 'clock': None,
+                                'steps': 0,
+                                'post_last': self._last_step_time,
+                                'post_acc': self._acc, 'dead': 1})
             return 0
+        # 11.x diagnostics: the pre-call clock state (the ADV record).
+        _pre_sim, _pre_last, _pre_acc = (self._sim_time, self._last_step_time,
+                                         self._acc)
         # The clock (see the GHOST CLOCK CONTRACT in the docstring above).
         # Branch 1: tests that drive advance with a bare dt, no reconcile.
+        _ht_raw = _ht_cap = None
         if real_time is None:
             self._sim_time += min(dt, MAX_FRAME_DT)
         # Branch 2: the LIVE client. The ghost's clock IS the host's clock
@@ -2255,7 +2305,12 @@ class PredictedShip:
         # ~0. The estimator re-anchors on every snapshot arrival, so this
         # tracks the host's clock without any client-side drift.
         elif host_time is not None and host_time.ready:
-            self._sim_time = host_time.now(real_time) + rtt_ow
+            # 11.x diagnostics: capture the estimator's UNCAPPED estimate
+            # (now_raw) alongside the capped one (now) so the CSV can show
+            # whether the MAX_LEAD cap is binding (now_raw > now).
+            _ht_raw = host_time.now_raw(real_time)
+            _ht_cap = host_time.now(real_time)
+            self._sim_time = _ht_cap + rtt_ow
         # Branch 3: real_time given but host_time not ready (the window
         # before the first snapshot, and some tests — e.g. test_10_11c).
         # Free-run from the last reconcile anchor. _sim_base/_real_base/
@@ -2286,7 +2341,30 @@ class PredictedShip:
         # The render interpolation phase: the time since the last step
         # (0 to TICK). render_pose lerps _prev -> curr at alpha = _acc/TICK.
         self._acc = self._sim_time - self._last_step_time
+        # 11.x diagnostics: the post-call ADV record (one per advance()).
+        self._diag('ADV', {'real_time': real_time,
+                            'pre_sim': _pre_sim, 'pre_last': _pre_last,
+                            'pre_acc': _pre_acc,
+                            'ht_raw': _ht_raw, 'ht_cap': _ht_cap,
+                            'rtt_ow': rtt_ow, 'clock': self._sim_time,
+                            'steps': n,
+                            'post_last': self._last_step_time,
+                            'post_acc': self._acc, 'dead': 0})
         return n
+
+    def _diag(self, kind, rec):
+        """11.x diagnostics: forward one clock record to the class-level
+        `diag_sink` (a no-op when it is None — tests + the host's ghost).
+        The sink is set by the client loop only while debug_net is on.
+
+        Read via the CLASS (`PredictedShip.diag_sink`), NOT `self.diag_sink`:
+        a function stored as a class attribute is a descriptor, so instance
+        access (`self.diag_sink`) would bind it as a method and call it with
+        `self` as a third argument (TypeError). Class access returns the raw
+        function."""
+        sink = PredictedShip.diag_sink
+        if sink is not None:
+            sink(kind, rec)
 
     def _render_pre_step(self):
         """10.18: compute the RENDER-ONLY pre-step pose (the sawtooth fix).

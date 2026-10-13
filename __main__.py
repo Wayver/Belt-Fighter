@@ -609,6 +609,48 @@ def _log_net_debug(game, inp):
     f.flush()
 
 
+def _make_ghost_clock_writer(path):
+    """11.x diagnostics: open ghost_clock.csv and return (file, sink).
+
+    The `sink` is set as `PredictedShip.diag_sink`; the ghost calls it once
+    per `advance()` (kind='ADV') and once per `reconcile_rewind()`
+    (kind='REC'). One row per call, so the CSV captures the per-frame clock
+    trace that net_debug.csv (logged once per reconcile) cannot: the
+    estimator's UNCAPPED vs capped `now`, the computed ghost clock, the
+    pre/post `_sim_time`/`_last_step_time`, and whether a step fired. This
+    is what resolves the "why is advance_steps 0 so much" question — it
+    shows, for each zero-step interval, exactly where the clock was and
+    whether the MAX_LEAD cap bound.
+
+    Columns are the UNION of the ADV and REC fields (empty when a field
+    does not apply to that record kind).
+    """
+    f = open(path, "w", newline="")
+    f.write("kind,real_time,pre_sim,pre_last,pre_acc,ht_raw,ht_cap,rtt_ow,"
+            "clock,steps,post_last,post_acc,dead,snap_time,now,n,post_sim\n")
+
+    def _fmt(v):
+        if v is None:
+            return ""
+        if isinstance(v, int):
+            return str(v)
+        return "%.4f" % v
+
+    def sink(kind, rec):
+        f.write("%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" % (
+            kind,
+            _fmt(rec.get('real_time')), _fmt(rec.get('pre_sim')),
+            _fmt(rec.get('pre_last')), _fmt(rec.get('pre_acc')),
+            _fmt(rec.get('ht_raw')), _fmt(rec.get('ht_cap')),
+            _fmt(rec.get('rtt_ow')), _fmt(rec.get('clock')),
+            _fmt(rec.get('steps')), _fmt(rec.get('post_last')),
+            _fmt(rec.get('post_acc')), _fmt(rec.get('dead')),
+            _fmt(rec.get('snap_time')), _fmt(rec.get('now')),
+            _fmt(rec.get('n')), _fmt(rec.get('post_sim'))))
+        f.flush()
+    return f, sink
+
+
 def run_client(screen, font, big_font, clock, sfx, menu, seed,
                light_tex, fog_surf, light_surf):
     """Join a 2P game (Session 6.6).
@@ -726,6 +768,13 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
     game._dbg_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                       "net_debug.csv")
     game._dbg_log_f = None
+    # 11.x diagnostics: the per-frame ghost-clock trace (F3-toggled, like
+    # net_debug.csv). Opened when debug_net turns on (below); closed on
+    # every exit path (the finally-style block after the loop).
+    game._ghost_clock_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "ghost_clock.csv")
+    game._ghost_clock_f = None
+    game._ghost_clock_sink = None
     # Session 7.10 (Chunk 1): per-frame frame-rate telemetry. The 7.8 CSV is
     # written once per reconcile (10 Hz), so it can't see individual frames —
     # the render-point drift could be a low frame rate OR occasional hiccup
@@ -794,6 +843,18 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
         # 10.3b missile telemetry: rides the same F3 toggle as the net
         # debug overlay (client only — the ghost never runs on the host).
         missile_telemetry.set_enabled(game.debug_net)
+        # 11.x diagnostics: open/close ghost_clock.csv on the F3 edge and
+        # set/clear the ghost's diag_sink. Opening on the rising edge
+        # (not every frame) keeps the file fresh per capture; clearing the
+        # sink on the falling edge stops the per-frame write when F3 is off.
+        if game.debug_net and game._ghost_clock_f is None:
+            game._ghost_clock_f, game._ghost_clock_sink = (
+                _make_ghost_clock_writer(game._ghost_clock_path))
+            PredictedShip.diag_sink = game._ghost_clock_sink
+        elif not game.debug_net and game._ghost_clock_f is not None:
+            game._ghost_clock_f.close()
+            game._ghost_clock_f = None
+            PredictedShip.diag_sink = None
         now = pygame.time.get_ticks() / 1000.0
         # 10.6 V/G/T (option A): route T/V/G/R/F through the client command
         # sink (T/V/G -> the ghost; R/F -> the client's existing behavior).
@@ -965,6 +1026,12 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
     if game._dbg_log_f is not None:
         game._dbg_log_f.close()
         game._dbg_log_f = None
+    # 11.x diagnostics: close the ghost-clock CSV + clear the sink on every
+    # exit path (ESC/QUIT, disconnect).
+    if getattr(game, "_ghost_clock_f", None) is not None:
+        game._ghost_clock_f.close()
+        game._ghost_clock_f = None
+    PredictedShip.diag_sink = None
     # 10.3b: flush + close the missile telemetry CSV on every exit path.
     missile_telemetry.close()
     # Session 8.2: stop the worker (join its thread) BEFORE closing the

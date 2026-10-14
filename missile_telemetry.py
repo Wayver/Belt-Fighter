@@ -1,38 +1,28 @@
-"""10.3b missile telemetry: capture the missile-id lifecycle on the CLIENT
-so the double-draw (two missiles from one fire) can be diagnosed offline.
+"""Missile-id lifecycle telemetry, CLIENT-SIDE ONLY (the host never runs the
+ghost, so only the joining peer writes the file).
 
-Why this exists
----------------
-The client's prediction ghost fires its OWN missiles (GhostMissiles) and the
-host's snapshot carries a BUFFER copy of the same missile. They are supposed
-to be deduped by a shared id — (player_index, missile_seq) — so only ONE is
-drawn. When the bug appears (two missiles from one fire: one hits + explodes,
-the other flies through), the id match is failing somewhere in the chain:
+The ghost fires its own missiles; the host's snapshot carries a buffer copy
+of the same missile. They are deduped by a shared id — (player_index,
+missile_seq) — so only one is drawn. When a double-draw appears, the id match
+is failing somewhere in the chain:
 
-    ghost fire  ->  reconcile (seq resync + rewind replay)  ->  handback
-    (FIRE)        (RECONCILE)                                 (HANDBACK)
-                                                                        |
-                                                            predicted_view (DEDUP)
+    ghost fire (FIRE) -> reconcile (RECONCILE) -> handback (HANDBACK)
+    -> predicted_view (DEDUP)
 
-This module logs those four events so the failure point is VISIBLE in the CSV
-instead of guessed at. It is CLIENT-SIDE ONLY: the host never runs the ghost,
-so only the joining peer writes the file.
+This module logs those four events to `missile_debug.csv` (next to this
+module) so the failure point is visible instead of guessed at.
 
-Enable
-------
-The client loop calls `set_enabled(game.debug_net)` each frame (F3 toggles
-`debug_net`). While enabled, one CSV row is appended per event and flushed
-immediately (so the file can be grabbed live). The file is `missile_debug.csv`
-next to this module.
+Enable: the client loop calls `set_enabled(game.debug_net)` each frame (F3
+toggles `debug_net`). While enabled, one CSV row is appended per event and
+flushed immediately (so the file can be grabbed live).
 
-Reading the CSV
----------------
-`t` is the wall clock (the join key — all rows are on the same client machine,
-so `t` orders the whole lifecycle). `sim_t` is the host sim clock where known
-(RECONCILE = the snapshot's stamp; DEDUP = the client's host-clock estimate)
-for cross-machine correlation; empty where the ghost has no clock (FIRE,
-HANDBACK). Ids are serialized as `player:seq` lists joined by `|` (e.g.
-`1:0|1:1`). The `event` column discriminates the row's populated fields.
+Reading the CSV: `t` is the wall clock (the join key — all rows are on the
+same client machine, so `t` orders the whole lifecycle). `sim_t` is the host
+sim clock where known (RECONCILE = the snapshot's stamp; DEDUP = the
+client's host-clock estimate) for cross-machine correlation; empty where the
+ghost has no clock (FIRE, HANDBACK). Ids are serialized as `player:seq` lists
+joined by `|` (e.g. `1:0|1:1`). The `event` column discriminates the row's
+populated fields.
 """
 import os
 import time

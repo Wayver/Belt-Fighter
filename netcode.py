@@ -1,15 +1,15 @@
-"""Remote-interpolation helpers (Session 5a; id-based matching 5b-1).
+"""Remote-interpolation helpers.
 
 The authoritative peer sends a `Game.snapshot()` every
 `config.SNAPSHOT_INTERVAL` ticks. The remote peer does NOT run the sim for
 remote entities — it renders BETWEEN snapshots by interpolating, instead of
 teleporting each time a snapshot lands.
 
-`PredictedShip` (Session 5b.4a) is the client-side prediction ghost: the
-remote peer steps a private Ship with its OWN input and reconciles it to
-the authoritative ship snapshot when one lands, so the player's own ship
-does not feel the INTERP_DELAY. Remote entities (other ship, enemies,
-asteroids) keep using `SnapshotBuffer`.
+`PredictedShip` is the client-side prediction ghost: the remote peer steps
+a private Ship with its OWN input and reconciles it to the authoritative
+ship snapshot when one lands, so the player's own ship does not feel the
+INTERP_DELAY. Remote entities (other ship, enemies, asteroids) keep using
+`SnapshotBuffer`.
 
 `interp_positions()` is the core: a PURE function of two snapshots + alpha.
 It reads plain data and returns plain data. It must never touch sim state —
@@ -18,42 +18,40 @@ Entities are matched by IDENTITY (enemies by ship id, asteroids by rock
 id) so interpolation survives entity turnover — see `interp_positions`
 for the membership rules.
 
-Player ships carry their ANGLE too (Session 6.8): the buffer returns
-(x, y, angle, dead, shield_dump, shield_clock, flame_mags) per ship, with
-the angle lerp'd the same way `Ship.sync_render` does (the wrapped delta,
-via `lerp_angle`), so the remote peer can draw the remote hull at its
-interpolated orientation instead of a dot. The `dead` flag (Session
-10.1) lets the remote peer skip a dead ship (it disappears until it
-respawns) and spawn a
-client-side explosion on the alive->dead transition. `flame_mags`
-(10.6) is the per-thruster exhaust (current snapshot, not lerp'd) so the
-remote player ship's exhaust renders (parity with the host).
+The buffer returns (x, y, angle, dead, shield_dump, shield_clock,
+flame_mags) per ship, with the angle lerp'd the same way
+`Ship.sync_render` does (the wrapped delta, via `lerp_angle`), so the
+remote peer can draw the remote hull at its interpolated orientation
+instead of a dot. The `dead` flag lets the remote peer skip a dead ship
+(it disappears until it respawns) and spawn a client-side explosion on
+the alive->dead transition. `flame_mags` is the per-thruster exhaust
+(current snapshot, not lerp'd) so the remote player ship's exhaust
+renders (parity with the host).
 
-Session 7.2 (full remote rendering): enemies carry their ANGLE, TAG,
-VELOCITY, and ID too — (tag, x, y, angle, vx, vy, id) — so the remote
-peer can draw each enemy as its REAL hull (the hull is fixed on both
-peers by construction: ENEMY_HULL/MOTE_HULL + fixed loadouts) at its
-interpolated orientation, build lightweight targeting proxies
-(lead_point needs pos + vel), and track a specific enemy across frames
-(by id — enemies churn, so there is no stable index like ship 0). And ALL projectiles are interpolated:
-snapshot indices 2 (player bullets), 3 (enemy bullets), 4 (missiles)
-come back under the 'bullets' key as (x, y, vx, vy, kind, owner,
-boost) entries, so the remote peer draws real bullets/missiles instead
-of nothing (the D3 defect). Projectiles are matched by PREDICTED
-POSITION, not index — see `_match_bullets` for why index matching
-(sliding lists) is wrong.
+Enemies carry their ANGLE, TAG, VELOCITY, and ID too — (tag, x, y, angle,
+vx, vy, id) — so the remote peer can draw each enemy as its REAL hull
+(the hull is fixed on both peers by construction: ENEMY_HULL/MOTE_HULL +
+fixed loadouts) at its interpolated orientation, build lightweight
+targeting proxies (lead_point needs pos + vel), and track a specific
+enemy across frames (by id — enemies churn, so there is no stable index
+like ship 0). And ALL projectiles are interpolated: snapshot indices 2
+(player bullets), 3 (enemy bullets), 4 (missiles) come back under the
+'bullets' key as (x, y, vx, vy, kind, owner, boost) entries, so the
+remote peer draws real bullets/missiles instead of nothing. Projectiles
+are matched by PREDICTED POSITION, not index — see `_match_bullets` for
+why index matching (sliding lists) is wrong.
 
 Snapshot layout (see Game.snapshot in game.py):
-    [0] players_s tuple of one Ship.snapshot() per player (Session 6.1):
+    [0] players_s tuple of one Ship.snapshot() per player:
                   ship_s = pos.x=[0], pos.y=[1], vel.x=[2], vel.y=[3],
                   angle=[4], ...
     [1] enemies_s tuple of (tag, e_s); e_s = AIEnemy.snapshot() =
                   (ship_s, hp, id, acc_x, acc_y) -> enemy pos = e_s[0][0], e_s[0][1]
     [2] bullets_s, [3] enemy_bullets_s, [4] missiles_s
                   b_s = (pos.x, pos.y, vel.x, vel.y, owner, life, id)
-                       (10.7: id = (player_index, bullet_seq), the
-                       client's dedup key; enemy bullets keep the 6-field
-                       form — the ghost only dedups its OWN shots)
+                       (id = (player_index, bullet_seq), the client's
+                       dedup key; enemy bullets keep the 6-field form —
+                       the ghost only dedups its OWN shots)
                   m_s = (pos.x, pos.y, vel.x, vel.y, owner, life, boost,
                          target_id, id)
     [5] asteroids_s  tuple of Asteroid.snapshot() =
@@ -76,10 +74,8 @@ from .ship import Ship
 from .bullets import Bullet
 from . import missile_telemetry as _mtel
 
-# 10.3a: the ghost's beam visuals age out at the host's beam ttl
-# (Game._step: `self.beams = [b for b in self.beams if b[4] < b[5]]`
-# with b[5] = 0.15). Mirrored here so the client's local beams fade on
-# the same clock as the host's.
+# The ghost's beam visuals age out at the host's beam ttl, so the
+# client's local beams fade on the same clock as the host's.
 BEAM_TTL = 0.15
 
 __all__ = ["interp_positions", "lerp", "lerp_angle", "SnapshotBuffer",
@@ -90,13 +86,10 @@ __all__ = ["interp_positions", "lerp", "lerp_angle", "SnapshotBuffer",
 def lerp(a, b, t):
     """Linear interpolation: a + (b - a) * t.
 
-    Exact at the endpoints: t==0 returns a and t==1 returns b *by
-    identity*, not by arithmetic. a + (b - a) * 1.0 is not always
-    bit-identical to b in IEEE-754 (b - a rounds, then adding a rounds
-    again), so the shortcut keeps alpha=0/1 lossless. That matters for
-    netcode: when a snapshot lands and becomes the boundary of the
-    interpolation window, the render must sit EXACTLY on the snapshot,
-    not ~1e-13 off (which would read as a tiny pop every SNAPSHOT_INTERVAL).
+    Exact at the endpoints by identity: a + (b - a) * 1.0 is not always
+    bit-identical to b in IEEE-754, so the render must sit EXACTLY on
+    the snapshot when a snapshot becomes the window boundary (a ~1e-13
+    offset reads as a tiny pop every SNAPSHOT_INTERVAL).
     """
     if t == 0.0:
         return a
@@ -107,16 +100,13 @@ def lerp(a, b, t):
 
 def lerp_angle(a0, a1, t):
     """Interpolate between two RAW (unbounded) angles by lerp-ing the
-    WRAPPED delta — exactly what Ship.sync_render does. The raw angles may
-    be far outside [-pi, pi] (the sim's angle accumulates forever; Session 4
-    fix), so the delta is wrapped to [-pi, pi] first; the result stays
-    anchored on a0, so it inherits a0's unwrapped offset. Never lerp the
-    raw angles directly."""
+    WRAPPED delta — exactly what Ship.sync_render does. The sim's angle
+    accumulates forever, so the delta is wrapped to [-pi, pi] first; the
+    result stays anchored on a0, so it inherits a0's unwrapped offset.
+    Never lerp the raw angles directly."""
     # Exact at the endpoints (same IEEE-754 rationale as lerp): a0 + da * 1.0
-    # is not always bit-identical to a1 (da rounds, then adding a0 rounds
-    # again), so the render would sit ~1 ulp off the snapshot at alpha=1 —
-    # a tiny pop every SNAPSHOT_INTERVAL (Session 7.2, caught by the
-    # turnover battery's endpoint-exactness check).
+    # is not always bit-identical to a1, so the render would sit ~1 ulp off
+    # the snapshot at alpha=1 — a tiny pop every SNAPSHOT_INTERVAL.
     if t == 0.0:
         return a0
     if t == 1.0:
@@ -126,71 +116,42 @@ def lerp_angle(a0, a1, t):
 
 
 class HostTimeEstimator:
-    """The client's estimate of the AUTHORITATIVE peer's sim clock
-    (Session 7.1).
+    """The client's estimate of the AUTHORITATIVE peer's sim clock.
 
     The client never runs the sim, so it has no sim clock of its own — but
-    the ghost's reconcile bookkeeping (and, before 7.5b, the render point)
-    need one. Deriving it from the LOCAL wall clock
-    (the 6.6 `sim_time += dt` fix) is wrong in principle: the host's
-    sim_time is a fixed-step accumulator and the client's frame dt is the
-    display clock, so two independent clocks drift and the render point
-    wanders inside the interpolation window (stutter).
-
-    Instead: each snapshot is stamped with the host's sim time at send and
-    arrives at a known local time, so every arrival is a sample of the
-    mapping from local time to host sim time. This class fits that mapping
-    as a line in POINT-SLOPE form, anchored on the NEWEST sample
-    (Session 7.9):
+    the ghost's clock needs one. Each snapshot is stamped with the host's
+    sim time at send and arrives at a known local time, so every arrival is
+    a sample of the mapping from local time to host sim time. This class
+    fits that mapping as a line in POINT-SLOPE form, anchored on the
+    NEWEST sample:
 
         host_time ≈ h_anchor + rate * (local_time - t_anchor)
 
-    where (t_anchor, h_anchor) is the newest recorded sample's
-    (local_time, stamp) and `rate` is an EMA of the host's sim rate in
-    local-time units (one sample per snapshot, 10 Hz). In steady state this
-    is the same line as the 7.1 affine fit `A + rate * local_time` — but
-    the offset is now a small DELTA (the time since the newest sample, at
-    most a few snapshot intervals), not an absolute intercept.
-
-    Why point-slope, not the 7.1 absolute intercept `A + rate * local_time`?
-    The 7.1 form computed `A = host_time - rate * local_time` — a difference
-    of two LARGE numbers (local_time is pygame ticks since init, which grows
-    unboundedly: 86 s in the 7.8 log). Any small error in `rate` is then
-    amplified by that large local_time (a 0.01 rate error at local_time 86 s
-    is a 0.86 s offset error), so the estimate's error GREW over the session
-    (the 7.8 log: |est - newest| went 0.45 s -> 1.0 s on the 4090, 0.69 s ->
-    1.24 s on the Mac). Re-anchoring to the newest sample makes the offset a
-    small delta, so the estimate stays well-conditioned for the WHOLE session
-    — the leverage is bounded by the time since the newest sample, not by the
-    session length.
+    The offset is a small DELTA (the time since the newest sample), not an
+    absolute intercept — an intercept `A + rate * local_time` amplifies any
+    rate error by the unbounded local_time, so the estimate's error would
+    grow over the session. Re-anchoring to the newest sample keeps the
+    estimate well-conditioned for the whole session.
 
     `rate` — the host's sim rate in local-time units, from consecutive
-    samples (Δhost/Δlocal). A healthy 60 FPS host is 1.0; a struggling host
-    (loop slower than the dt clamp) simulates slower than real time, and the
-    estimate must follow that or it drifts away from the host's clock.
-    Clamped to [RATE_MIN, RATE_MAX] as a sanity bound. (The rate EMA is
-    unchanged from 7.1 — only the offset representation was re-anchored.)
+    samples (Δhost/Δlocal). A healthy host is 1.0; a struggling host
+    simulates slower than real time, and the estimate must follow that or
+    it drifts away from the host's clock. Clamped to [RATE_MIN, RATE_MAX].
 
-    `now(local_time)` = h_anchor + rate * (local_time - t_anchor) — the
-    host's own clock as carried by the wire, not the display's — CAPPED at
-    the newest sample's stamp + MAX_LEAD (one snapshot interval). The cap
-    anchors the estimate on the DATA, not the model: if the host starves (a
-    contended loop simulating at 0.1x real time), samples arrive a full
-    second apart and extrapolating at the clamped rate would run the estimate
-    far ahead of the data, making the render point clamp-stutter. Capped, the
-    estimate holds within one snapshot interval of the newest stamp, so the
-    render point (sim_time - INTERP_DELAY) sits at or behind the newest
-    snapshot and the remote render simply holds the last frame while the host
-    catches up. In steady state (1x host, 10 Hz samples) the cap never binds
-    — the estimate is at most ~0.01 s ahead of the newest sample.
+    `now(local_time)` is CAPPED at the newest sample's stamp + MAX_LEAD
+    (one snapshot interval). The cap anchors the estimate on the DATA, not
+    the model: if the host starves, samples arrive a full second apart and
+    extrapolating at the clamped rate would run the estimate far ahead of
+    the data. Capped, the estimate holds within one snapshot interval of
+    the newest stamp, so the render point sits at or behind the newest
+    snapshot and the remote render holds the last frame while the host
+    catches up. In steady state the cap never binds.
 
-    The per-arrival jitter sample (`last_jitter`) is the PREDICTION RESIDUAL
-    (Session 7.9): how far this arrival's stamp is from where the PREVIOUS
+    The per-arrival jitter sample (`last_jitter`) is the PREDICTION
+    RESIDUAL: how far this arrival's stamp is from where the PREVIOUS
     model (the previous anchor + rate) predicted it would be. A steady
-    arrival sits near 0; a late/early packet spikes. This is the
-    well-conditioned replacement for the 7.1 offset sample
-    (`host_time - rate * local_time`), which had the same leverage problem as
-    the intercept. It is the input the LatencyTracker consumes (7.5a).
+    arrival sits near 0; a late/early packet spikes. It is the input the
+    LatencyTracker consumes.
 
     `local_time` is any monotonically increasing seconds value the caller
     has (pygame.time.get_ticks()/1000.0 in the game loop; plain t in tests).
@@ -198,19 +159,19 @@ class HostTimeEstimator:
     only ever computes the SMALL difference (local_time - t_anchor), so a
     large local_time is harmless.
 
-    Session 7.5b: this estimate is NO LONGER the client's render clock.
-    The render point is now anchored on the DATA — the newest ARRIVED
-    snapshot's stamp minus the adaptive delay (see `RenderPoint`) —
-    because a model of the host clock and the data disagree under
-    jitter/loss, and the render must not wander by the disagreement.
-    The estimator still runs for two reasons: its per-arrival jitter
-    sample (`last_jitter`) is the input the LatencyTracker consumes, and
-    `now()` remains available for diagnostics (the 7.8 overlay).
+    This estimate is NOT the client's render clock. The render point is
+    anchored on the DATA — the newest ARRIVED snapshot's stamp minus the
+    adaptive delay (see `RenderPoint`) — because a model of the host clock
+    and the data disagree under jitter/loss, and the render must not wander
+    by the disagreement. The estimator still runs for two reasons: its
+    per-arrival jitter sample (`last_jitter`) is the input the
+    LatencyTracker consumes, and `now_smooth()` is the ghost's render clock
+    (see the GHOST CLOCK CONTRACT in PredictedShip.advance).
     """
 
     RATE_ALPHA = 0.1
     RATE_MIN, RATE_MAX = 0.4, 1.5
-    # 11.x: the SMOOTH render clock (now_smooth) — see its docstring.
+    # The SMOOTH render clock (now_smooth) — see its docstring.
     # SMOOTH_ALPHA is the per-frame correction rate toward the raw (capped)
     # estimate: a slow pull, not a snap, so a noisy anchor can't jerk the
     # render. SMOOTH_MAX_JUMP bounds the per-frame correction (s) so a single
@@ -218,21 +179,15 @@ class HostTimeEstimator:
     # more than this in one frame.
     SMOOTH_ALPHA = 0.05
     SMOOTH_MAX_JUMP = 0.02
-    # Session 7.9: no OFFSET_ALPHA — the offset is no longer an EMA of
-    # `host_time - rate * local_time` (that form's leverage made the error
-    # grow over the session). The offset is the point-slope anchor itself
-    # (the newest sample), which is exact by construction.
     MAX_LEAD = SNAPSHOT_INTERVAL * TICK   # one snapshot interval
 
     def __init__(self):
-        # Session 7.9: point-slope anchor (the newest recorded sample), not
-        # an absolute intercept — see the class docstring for why the
-        # absolute-intercept form's leverage made the estimate's error grow
-        # over the session.
+        # Point-slope anchor (the newest recorded sample), not an absolute
+        # intercept — see the class docstring.
         self._anchor = None  # (local_time, host_time) of the newest sample
         self._rate = 1.0     # EMA host sim rate (local-time units)
-        self._last_jitter = None  # Session 7.5a: per-arrival jitter sample
-        # 11.x: the smooth render clock's state (see now_smooth). _smooth is
+        self._last_jitter = None  # per-arrival jitter sample
+        # The smooth render clock's state (see now_smooth). _smooth is
         # the smoothed host-time estimate; _smooth_t is the local time it
         # was last advanced to (None until the first now_smooth call).
         self._smooth = None
@@ -246,10 +201,9 @@ class HostTimeEstimator:
     @property
     def offset(self):
         """The current anchor's HOST stamp (None before the first
-        snapshot). Session 7.9: this is the point-slope anchor's host_time
-        (h_anchor), NOT the 7.1 absolute intercept A — the estimate is now
-        `offset + rate * (local_time - anchor_local_time)`. Exposed for the
-        7.8 debug overlay."""
+        snapshot). This is the point-slope anchor's host_time (h_anchor) —
+        the estimate is `offset + rate * (local_time - anchor_local_time)`.
+        Exposed for the debug overlay."""
         if self._anchor is None:
             return None
         return self._anchor[1]
@@ -257,24 +211,20 @@ class HostTimeEstimator:
     @property
     def rate(self):
         """Current host sim-rate estimate (1.0 = real-time). Exposed for
-        the 7.8 debug overlay."""
+        the debug overlay."""
         return self._rate
 
     @property
     def last_jitter(self):
-        """The per-arrival jitter sample of the LAST recorded snapshot
-        (Session 7.5a), or None until one exists.
+        """The per-arrival jitter sample of the LAST recorded snapshot, or
+        None until one exists.
 
-        Session 7.9: this is the PREDICTION RESIDUAL — how far this
-        arrival's stamp is from where the PREVIOUS model (the previous
-        anchor + rate) predicted it would be:
+        This is the PREDICTION RESIDUAL — how far this arrival's stamp is
+        from where the PREVIOUS model (the previous anchor + rate)
+        predicted it would be:
         `|host_sim_time - (h_anchor_prev + rate * (local_time - t_anchor_prev))|`.
-        A steady arrival sits near 0; a late/early packet spikes. This is
-        the well-conditioned replacement for the 7.1 offset sample
-        (`host_time - rate * local_time`), which had the same leverage
-        problem as the intercept (it was a difference of two large numbers).
-        Exposed so LatencyTracker can consume it (and for the 7.8 debug
-        overlay)."""
+        A steady arrival sits near 0; a late/early packet spikes. Exposed
+        so LatencyTracker can consume it (and for the debug overlay)."""
         return self._last_jitter
 
     def record(self, local_time, host_sim_time):
@@ -283,37 +233,33 @@ class HostTimeEstimator:
         happen over TCP) are dropped, like SnapshotBuffer.push.
 
         Returns True if the sample was recorded, False if it was dropped
-        (Session 7.5a: the caller feeds the jitter sample to the
-        LatencyTracker only on a recorded arrival).
+        (the caller feeds the jitter sample to the LatencyTracker only on
+        a recorded arrival).
 
-        Session 7.9 (point-slope re-anchor): the model is
-        `host = h_anchor + rate * (local_time - t_anchor)`, anchored on the
-        NEWEST sample. On each recorded arrival:
+        The model is `host = h_anchor + rate * (local_time - t_anchor)`,
+        anchored on the NEWEST sample. On each recorded arrival:
           1. the jitter sample is the PREDICTION RESIDUAL — how far this
              arrival's stamp is from where the PREVIOUS anchor + PREVIOUS
-             rate predicted it (a small, well-conditioned number, unlike the
-             7.1 offset sample);
-          2. the RATE EMA is updated from the Δhost/Δlocal of the two newest
-             samples (unchanged from 7.1);
+             rate predicted it;
+          2. the RATE EMA is updated from the Δhost/Δlocal of the two
+             newest samples;
           3. the anchor is MOVED to this newest sample (t_anchor, h_anchor)
              = (local_time, host_sim_time).
-        Because the anchor is always the newest sample, `now()` extrapolates
-        forward from real data at the fitted rate — and the offset it adds is
-        a small delta (time since the newest sample), so the estimate stays
-        well-conditioned for the whole session (no leverage growth)."""
+        Because the anchor is always the newest sample, `now()`
+        extrapolates forward from real data at the fitted rate — and the
+        offset it adds is a small delta (time since the newest sample), so
+        the estimate stays well-conditioned for the whole session."""
         if self._anchor is not None and host_sim_time <= self._anchor[1]:
             return False
         if self._anchor is not None:
             lt0, ht0 = self._anchor
-            # Session 7.9: the jitter sample is the PREDICTION RESIDUAL —
-            # how far this arrival's stamp is from where the PREVIOUS model
-            # (previous anchor + PREVIOUS rate) predicted it. Computed with
-            # the rate BEFORE this sample updates it (the standard
-            # innovation: measurement minus the prior model's prediction),
-            # so a late packet spikes the full amount instead of being
-            # partially absorbed into the rate EMA. A steady arrival sits
-            # near 0; a late/early packet spikes. Well-conditioned (a small
-            # delta), unlike the 7.1 offset sample.
+            # The jitter sample is the PREDICTION RESIDUAL — how far this
+            # arrival's stamp is from where the PREVIOUS model (previous
+            # anchor + PREVIOUS rate) predicted it. Computed with the rate
+            # BEFORE this sample updates it (the standard innovation:
+            # measurement minus the prior model's prediction), so a late
+            # packet spikes the full amount instead of being partially
+            # absorbed into the rate EMA.
             predicted = ht0 + self._rate * (local_time - lt0)
             self._last_jitter = abs(host_sim_time - predicted)
             if local_time > lt0:
@@ -332,11 +278,11 @@ class HostTimeEstimator:
         the class docstring for why the estimate must stay anchored on the
         data when the host starves.
 
-        Session 7.9: point-slope form — extrapolate FORWARD from the newest
-        sample (the anchor) at the fitted rate:
+        Point-slope form — extrapolate FORWARD from the newest sample (the
+        anchor) at the fitted rate:
         `h_anchor + rate * (local_time - t_anchor)`. The offset is a small
         delta (time since the newest sample), so the estimate stays
-        well-conditioned for the whole session (no leverage growth)."""
+        well-conditioned for the whole session."""
         if self._anchor is None:
             return None
         t_anchor, h_anchor = self._anchor
@@ -347,30 +293,26 @@ class HostTimeEstimator:
         return est
 
     def now_raw(self, local_time):
-        """The UNCAPPED estimate (11.x diagnostics): same as `now()` but
-        without the MAX_LEAD cap. Exposed so the ghost-clock
-        instrumentation (ghost_clock.csv) can see whether the cap is
-        binding — if `now_raw` is ahead of `now` by the cap, the
-        estimate is being held at `newest + MAX_LEAD`. None before the
-        first snapshot."""
+        """The UNCAPPED estimate (diagnostics): same as `now()` but without
+        the MAX_LEAD cap. Exposed so the ghost-clock instrumentation
+        (ghost_clock.csv) can see whether the cap is binding — if
+        `now_raw` is ahead of `now` by the cap, the estimate is being held
+        at `newest + MAX_LEAD`. None before the first snapshot."""
         if self._anchor is None:
             return None
         t_anchor, h_anchor = self._anchor
         return h_anchor + self._rate * (local_time - t_anchor)
 
     def now_smooth(self, local_time):
-        """The SMOOTH host-time estimate (11.x) — the render clock.
+        """The SMOOTH host-time estimate — the render clock.
 
         `now()` (the raw point-slope estimate) is correct on average but
         NOISY frame-to-frame: the anchor re-anchors on every snapshot
-        arrival (~43 Hz on a real LAN, not 60), the rate EMA wobbles, and
-        the MAX_LEAD cap freezes the estimate at `newest + MAX_LEAD` and
-        then jumps it when a new snapshot releases it. The ghost's render
-        pose is `physics_pose + v * _acc`, and `_acc` is driven by this
-        clock — so every wobble in the clock is a wobble in the rendered
-        ship. Measured on a real 2P session: 15% of frames the clock
-        FROZE (cap binding), 10% it JUMPED (cap release / re-anchor), 1.5%
-        it went BACKWARD — the "ship jumps even while coasting" symptom.
+        arrival, the rate EMA wobbles, and the MAX_LEAD cap freezes the
+        estimate at `newest + MAX_LEAD` and then jumps it when a new
+        snapshot releases it. The ghost's render pose is
+        `physics_pose + v * _acc`, and `_acc` is driven by this clock —
+        so every wobble in the clock is a wobble in the rendered ship.
 
         This is the render's clock instead. It advances at the smoothed
         rate (1x real time in steady state) and applies a SLOW, bounded
@@ -417,50 +359,45 @@ class HostTimeEstimator:
 
 
 class LatencyTracker:
-    """The adaptive interpolation delay (Session 7.5a).
+    """The adaptive interpolation delay.
 
     A fixed INTERP_DELAY (0.1 s) is the right lag for a clean connection,
-    but on a jittery wifi link a snapshot that arrives late strands the
-    render point ahead of the data: the buffer clamps to the newest
-    snapshot and the remote render stutters (the 7.1 MAX_LEAD cap turns
-    the outrun into a hold, but a hold is still a stall). The fix is to
-    render FURTHER in the past when the arrival pattern is ragged: the
-    delay grows with the measured jitter, so a late packet lands inside
-    the window instead of behind the render point.
+    but on a jittery link a snapshot that arrives late strands the render
+    point ahead of the data: the buffer clamps to the newest snapshot and
+    the remote render stutters. The fix is to render FURTHER in the past
+    when the arrival pattern is ragged: the delay grows with the measured
+    jitter, so a late packet lands inside the window instead of behind the
+    render point.
 
-    The delay is a PURE FUNCTION OF THE ARRIVAL PATTERN (7.5a scope:
-    compute the value; 7.5b re-anchored the render point to it — see
-    `RenderPoint`, which reads `.delay` every frame). The input is the
-    HostTimeEstimator's per-arrival jitter sample
-    (`HostTimeEstimator.last_jitter` — `|offset_sample - offset_ema|`,
-    the 7.1 offset samples repurposed): a steady 10 Hz stream sits near
-    0, a late/early packet spikes.
+    The delay is a PURE FUNCTION OF THE ARRIVAL PATTERN — `RenderPoint`
+    reads `.delay` every frame. The input is the HostTimeEstimator's
+    per-arrival jitter sample (`HostTimeEstimator.last_jitter`): a steady
+    stream sits near 0, a late/early packet spikes.
 
     The law (config knobs, see config.py):
 
         delay = clamp(INTERP_DELAY + ADAPT_K * EMA(jitter),
                       INTERP_DELAY_MIN, INTERP_DELAY_MAX)
 
-    with EMA alpha = 0.2 (the same time constant as the estimator's
-    offset EMA — the sample stream settles within a few snapshots). Two
-    disciplines on top of the clamp:
+    with EMA alpha = 0.2 (the sample stream settles within a few
+    snapshots). Two disciplines on top of the clamp:
 
       - the delay only ever moves by at most MAX_STEP = 1/60 s per
-        frame, so the render point (7.5b: newest_snap - delay) can never
-        jump — a jitter spike raises the delay over ~20 frames instead of
+        frame, so the render point (newest_snap - delay) can never jump —
+        a jitter spike raises the delay over ~20 frames instead of
         teleporting the render ~100 ms into the past;
       - the delay never shrinks below INTERP_DELAY_MIN (= INTERP_DELAY,
         the base) — adaptation only adds lag, it never goes under the
         clean-connection value.
 
-    Wiring (the 7.5b seam, documented here in 7.5a): the client calls
-    `estimator.record(now, stamp)` on each snapshot arrival and, when it
-    returns True, `tracker.update(estimator.last_jitter)`; every frame it
-    calls `tracker.tick(dt)` (the per-frame smoothing step) and reads
+    Wiring: the client calls `estimator.record(now, stamp)` on each
+    snapshot arrival and, when it returns True,
+    `tracker.update(estimator.last_jitter)`; every frame it calls
+    `tracker.tick(dt)` (the per-frame smoothing step) and reads
     `tracker.delay`.
     """
 
-    ALPHA = 0.2          # jitter EMA (same time constant as the 7.1 offset EMA)
+    ALPHA = 0.2          # jitter EMA
     MAX_STEP = 1.0 / 60.0  # the delay may move at most this far per frame
 
     def __init__(self, base=INTERP_DELAY, k=ADAPT_K,
@@ -483,7 +420,7 @@ class LatencyTracker:
     @property
     def jitter_ema(self):
         """The current EMA of the per-arrival jitter samples (None before
-        the first sample). Exposed for the 7.8 debug overlay."""
+        the first sample). Exposed for the debug overlay."""
         if self._samples == 0:
             return None
         return self._jitter_ema
@@ -507,11 +444,11 @@ class LatencyTracker:
 
     def tick(self, dt):
         """Per-frame smoothing step: move the delay toward its target by
-        at most MAX_STEP (1/60 s), so the render point it drives (7.5b)
-        can never jump. `dt` is the real frame time; the step is
-        frame-BOUND (one frame may move at most MAX_STEP regardless of
-        dt), which is what keeps the render point continuous on any
-        display refresh rate."""
+        at most MAX_STEP (1/60 s), so the render point it drives can
+        never jump. `dt` is the real frame time; the step is frame-BOUND
+        (one frame may move at most MAX_STEP regardless of dt), which is
+        what keeps the render point continuous on any display refresh
+        rate."""
         self._step_toward(self._target())
 
     def _target(self):
@@ -528,17 +465,11 @@ class LatencyTracker:
 
 
 class RenderPoint:
-    """The client's render point in HOST SIM TIME (Session 7.5b).
+    """The client's render point in HOST SIM TIME.
 
-    7.1 rendered at `host_time_estimate - INTERP_DELAY`, where the
-    estimate extrapolates the newest snapshot's stamp forward at the
-    fitted host rate. That is a MODEL of the host clock: on a clean link
-    it sits ~0.01 s ahead of the newest ARRIVED snapshot, but under
-    jitter/loss the model and the data disagree — the estimate can lag
-    the newest stamp (a late packet pulls the offset EMA down) or lead
-    it (the MAX_LEAD cap holds it one interval ahead), and the render
-    point wanders by as much as the disagreement. The fix (this
-    session): anchor the render point on the DATA, not the model —
+    The render point is anchored on the DATA, not on a model of the host
+    clock (a model and the data disagree under jitter/loss, and the
+    render must not wander by the disagreement):
 
         render_t = newest_arrived_snapshot_stamp - delay
 
@@ -547,12 +478,6 @@ class RenderPoint:
     stall) instead of the point outrunning the data and
     clamp-stuttering, and the point can never exceed the newest
     snapshot (delay >= INTERP_DELAY_MIN > 0).
-
-    This REPLACES the 7.1 host-time estimate for the render point — the
-    genuinely risky re-anchor of the core render path, isolated in this
-    session. The estimator is NOT deleted: it still runs, and its
-    per-arrival jitter sample (`last_jitter`) is what feeds the
-    LatencyTracker (7.5a). It is no longer a clock the render reads.
 
     One subtlety: `newest - delay` on its own is a STAIRCASE. The newest
     stamp is flat between arrivals and jumps by one snapshot interval
@@ -568,19 +493,19 @@ class RenderPoint:
     1/60 cap advances the point by only 1/60 s per frame, but a 47 FPS
     frame lasts 1/47 s of real time, so the point falls behind by
     (1/47 - 1/60) every frame and the remote render looks at ever-older
-    snapshots (the 7.8 log's 4.3 s drift on the Mac, ~4.6 s of stale
-    data). Capped by `dt`, the point advances 1/47 s per frame at
+    snapshots. Capped by `dt`, the point advances 1/47 s per frame at
     47 FPS — exactly 1x real time — and never drifts. The cap still
     smooths the staircase (a one-interval anchor jump is covered over a
-    couple of frames at 60 FPS) and still bounds a hiccup (the caller clamps
-    `dt` to MAX_FRAME_DT, so one frame moves the point at most that far).
-    The net per-frame advance is bounded by `dt` + MAX_STEP_DELAY (the
-    chase step plus the delay's own per-frame movement) — the render
-    point is continuous on any refresh rate, and a jitter spike or a late
-    packet can never teleport it. In steady state the chase is slack
-    (the anchor creeps forward at the host's sim rate, ~1x, and the point
-    tracks it within ~one frame's step); under a stall the anchor holds
-    and the point converges onto it and holds there.
+    couple of frames at 60 FPS) and still bounds a hiccup (the caller
+    clamps `dt` to MAX_FRAME_DT, so one frame moves the point at most
+    that far). The net per-frame advance is bounded by `dt` +
+    MAX_STEP_DELAY (the chase step plus the delay's own per-frame
+    movement) — the render point is continuous on any refresh rate, and
+    a jitter spike or a late packet can never teleport it. In steady
+    state the chase is slack (the anchor creeps forward at the host's
+    sim rate, ~1x, and the point tracks it within ~one frame's step);
+    under a stall the anchor holds and the point converges onto it and
+    holds there.
 
     `advance(dt, newest)` is called once per frame with the newest
     snapshot stamp in the buffer (None before the first arrival — the
@@ -588,27 +513,19 @@ class RenderPoint:
     `now()` returns the render point (host sim time) or None.
     """
 
-    # Session 7.9: the chase cap is the frame's REAL time (`dt`), not a
-    # fixed 1/60 s — see the class docstring. A fixed 1/60 cap made the
-    # point advance at (frame_rate/60) x real time, so any client below
-    # 60 FPS drifted behind the data (the 7.8 log: 4.3 s on the Mac).
-    # `dt` is clamped by the caller to MAX_FRAME_DT, which bounds a hiccup.
+    # The chase cap is the frame's REAL time (`dt`), not a fixed 1/60 s —
+    # see the class docstring. `dt` is clamped by the caller to
+    # MAX_FRAME_DT, which bounds a hiccup.
     MAX_STEP_DELAY = LatencyTracker.MAX_STEP  # the delay's own per-frame move
-    # Session 7.10: catch-up fraction. When the point is BEHIND the target by
-    # more than ~5 frames (d > 5*dt), it advances by CATCHUP * d per frame
-    # (20% of the gap) instead of just dt (1x real time), so a large gap
-    # (a snapshot burst after a wire stall, or the buffer filling at the
-    # start) closes in ~5 frames (~83 ms at 60 FPS) instead of ~10 (166 ms).
-    # For small gaps (d < 5*dt) the cap is dt (1x real time), preserving the
-    # staircase smoothing. The steady-state gap (where the catch-up rate
-    # equals the target's 1x advance) is 5*dt (~0.083 s at 60 FPS) — the
-    # point settles just behind the target, inside the buffer's window.
-    # Session 7.10b: raised from 0.1 to 0.2 to halve the catch-up duration
-    # after a snapshot burst (the "big lag spike" in the 7.10 re-test: a
-    # 1.4 s gap took ~10 frames to close at CATCHUP=0.1; at 0.2 it takes
-    # ~5). The per-frame fast-forward is 20% of the gap (e.g. 280 ms of sim
-    # time in one 16.7 ms frame for a 1.4 s gap) — a visible but brief
-    # fast-forward, better than a 166 ms stall at 1x.
+    # Catch-up fraction. When the point is BEHIND the target by more than
+    # ~5 frames (d > 5*dt), it advances by CATCHUP * d per frame (20% of
+    # the gap) instead of just dt (1x real time), so a large gap (a
+    # snapshot burst after a wire stall, or the buffer filling at the
+    # start) closes in ~5 frames (~83 ms at 60 FPS). For small gaps
+    # (d < 5*dt) the cap is dt (1x real time), preserving the staircase
+    # smoothing. The steady-state gap (where the catch-up rate equals the
+    # target's 1x advance) is 5*dt (~0.083 s at 60 FPS) — the point
+    # settles just behind the target, inside the buffer's window.
     CATCHUP = 0.2
 
     def __init__(self, tracker=None):
@@ -617,8 +534,8 @@ class RenderPoint:
 
     @property
     def tracker(self):
-        """The LatencyTracker this point reads its delay from (the 7.8
-        debug overlay reads both). Settable so tests can swap trackers."""
+        """The LatencyTracker this point reads its delay from (the debug
+        overlay reads both). Settable so tests can swap trackers."""
         return self._tracker
 
     @tracker.setter
@@ -631,30 +548,23 @@ class RenderPoint:
         point (or None while there is no anchor yet).
 
         The chase is capped by `dt` (the frame's REAL time), NOT a fixed
-        1/60 s (Session 7.9): the point advances at 1x real time on any
-        refresh rate, so it never drifts behind the data on a client
-        running below 60 FPS. `dt` is clamped by the caller to
-        MAX_FRAME_DT, which bounds a hiccup (one frame moves the point at
-        most that far).
+        1/60 s: the point advances at 1x real time on any refresh rate,
+        so it never drifts behind the data on a client running below
+        60 FPS. `dt` is clamped by the caller to MAX_FRAME_DT, which
+        bounds a hiccup (one frame moves the point at most that far).
 
-        Session 7.10 (catch-up): a pure 1x cap has a flaw — it closes a
-        LARGE gap at only 1x real time, and if the target also advances at
-        ~1x (the host's sim rate), the gap NEVER closes. The 7.10 log
-        showed exactly this: the buffer filled with ~1 s of snapshots at
-        the start, the point was born 1.0 s behind its target, and it
-        stayed there for the whole session (d = 0.96 -> 1.08 s, stable),
-        rendering 700 ms of stale data (the buffer's oldest snapshot —
-        the point was clamped to the buffer's back edge). The fix: when
-        the point is behind by more than ~5 frames (d > 5*dt), advance
-        by CATCHUP * d per frame (20% of the gap) instead of dt, so the
-        gap closes exponentially (halving every ~3.5 frames at 60 FPS)
-        and settles at the steady-state gap of 5*dt (~0.083 s at 60 FPS —
-        just behind the target, inside the buffer's window). For small
-        gaps (d < 5*dt) the cap is dt (1x real time), so the staircase
-        smoothing is unchanged and the point never teleports. The step is
-        always bounded by d (min(d, ...)), so the point can never
-        overshoot the target. See the CATCHUP class attr for the
-        rationale."""
+        Catch-up: a pure 1x cap has a flaw — it closes a LARGE gap at
+        only 1x real time, and if the target also advances at ~1x (the
+        host's sim rate), the gap NEVER closes. So when the point is
+        behind by more than ~5 frames (d > 5*dt), advance by CATCHUP * d
+        per frame (20% of the gap) instead of dt, so the gap closes
+        exponentially and settles at the steady-state gap of 5*dt
+        (~0.083 s at 60 FPS — just behind the target, inside the buffer's
+        window). For small gaps (d < 5*dt) the cap is dt (1x real time),
+        so the staircase smoothing is unchanged and the point never
+        teleports. The step is always bounded by d (min(d, ...)), so the
+        point can never overshoot the target. See the CATCHUP class attr
+        for the rationale."""
         if newest is None:
             return None
         if self._t is None:
@@ -665,17 +575,12 @@ class RenderPoint:
         target = newest - self._delay()
         d = target - self._t
         if d > 0.0:
-            # Session 7.10: catch-up. When the point is behind the target by
-            # more than ~5 frames (d > 5*dt), advance by CATCHUP * d per
-            # frame (20% of the gap) instead of just dt (1x real time), so a
-            # large gap (a snapshot burst after a wire stall, or the buffer
-            # filling at the start) closes in ~5 frames (~83 ms at 60 FPS).
+            # Catch-up: when behind by more than ~5 frames (d > 5*dt),
+            # advance by CATCHUP * d per frame (20% of the gap) instead of
+            # just dt (1x real time), so a large gap closes in ~5 frames.
             # For small gaps (d < 5*dt) the cap is dt (1x real time),
-            # preserving the staircase smoothing. The steady-state gap
-            # (where the catch-up rate equals the target's 1x advance) is
-            # 5*dt (~0.083 s at 60 FPS) — the point settles just behind the
-            # target, not 1.0 s behind it (the 7.9 behavior, where the gap
-            # never closed). See the CATCHUP class attr for the rationale.
+            # preserving the staircase smoothing. See the CATCHUP class
+            # attr for the rationale.
             step = min(d, max(dt, self.CATCHUP * d))
             self._t += step
         elif d < 0.0:
@@ -710,26 +615,23 @@ def _enemy_id(e_s):
 def _asteroid_key(a_s):
     # a_s = (id, pos.x, pos.y, vel.x, vel.y, size, angle, spin, verts).
     # The id is assigned once from the Asteroid._next_id class counter
-    # (Session 5b.1) and never reused within a run — a stable identity
-    # across snapshots. Split children get fresh ids -> they read as
-    # "new".
+    # and never reused within a run — a stable identity across snapshots.
+    # Split children get fresh ids -> they read as "new".
     return a_s[0]
 
 
 def _match_bullets(prev_list, curr_list, dt):
-    """Match curr bullets to prev bullets by PREDICTED POSITION (Session
-    7.2). Returns a list, one entry per curr bullet: the prev twin's
-    (x, y) or None (a new bullet — pops in at its curr position, the
-    same membership rule as enemies/asteroids).
+    """Match curr bullets to prev bullets by PREDICTED POSITION. Returns a
+    list, one entry per curr bullet: the prev twin's (x, y) or None (a
+    new bullet — pops in at its curr position, the same membership rule
+    as enemies/asteroids).
 
-    Why not match by INDEX within a kind (the 7.2 plan's original
-    assumption)? The sim's bullet lists are sliding windows: a fired
-    bullet appends, an expired one is culled from the FRONT
-    (`self.bullets = [b for b in self.bullets if b.life > 0]`), so every
-    later index slides down by one each time a bullet dies. A probe over
-    20 snapshot windows (6 ticks each, the test's script_input) found
-    ~11% of same-index pairs were NOT the same bullet — index matching
-    would lerp a bullet from a stranger's position and make it jump.
+    Why not match by INDEX within a kind? The sim's bullet lists are
+    sliding windows: a fired bullet appends, an expired one is culled
+    from the FRONT (`self.bullets = [b for b in self.bullets if b.life >
+    0]`), so every later index slides down by one each time a bullet
+    dies. Index matching would lerp a bullet from a stranger's position
+    and make it jump.
 
     Bullets fly in straight lines (no steering — only missiles steer,
     and they are matched with the same method), so a prev bullet's
@@ -740,14 +642,14 @@ def _match_bullets(prev_list, curr_list, dt):
     snapshot window (t_curr - t_prev); at dt == 0 the prediction is the
     prev position itself.
 
-    MATCH_RADIUS: a bullet moves BULLET_SPEED * dt per window (860 * 0.1
-    = 86 px at the 10 Hz cadence). The radius must exceed that (a real
-    twin is always within ~1 window of motion of its prediction) but be
-    small enough that two DIFFERENT bullets never both fall inside it of
-    each other's predictions. Bullets from the same gun fire from the
-    same muzzle ~10 px apart at 100 Hz, so they can be as close as
-    ~10 px; 30 px is well clear of that while a mis-match would require
-    two bullets' predicted positions to be within 30 px of the same curr
+    MATCH_RADIUS: a bullet moves BULLET_SPEED * dt per window (~14 px at
+    the 60 Hz cadence). The radius must exceed that (a real twin is
+    always within ~1 window of motion of its prediction) but be small
+    enough that two DIFFERENT bullets never both fall inside it of each
+    other's predictions. Bullets from the same gun fire from the same
+    muzzle ~10 px apart at 100 Hz, so they can be as close as ~10 px;
+    30 px is well clear of that while a mis-match would require two
+    bullets' predicted positions to be within 30 px of the same curr
     bullet — only possible for near-coincident fire, where swapping the
     lerp pair is visually a no-op (same muzzle, same velocity).
     """
@@ -774,10 +676,10 @@ def _match_bullets(prev_list, curr_list, dt):
 
 
 def interp_positions(prev_s, curr_s, alpha, dt=None):
-    """Interpolated poses for each player ship ((x, y, angle), Session 6.8),
-    each enemy ((tag, x, y, angle, vx, vy, id), Session 7.2), each asteroid
-    ((x, y)), and each projectile ((x, y, vx, vy, kind, owner, boost),
-    Session 7.2), between two Game snapshots.
+    """Interpolated poses for each player ship ((x, y, angle)), each enemy
+    ((tag, x, y, angle, vx, vy, id)), each asteroid ((x, y)), and each
+    projectile ((x, y, vx, vy, kind, owner, boost, mid)), between two
+    Game snapshots.
 
     prev_s / curr_s are the 11-tuples from Game.snapshot(); alpha in [0, 1]
     is clamped (never extrapolate into the future). Returns a plain dict —
@@ -791,138 +693,44 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
          'asteroids': [(x, y), ...],
          'bullets': [(x, y, vx, vy, kind, owner, boost, mid), ...]}
 
-    Each ship entry carries `flame_mags` (10.6): the per-thruster exhaust
-    magnitudes (ship_s[23]), taken from the CURRENT snapshot (not lerp'd —
-    a flame dict has no meaningful cross-window blend). The client feeds it
-    to the remote player ship's stand-in before drawing so the remote
-    ship's exhaust renders (parity with the host's _sync_local_ship).
+    LERP'd across the window: pose, angle (via `lerp_angle` — the wrapped
+    delta, never a plain lerp of the raw unbounded angles), shield state
+    (shield_dump / shield_clock), `power_factor`, and enemy `power_used`.
+    Taken from the CURRENT snapshot (a latch/dict has no meaningful
+    cross-window blend): `dead` (ship_s[20]), `brownout` (ship_s[16]),
+    `flame_mags` (ship_s[23]).
 
-    Each ship entry also carries the power state (10.5): `brownout`
-    (ship_s[16], the latched brownout flag) taken from the CURRENT
-    snapshot (like `dead` — a latch has no meaningful cross-window blend),
-    and `power_factor` (ship_s[17], the 0..1 allocation scale) LERP'd
-    across the window like the shield state (it sags/recovers smoothly).
-    The client feeds both to the remote player ship's stand-in and drives
-    its brownout arcs (Ship._update_arcs) so the remote ship's crackle
-    renders (parity with the host's model path, which packs the arcs
-    directly). No wire change — both fields are already in the snapshot.
+    Each projectile entry carries `mid`: the unique id (player_index, seq)
+    for kind 'missile' and 'player' (the ghost's own gun shots), else None
+    (kind 'enemy') — the client's dedup key against the buffer's copy
+    (see predicted_view).
 
-    Each enemy entry carries `power_used` (10.3c): the enemy's live power
-    demand (ship_s[22]), lerp'd across the window like the shield state.
-    The ghost's sensor-contact signature is `power_used - power_idle_total`
-    (power_idle_total is a loadout constant the client derives) — see
-    PredictedShip._update_contacts.
+    Enemy entries: angle lerp'd with the same wrapped-delta rule as player
+    ships; TAG and VELOCITY from curr (presentation data for the
+    targeting proxy); ID carried so a caller can track a specific enemy
+    across frames (enemies churn — no stable index).
 
-    Each enemy entry also carries `flame_mags` (10.6): the enemy's
-    per-thruster exhaust magnitudes (ship_s[23]), taken from the CURRENT
-    snapshot (not lerp'd — a flame dict has no meaningful cross-window
-    blend). The client feeds it to the enemy stand-in before drawing so
-    the remote enemy's exhaust renders (parity with the host's model
-    path, which carries it in the model's enemy tuple too).
+    Projectiles: snapshot indices 2 (player bullets), 3 (enemy bullets),
+    4 (missiles) are all interpolated. Position lerp'd (matched by
+    predicted position — see `_match_bullets`), velocity/owner/boost from
+    curr. A bullet fired mid-window pops in at its curr position; one
+    that expires drops out.
 
-    Each projectile entry carries `mid` (10.3b / 10.7): the projectile's
-    unique id (player_index, seq) for kind == 'missile' (10.3b) AND
-    kind == 'player' (10.7 — the ghost's own gun shots), else None
-    (kind == 'enemy'). The client uses it to dedup its own ghost
-    projectiles against the buffer's copy of the same projectile (no
-    double-draw) — see predicted_view.
-
-    Ships carry their `dead` flag too (Session 10.1): ship_s[20], taken
-    from the CURRENT snapshot (membership follows curr). The remote peer
-    uses it to skip drawing a dead ship (it disappears until it respawns)
-    and to spawn a client-side explosion on the alive->dead transition.
-
-    Ships also carry their shield-impact state (Session 10.2):
-    shield_dump (ship_s[6]) and shield_clock (ship_s[7]), LERP'd between
-    the two snapshots like the pose. These drive the shield-impact flash
-    (Ship._draw_shield: the blue->white glow that appears when the shield
-    is struck). The client's own ship (the ghost) already shows its flash
-    (a real Ship, restored on reconcile); the REMOTE ship is drawn via
-    Ship.draw too, so feeding it the buffer's shield state makes its
-    impact flash render identically to the host's. No wire change — both
-    fields are already in the ship snapshot.
-
-    Ships carry their angle (Session 6.8): ship_s[4] is the RAW unbounded
-    angle (see Ship.snapshot), so it is lerp'd with `lerp_angle` — the
-    wrapped-delta lerp `Ship.sync_render` uses — never a plain lerp of the
-    raw values (which would swing the wrong way around the circle once the
-    raw angle leaves [-pi, pi]). The result stays anchored on the prev
-    angle's unwrapped offset, exactly like sync_render's rangle.
-
-    Enemies carry their angle too (Session 7.2): e_s[0][4] is the enemy
-    ship's RAW angle, lerp'd with the SAME wrapped-delta rule (the plan's
-    "same wrapped-delta rule as player ships, 6.8"), so the remote peer
-    draws the real enemy hull at its interpolated orientation instead of a
-    10 px dot (the D4 defect). The TAG (the first element of the
-    (tag, e_s) pair — 'ai'/'mote'/'test') comes from the CURRENT
-    snapshot: membership already follows curr, and the tag is constant
-    for a given enemy id, so curr's tag is the right one. The VELOCITY
-    (e_s[0][2], e_s[0][3]) is taken from curr (it is presentation data
-    for the targeting proxy — lead_point needs pos + vel — and a 10 Hz
-    stale velocity is fine for a reticle). The ID (e_s[2]) is carried so
-    a caller can track a specific enemy across frames (enemies churn, so
-    there is no stable index like ship 0) — presentation only.
-
-    Projectiles (Session 7.2, the D3 defect — the client rendered no
-    bullets at all): snapshot indices 2 (player bullets), 3 (enemy
-    bullets), 4 (missiles) are all interpolated. Each entry is
-    (x, y, vx, vy, kind, owner, boost): position lerp'd between the two
-    snapshots (matched by predicted position — see `_match_bullets`),
-    velocity from curr (drives the stretched-capsule render length),
-    kind in {'player', 'enemy', 'missile'}, owner from curr (the bullet's
-    ship id — presentation only; the client never runs the sim), and
-    boost from curr (missile exhaust flicker; 0.0 for non-missiles).
-    A bullet fired mid-window pops in at its curr position (no earlier
-    position to lerp from); one that expires drops out (membership
-    follows curr — the same rule as enemies/asteroids).
-
-    Entity matching:
-      - player ships by INDEX (Session 6.1): ships don't turn over — a dead
-        ship is game over, not a respawn — so slot i of curr_s[0] is the
-        same ship as slot i of prev_s[0]. Output order is curr_s[0]'s order.
-      - enemies by their ship id (e_s[2]);
-      - asteroids by their rock id (a_s[0]) — see _asteroid_key;
-      - projectiles by predicted position within a kind — see
-        `_match_bullets` (index matching is wrong: the lists slide).
-    Enemy/asteroid matching is by IDENTITY, not index (Session 5b-1):
-    This survives entity turnover inside the window: a rock that splits,
-    a sector that tops up or culls, an enemy that dies and respawns.
-
-    Membership follows the CURRENT snapshot: entities present in curr_s
-    are rendered — a new entity pops in at its curr position (there is no
-    earlier position to lerp from); an entity that died within the window
-    drops out (there is no death position to lerp to — it vanishes a
-    snapshot interval early, imperceptible at 10 Hz). Output order is
-    curr_s's order.
+    Entity matching (full contract in ARCHITECTURE.md): player ships by
+    INDEX (ships don't turn over), enemies by ship id, asteroids by rock
+    id, projectiles by predicted position within a kind (index matching
+    is wrong — the sim's lists slide). Membership follows the CURRENT
+    snapshot: a new entity pops in at its curr position, a dead one drops
+    out. Output order is curr_s's order.
     """
     a = min(1.0, max(0.0, alpha))
 
     # Player ships: matched by index (see docstring). A ship missing from
     # prev_s[0] (shouldn't happen — ships don't turn over) pops in at its
-    # curr pose, same rule as new enemies/asteroids. The angle is lerp'd
-    # with lerp_angle (wrapped delta), not a plain lerp — see docstring.
-    # 10.1: the per-ship `dead` flag (ship_s[20]) is carried through the
-    # buffer so the remote peer can (a) skip drawing a dead ship (it
-    # "disappears" until it respawns) and (b) spawn a client-side explosion
-    # on the alive->dead transition. It is taken from the CURRENT snapshot
-    # (membership follows curr) — a dead ship's pose is static, so only the
-    # flag, not the pose, changes at the death.
-    # The prev ship carries (x, y, angle, shield_dump, shield_clock,
-    # power_factor) — the shield state (10.2) and the power sag (10.5) are
-    # lerp'd with the pose so the remote ship's impact flash fades and its
-    # power factor sags/recovers smoothly across the window.
-    # 10.6: the entry also carries flame_mags (ship_s[23]) — the per-
-    # thruster exhaust magnitudes. Taken from the CURRENT snapshot (like
-    # `dead`), NOT lerp'd: a flame dict is a set of per-bucket scalars with
-    # no meaningful cross-window blend (the host recomputes it every tick;
-    # the newest window's value is the freshest exhaust), and the client
-    # feeds it to the remote stand-in before drawing so the remote player
-    # ship's exhaust renders (parity with the host's _sync_local_ship).
-    # 10.5: the entry also carries brownout (ship_s[16]) — the latched
-    # brownout flag, taken from the CURRENT snapshot (like `dead`): a latch
-    # has no meaningful cross-window blend. The client feeds it (with the
-    # lerp'd power_factor) to the remote stand-in and drives its brownout
-    # arcs (Ship._update_arcs) so the remote ship's crackle renders.
+    # curr pose. The prev ship carries (x, y, angle, shield_dump,
+    # shield_clock, power_factor) — lerp'd with the pose; flame_mags
+    # (ship_s[23]) and brownout (ship_s[16]) come from the CURRENT
+    # snapshot (like `dead`), NOT lerp'd.
     prev_ships = {i: (p[0], p[1], p[4], p[6], p[7], p[17])
                   for i, p in enumerate(prev_s[0])}
     ships = []
@@ -943,29 +751,12 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
                           c[16],
                           lerp(pp[5], cp[5], a)))
 
-    # Enemies (Session 7.2): carry (tag, x, y, angle, vx, vy). The angle
-    # is lerp'd with lerp_angle (the same wrapped-delta rule as player
-    # ships, 6.8); the tag and velocity come from the CURRENT snapshot
-    # (membership follows curr; velocity is presentation data for the
-    # targeting proxy).
-    # The prev enemy carries (x, y, angle, shield_dump, shield_clock) —
-    # the shield state (10.2b) is lerp'd with the pose so the remote
-    # enemy's impact flash fades smoothly across the window (same rule as
-    # the player ships' shield state).
-    # 10.3c: the enemy entry also carries power_used (ship_s[22]) — the
-    # live power demand the ghost's sensor-contact signature needs
-    # (power_used - power_idle_total). LERP'd across the window like the
-    # shield state (the enemy's power demand eases smoothly between
-    # snapshots as it throttles / fires); a new enemy pops in at its curr
-    # power_used.
-    # 10.6: the entry also carries flame_mags (ship_s[23]) — the enemy's
-    # per-thruster exhaust. Taken from the CURRENT snapshot (like the
-    # player ships' flame_mags), NOT lerp'd: a flame dict is a set of
-    # per-bucket scalars with no meaningful cross-window blend. The
-    # client feeds it to the enemy stand-in before drawing so the remote
-    # enemy's exhaust renders (parity with the host's model path, which
-    # carries it in the model's enemy tuple too — 10.6 restored the M2a
-    # "deliberate loss" of enemy flames on both peers).
+    # Enemies: carry (tag, x, y, angle, vx, vy). The angle is lerp'd with
+    # lerp_angle (the same wrapped-delta rule as player ships); the tag
+    # and velocity come from the CURRENT snapshot. The prev enemy carries
+    # (x, y, angle, shield_dump, shield_clock, power_used) — lerp'd with
+    # the pose; a new enemy pops in at its curr values. flame_mags
+    # (ship_s[23]) comes from the CURRENT snapshot, NOT lerp'd.
     prev_enemies = {}
     for _tag, p in prev_s[1]:
         es = p[0]
@@ -1003,26 +794,22 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
             asteroids.append((lerp(pp[0], cp[0], a),
                               lerp(pp[1], cp[1], a)))
 
-    # Projectiles (Session 7.2): all three kinds, matched by predicted
-    # position within a kind (see _match_bullets). `dt` is the time
-    # BETWEEN the two snapshots — the span the prev bullets travel before
-    # the curr snapshot. `positions_at` passes the bracketing span it
-    # already computed (exact); a direct call (tests) falls back to the
-    # nominal snapshot cadence, which is the realistic window. The
-    # position lerp itself uses alpha (exact); dt only scales the
-    # predicted-position matching, and MATCH_RADIUS is generous enough
-    # that a slightly-off dt still matches correctly.
+    # Projectiles: all three kinds, matched by predicted position within a
+    # kind (see _match_bullets). `dt` is the time BETWEEN the two
+    # snapshots — the span the prev bullets travel before the curr
+    # snapshot. `positions_at` passes the bracketing span it already
+    # computed (exact); a direct call (tests) falls back to the nominal
+    # snapshot cadence. The position lerp itself uses alpha (exact); dt
+    # only scales the predicted-position matching, and MATCH_RADIUS is
+    # generous enough that a slightly-off dt still matches correctly.
     if dt is None:
         dt = SNAPSHOT_INTERVAL * TICK
     bullets = []
-    # 10.3b: missiles carry their unique id (player_index, seq) — the
-    # client's dedup key (its own ghost missiles are suppressed against the
-    # buffer's copy of the same id; the other player's missiles are drawn
-    # from the buffer).
-    # 10.7: PLAYER bullets carry their id too (the 7th field of the bullet
-    # snapshot) — the same dedup idea for the ghost's own gun shots. Enemy
-    # bullets carry None (the ghost never dedups them — they are always
-    # drawn from the buffer).
+    # Missiles and PLAYER bullets carry their unique id (player_index, seq)
+    # — the client's dedup key (its own ghost projectiles are suppressed
+    # against the buffer's copy of the same id; the other player's
+    # projectiles are drawn from the buffer). Enemy bullets carry None
+    # (the ghost never dedups them — always drawn from the buffer).
     for kind, idx, boost_field, id_field in (("player", 2, None, 6),
                                              ("enemy", 3, None, None),
                                              ("missile", 4, 6, 8)):
@@ -1044,14 +831,14 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
 
 
 class SnapshotBuffer:
-    """The remote peer's interpolation store (Session 5b.3).
+    """The remote peer's interpolation store.
 
     The authoritative peer stamps each `Game.snapshot()` with the sim time
     it was taken at and sends it on. The remote peer pushes them here, in
     arrival order, and renders `INTERP_DELAY` seconds in the PAST: it asks
     `positions_at(sim_time - INTERP_DELAY)` for the interpolated pose
-    (x, y, angle) of each ship (Session 6.8) and the (x, y) of each enemy
-    and each asteroid.
+    (x, y, angle) of each ship and the (x, y) of each enemy and each
+    asteroid.
 
     Why the delay: a snapshot taken at sim time T is only usable once it has
     ARRIVED, which is at least one round-trip later. Rendering at
@@ -1073,10 +860,11 @@ class SnapshotBuffer:
     def __init__(self, max_snapshots=None):
         # (sim_time, snapshot) pairs, oldest first. Bounded so a stalled
         # authoritative peer can't grow the buffer without limit.
-        # 10.8: the default depth is config.SNAPSHOT_BUFFER_MAX (16) — deep
-        # enough to bracket the render point at the 30 Hz cadence even when
-        # the adaptive delay is at its INTERP_DELAY_MAX cap (see config).
-        # Pass an explicit value to override (tests use 200 for long sweeps).
+        # The default depth is config.SNAPSHOT_BUFFER_MAX (24) — deep
+        # enough to bracket the render point at the 60 Hz cadence even
+        # when the adaptive delay is at its INTERP_DELAY_MAX cap (see
+        # config). Pass an explicit value to override (tests use 200 for
+        # long sweeps).
         if max_snapshots is None:
             max_snapshots = SNAPSHOT_BUFFER_MAX
         self._snaps = []
@@ -1087,9 +875,9 @@ class SnapshotBuffer:
 
     def newest_time(self):
         """The sim time of the newest snapshot in the buffer (None when
-        empty). Session 7.1: the client's render clock anchors on this —
-        the host's own clock as carried by the wire — instead of the
-        display's wall clock."""
+        empty). The client's render clock anchors on this — the host's
+        own clock as carried by the wire — instead of the display's wall
+        clock."""
         if not self._snaps:
             return None
         return self._snaps[-1][0]
@@ -1097,12 +885,12 @@ class SnapshotBuffer:
     def latest_snapshot(self):
         """The newest snapshot in the buffer (None when empty).
 
-        10.3b fix: the ghost's handback decision needs the missile list
-        of the NEWEST snapshot — the one that actually carries a just-
-        launched missile — not just its missile_seq. The seq alone is
-        necessary but not sufficient: a missile the host launched after
-        the newest snapshot is provably NOT in the buffer yet, even
-        though its seq is below any future snapshot's seq."""
+        The ghost's handback decision needs the missile list of the
+        NEWEST snapshot — the one that actually carries a just-launched
+        missile — not just its missile_seq. The seq alone is necessary
+        but not sufficient: a missile the host launched after the newest
+        snapshot is provably NOT in the buffer yet, even though its seq
+        is below any future snapshot's seq."""
         if not self._snaps:
             return None
         return self._snaps[-1][1]
@@ -1162,16 +950,16 @@ class SnapshotBuffer:
             if ti <= render_t <= tj:
                 span = tj - ti
                 alpha = 0.0 if span <= 0.0 else (render_t - ti) / span
-                # Pass the REAL bracketing span as the projectile window
-                # (Session 7.2): predicted-position matching needs the
-                # time the prev bullets travel before the curr snapshot.
+                # Pass the REAL bracketing span as the projectile window:
+                # predicted-position matching needs the time the prev
+                # bullets travel before the curr snapshot.
                 return interp_positions(si, sj, alpha, dt=span)
         # Unreachable: render_t is strictly inside (t0, tN).
         return None
 
 
 class GhostMissile:
-    """A presentation missile the prediction ghost fired (10.3b).
+    """A presentation missile the prediction ghost fired.
 
     The client never runs the sim, so without this the player's own
     missiles appear only when the host's next snapshot arrives (~100 ms
@@ -1205,13 +993,13 @@ class GhostMissile:
         self.target = target             # _GhostEnemyProxy (or None)
         self.life = MISSILE_LIFE
         self.boost = MISSILE_BOOST_TIME
-        # 10.3e: set by handback_missiles once the buffer's copy is in the
-        # NEWEST snapshot. The missile is NOT culled then — the buffer's
-        # copy only becomes VISIBLE when the render point reaches the
-        # carrying snapshot (~INTERP_DELAY later). Until then the ghost
-        # keeps drawing it (no gap). predicted_view hands it off (removes
-        # it + seeds the decoupled render offset) on the frame the buffer
-        # copy is visible. Cleared implicitly when the missile leaves
+        # Set by handback_missiles once the buffer's copy is in the NEWEST
+        # snapshot. The missile is NOT culled then — the buffer's copy
+        # only becomes VISIBLE when the render point reaches the carrying
+        # snapshot (~INTERP_DELAY later). Until then the ghost keeps
+        # drawing it (no gap). predicted_view hands it off (removes it +
+        # seeds the decoupled render offset) on the frame the buffer copy
+        # is visible. Cleared implicitly when the missile leaves
         # local_missiles (handed off or life-culled).
         self.pending = False
 
@@ -1255,46 +1043,38 @@ class GhostMissile:
 
 
 class PredictedShip:
-    """Client-side prediction ghost for the local player's ship
-    (Session 5b.4a).
+    """Client-side prediction ghost for the local player's ship.
 
     The remote peer renders its OWN ship from the interpolation buffer at
-    `sim_time - INTERP_DELAY`, which feels ~100 ms laggy. The classic fix is
-    to predict the local ship: step a private Ship with the player's OWN
-    input at the sim's fixed rate, and snap it back to the authoritative
+    `sim_time - INTERP_DELAY`, which feels ~100 ms laggy. The fix is to
+    predict the local ship: step a private Ship with the player's OWN
+    input at the sim's fixed rate, and reconcile it to the authoritative
     ship snapshot when one lands. This class is that ghost — a full `Ship`
-    (not a minimal kinematic stand-in) so reconciliation reuses the existing
-    `apply_snapshot` round-trip and the physics stay faithful.
+    (not a minimal kinematic stand-in) so reconciliation reuses the
+    existing `apply_snapshot` round-trip and the physics stay faithful.
 
-    Clock discipline (Session 7.1): the ghost must step at the SIM's fixed
-    rate, not the display's. The caller feeds it real frame times via
-    `advance(dt, inp)`; the internal accumulator converts that to whole
-    `STEP` steps. Stepping once per display frame (the pre-7.1 behavior)
-    made the ghost integrate `refresh_rate / 60` times the sim's motion —
-    on a 144 Hz monitor it raced 2.4x ahead and every reconcile yanked it
-    back (the reported "spiking and snapbacking").
+    Clock discipline: the ghost must step at the SIM's fixed rate, not the
+    display's. The caller feeds it real frame times via `advance(dt, inp)`;
+    the internal accumulator converts that to whole `TICK` steps. Stepping
+    once per display frame would make the ghost integrate
+    `refresh_rate / 60` times the sim's motion (on a 144 Hz monitor it
+    raced 2.4x ahead and every reconcile yanked it back).
 
     The ghost is a PRESENTATION object: it is stepped with the local input
     and reconciled to authority, but it never feeds the sim. The sim stays
     authoritative on one peer; this only feeds the render.
 
-    Local bullets (Session 7.3): the ghost also keeps its OWN gun shots as
-    presentation `Bullet`s (`self.local_bullets`), so the player sees their
-    own fire immediately instead of waiting ~100 ms for the host's next
-    snapshot. They are stepped at the sim's rate (via `advance`) and culled
-    on expiry. They are NOT reconciled to the authoritative list: the 2P
+    Local bullets: the ghost also keeps its OWN gun shots as presentation
+    `Bullet`s (`self.local_bullets`), so the player sees their own fire
+    immediately instead of waiting ~100 ms for the host's next snapshot.
+    They are stepped at the sim's rate (via `advance`) and culled on
+    expiry. They are NOT reconciled to the authoritative list: the 2P
     snapshot carries no stable player id (both ships are ship_id 0), so the
     local player's authoritative bullets cannot be isolated by owner — and
     the ghost's own bullets ARE the local player's by construction (same
     input + weapon state the host applies). They are presentation only:
     they never collide, never feed the sim, and the remote peer's own
-    bullets still come from the interpolation buffer (Session 7.2).
-
-    Known limitation (v1): reconciliation is a FULL SNAP — the ghost jumps
-    to the authoritative position when a snapshot lands. Dead-reckoning
-    rewind (replaying a local input buffer from the last reconciled state)
-    is OUT of scope; the test (test_interpolation part e) measures and
-    bounds the resulting drift so it is not a silent regression.
+    bullets still come from the interpolation buffer.
 
     The Game-fed per-tick fields (`tracked`, `laser_target`,
     `missile_target`, `contacts`) are reset to their idle values before each
@@ -1304,40 +1084,40 @@ class PredictedShip:
     draw is exactly the drift the ghost is allowed to have — it is bounded
     by the test, not eliminated.
 
-    10.3a exception: `laser_target` is now picked from the caller's
+    `laser_target` and `missile_target` are picked from the caller's
     `enemies` proxies (the interpolation buffer's enemy entries) when
-    given — the ghost charges + fires a beam on the same tick the host
-    does, and the fired beams are kept as presentation entries in
-    `self.local_beams` (hull-local muzzle -> world target, aged at the
-    host's 0.15 s beam ttl; 10.4c re-anchors the muzzle to the ghost's
-    current pose at draw time). `contacts` stays idle (10.3c).
+    given — the SAME nearest-in-range math the host's `_pick_laser_target`
+    / `_pick_missile_target` use — so the ghost charges + fires a beam and
+    locks + launches a missile on the same tick the host does. The fired
+    beams are kept as presentation entries in `self.local_beams` (hull-
+    local muzzle -> world target, aged at the host's 0.15 s beam ttl;
+    predicted_view re-anchors the muzzle to the ghost's current pose at
+    draw time). The LAUNCHED missiles are kept as presentation
+    `GhostMissile`s in `self.local_missiles` (each with the same unique id
+    the host assigns — `(player_index, seq)` — so the client dedups it
+    against the buffer's copy; homing is client-side, steering toward the
+    buffer's enemy proxy for the target id). Call `step_local_beams` /
+    `step_local_missiles` after `step` to advance + cull the lists.
 
-    10.3b: `missile_target` is now picked from the caller's `enemies`
-    proxies too (the SAME nearest-in-range math the host's
-    `_pick_missile_target` uses), so the ghost locks + launches a missile
-    on the same tick the host does. The LAUNCHED missiles are kept as
-    presentation `GhostMissile`s in `self.local_missiles` (each with the
-    same unique id the host assigns — `(player_index, seq)` — so the
-    client dedups it against the buffer's copy; homing is client-side,
-    steering toward the buffer's enemy proxy for the target id). Call
-    `step_local_missiles` after `step` to advance + cull the list.
+    Full contract (ghost clock, reconcile/rewind, render pose, handoff)
+    in ARCHITECTURE.md.
     """
 
-    # Session 7.6: how much host time of local input to keep for rewind
-    # replay. 2 s is far more than the worst-case snapshot age (the
-    # adaptive delay caps the render lag at INTERP_DELAY_MAX = 0.35 s, and
-    # a snapshot is at most one interval old), so the buffer never runs out
-    # of the inputs a rewind needs — while staying small (a 2 s buffer at
-    # 60 Hz input sampling is ~120 entries).
+    # How much host time of local input to keep for rewind replay. 2 s is
+    # far more than the worst-case snapshot age (the adaptive delay caps
+    # the render lag at INTERP_DELAY_MAX = 0.35 s, and a snapshot is at
+    # most one interval old), so the buffer never runs out of the inputs
+    # a rewind needs — while staying small (~120 entries at 60 Hz input
+    # sampling).
     INPUT_BUFFER_MAX = 2.0
 
-    # 11.x diagnostics: an optional callable the game loop sets (when
-    # debug_net is on) to receive per-call ghost-clock records. Signature:
+    # Diagnostics: an optional callable the game loop sets (when debug_net
+    # is on) to receive per-call ghost-clock records. Signature:
     # fn(kind, rec) where kind is 'ADV' (one per advance() call) or
-    # 'REC' (one per reconcile_rewind() call) and rec is a dict of
-    # plain floats/ints. None by default (tests + the host's ghost): the
-    # hook is a no-op. The client loop (run_client) sets it to a writer
-    # that appends to ghost_clock.csv.
+    # 'REC' (one per reconcile_rewind() call) and rec is a dict of plain
+    # floats/ints. None by default (tests + the host's ghost): the hook is
+    # a no-op. The client loop (run_client) sets it to a writer that
+    # appends to ghost_clock.csv.
     diag_sink = None
 
     def __init__(self, hull=None, loadout=None, local_index=0):
@@ -1357,8 +1137,8 @@ class PredictedShip:
         # given but host_time not ready — the pre-first-snapshot window and
         # some tests, e.g. test_10_11c). They are NOT the live client clock:
         # on a real client host_time is always ready, so branch 2
-        # (_sim_time = host_time.now(real_time) + rtt_ow) is used and these
-        # are never read. See the GHOST CLOCK CONTRACT in advance().
+        # (_sim_time = host_time.now_smooth(real_time) + rtt_ow) is used and
+        # these are never read. See the GHOST CLOCK CONTRACT in advance().
         #
         # _real_base: the ghost's REAL-TIME base (pygame ticks / 1000) of
         # the last reconcile. Branch 3 free-runs at 1x real time from it:
@@ -1370,112 +1150,108 @@ class PredictedShip:
         # reconcile_rewind; 0.0 until the first reconcile.
         self._sim_base = 0.0
         # _rate: the branch-3 free-run rate (sim time per real time).
-        # Always 1.0 (the host sim runs at 1x real time); the 10.11d
-        # decision dropped the noisy HostTimeEstimator rate EMA here. Set
-        # in reconcile_rewind / seed; 1.0 until the first reconcile.
+        # Always 1.0 (the host sim runs at 1x real time). Set in
+        # reconcile_rewind / seed; 1.0 until the first reconcile.
         self._rate = 1.0
-        # 10.11c: the last sim time at which a physics step was executed
-        # (the most recent crossed tick boundary). The step trigger in
-        # `advance` is `floor(_sim_time / TICK) > floor(_last_step_time /
-        # TICK)` — a step runs once per crossed boundary, and `_acc` is
-        # `_sim_time - _last_step_time` (the render interpolation phase).
-        # Set in seed() and reconcile_rewind() to the post-reconcile
-        # `_sim_time` (no step is owed at the reconcile itself — the
-        # replay/apply already put the pose at `_sim_time`).
+        # The last sim time at which a physics step was executed (the most recent
+        # crossed tick boundary). The step trigger in `advance` is
+        # `floor(_sim_time / TICK) > floor(_last_step_time / TICK)` — a step
+        # runs once per crossed boundary, and `_acc` is `_sim_time -
+        # _last_step_time` (the render interpolation phase). Set in seed()
+        # and reconcile_rewind() to the post-reconcile `_sim_time` (no step
+        # is owed at the reconcile itself — the replay/apply already put the
+        # pose at `_sim_time`).
         self._last_step_time = 0.0
-        # 10.11: the ghost's current PHYSICS sim time (the time of its pose,
+        # The ghost's current PHYSICS sim time (the time of its pose,
         # `s.pos`). The ghost advances in real time between reconciles (via
         # `advance`), so `_sim_time` is AHEAD of the newest snapshot's stamp
         # by the amount of time the ghost has advanced since that snapshot
         # was taken. `reconcile_rewind` uses `_sim_time` as `now` (the replay
         # target) instead of the host-time estimate (which is anchored on the
-        # newest snapshot and equals `snap_time` exactly — the 0-tick replay
-        # that caused the sawtooth). Updated in `advance` (add n*TICK per
-        # step) and `reconcile_rewind` (set to snap_time + n*TICK after the
-        # replay). 0.0 until the first seed/reconcile.
+        # newest snapshot and equals `snap_time` exactly — a 0-tick replay).
+        # Updated in `advance` (add n*TICK per step) and `reconcile_rewind`
+        # (set to snap_time + n*TICK after the replay). 0.0 until the first
+        # seed/reconcile.
         self._sim_time = 0.0
-        # 10.9: the ghost's pose at the START of the current in-progress
-        # step, for sub-step render interpolation (render_pose). The ghost
-        # is drawn at lerp(_prev, curr, acc/TICK) — the same interpolation
-        # the host's local ship gets from _ship_pose(step_alpha) — instead
-        # of its raw post-step pos (which moves in 60 Hz jumps on a ~62 Hz
-        # display = the "jagged" local ship). Set in advance() before each
-        # step; reset to curr in seed()/reconcile_rewind() so a reconcile
-        # never adds a phantom lerp from the pre-reconcile pose. None until
-        # the first seed (render_pose is only called once seeded).
+        # The ghost's pose at the START of the current in-progress step, for
+        # sub-step render interpolation (render_pose). The ghost is drawn at
+        # lerp(_prev, curr, acc/TICK) — the same interpolation the host's
+        # local ship gets from _ship_pose(step_alpha) — instead of its raw
+        # post-step pos (which moves in 60 Hz jumps on a ~62 Hz display).
+        # Set in advance() before each step; reset to curr in
+        # seed()/reconcile_rewind() so a reconcile never adds a phantom lerp
+        # from the pre-reconcile pose. None until the first seed
+        # (render_pose is only called once seeded).
         self._prev_pos = None
         self._prev_angle = None
-        # 10.18: RENDER-ONLY pre-step state (the sawtooth fix). The physics
-        # pose (s.pos) sits at the replay end (snap_time + n*TICK), but the
-        # render clock (_sim_time) is L = rtt_ow AHEAD of it (the reconcile
-        # sets _sim_time = max(now, snap_time + n*TICK) with now =
-        # snap_time + L). Rendering the physics pose directly pins the
-        # render to snap_time while the clock is at snap_time + L — each
-        # reconcile then jumps the pose 1 tick (the 8.67 px sawtooth).
-        # The fix: render at the CLOCK's time. _render_base is the pose
-        # at the replay end (== s.pos at reconcile time); _render_next is
-        # the pose ONE TICK ahead (a kinematic pre-step — see
-        # _render_pre_step). render_pose lerps _render_base -> _render_next
-        # at alpha = L/TICK, so the render pose sits at snap_time + L
-        # (the clock's time) and is continuous across the reconcile.
-        # None until the first seed/reconcile.
+        # RENDER-ONLY pre-step state (the sawtooth fix). The physics pose (s.pos)
+        # sits at the replay end (snap_time + n*TICK), but the render clock
+        # (_sim_time) is L = rtt_ow AHEAD of it (the reconcile sets
+        # _sim_time = max(now, snap_time + n*TICK) with now = snap_time + L).
+        # Rendering the physics pose directly pins the render to snap_time
+        # while the clock is at snap_time + L — each reconcile then jumps
+        # the pose 1 tick (the sawtooth). The fix: render at the CLOCK's
+        # time. _render_base is the pose at the replay end (== s.pos at
+        # reconcile time); _render_next is the pose ONE TICK ahead (a
+        # kinematic pre-step — see _render_pre_step). render_pose lerps
+        # _render_base -> _render_next at alpha = L/TICK, so the render pose
+        # sits at snap_time + L (the clock's time) and is continuous across
+        # the reconcile. None until the first seed/reconcile.
         self._render_base = None
         self._render_base_angle = None
         self._render_next = None
         self._render_next_angle = None
-        # 10.18: the last ShipInput the ghost was stepped with (set in
-        # step()). The render pre-step reads its .turn to predict the
-        # angular motion over the L gap. None before the first step (the
-        # pre-step then coasts straight — no turn).
+        # The last ShipInput the ghost was stepped with (set in step()).
+        # The render pre-step reads its .turn to predict the angular motion
+        # over the L gap. None before the first step (the pre-step then
+        # coasts straight — no turn).
         self._last_inp = None
-        # Session 7.6: the local input buffer — (host_time, ShipInput) pairs,
-        # oldest first, bounded to INPUT_BUFFER_MAX seconds of host time.
-        # `host_time` is the client's estimate of the host's sim clock at the
-        # moment the input was sampled (the 7.1 HostTimeEstimator), so a
+        # The local input buffer — (host_time, ShipInput) pairs, oldest
+        # first, bounded to INPUT_BUFFER_MAX seconds of host time.
+        # `host_time` is the client's estimate of the host's sim clock at
+        # the moment the input was sampled (the HostTimeEstimator), so a
         # snapshot arriving at sim time T can replay the inputs the host
         # actually applied between T and now (see `reconcile_rewind`).
         self._input_buffer = []
-        # 10.10: the input-ECHO buffer — (sim_time, ShipInput) pairs, oldest
-        # first, bounded to INPUT_BUFFER_MAX seconds of sim time (the same
-        # bound as _input_buffer). These are the inputs the host ACTUALLY
-        # applied to the local player (player 1), echoed per tick over the
-        # wire (T_ECHO, see net.py) and stamped with the tick's sim_time —
+        # The input-ECHO buffer — (sim_time, ShipInput) pairs, oldest first,
+        # bounded to INPUT_BUFFER_MAX seconds of sim time (the same bound as
+        # _input_buffer). These are the inputs the host ACTUALLY applied to
+        # the local player (player 1), echoed per tick over the wire
+        # (T_ECHO, see net.py) and stamped with the tick's sim_time —
         # authoritative, unlike _input_buffer's client-estimated stamps.
-        # reconcile_rewind prefers them for the replay (the high-speed
-        # snapback fix: the host applied the latest input it had RECEIVED,
-        # up to one-way latency stale — the client's own sent input
-        # diverges from that on an input change). Falls back to
-        # _input_buffer when no echo covers a tick (initial transient /
-        # loss — a dropped echo holds the last echoed input, exactly what
-        # the host itself did).
+        # reconcile_rewind prefers them for the replay (the host applied the
+        # latest input it had RECEIVED, up to one-way latency stale — the
+        # client's own sent input diverges from that on an input change).
+        # Falls back to _input_buffer when no echo covers a tick (initial
+        # transient / loss — a dropped echo holds the last echoed input,
+        # exactly what the host itself did).
         self._echo_buffer = []
-        # 10.11: the LAST reconcile's replay length, for the net-debug CSV
-        # (the sawtooth diagnosis). _last_replay_ticks = the whole-tick
-        # count `n` the rewind replayed; _last_replay_span = the raw
-        # (now - snap_time) seconds that `n` was truncated from. Both are
-        # 0/0 until the first reconcile (and on the no-replay path).
+        # The LAST reconcile's replay length, for the net-debug CSV.
+        # _last_replay_ticks = the whole-tick count `n` the rewind replayed;
+        # _last_replay_span = the raw (now - snap_time) seconds that `n` was
+        # truncated from. Both are 0/0 until the first reconcile (and on the
+        # no-replay path).
         self._last_replay_ticks = 0
         self._last_replay_span = 0.0
-        # Session 7.3: the ghost's OWN gun shots, as presentation Bullets.
-        # The client never runs the sim, so without this the player's own
-        # shots appear only when the host's next snapshot arrives (~100 ms
-        # later) — "I fired and nothing happened for a tenth of a second".
+        # The ghost's OWN gun shots, as presentation Bullets. The client never
+        # runs the sim, so without this the player's own shots appear only
+        # when the host's next snapshot arrives (~100 ms later).
         # `local_index` is the local player's index (0 = host, 1 = client);
         # it is carried for diagnostics and so a future session can match
         # the authoritative local-owner bullets (the 2P snapshot carries no
-        # stable player id — both ships are ship_id 0 — so 7.3 keeps the
-        # ghost's own bullets as the local player's by construction).
+        # stable player id — both ships are ship_id 0 — so the ghost's own
+        # bullets are the local player's by construction).
         self.local_index = local_index
         self.local_bullets = []
-        # 10.3a: the ghost's OWN laser discharges, as presentation entries
+        # The ghost's OWN laser discharges, as presentation entries
         # [start, end, age, ttl] in WORLD space (muzzle -> target). The
         # client never runs the sim, so without this the player's own beam
         # appears only when the host's next snapshot arrives (~100 ms
         # later). Like local_bullets these are presentation only: no
         # collision, no sim feedback.
         self.local_beams = []
-        # 10.3b: the ghost's OWN missiles, as presentation GhostMissiles.
-        # The client never runs the sim, so without this the player's own
+        # The ghost's OWN missiles, as presentation GhostMissiles. The
+        # client never runs the sim, so without this the player's own
         # missiles appear only when the host's next snapshot arrives
         # (~100 ms later) — and the buffer's copy of the SAME missile would
         # then be drawn a second time (the double-draw). Each carries the
@@ -1484,7 +1260,7 @@ class PredictedShip:
         # snapshot on reconcile), so predicted_view dedups it against the
         # buffer's copy. Homing is client-side (see GhostMissile).
         self.local_missiles = []
-        # 10.6 V/G/T (option A): when True, the ghost's SENSOR state
+        # V/G/T (option A): when True, the ghost's SENSOR state
         # (targeting_on, sensor_on, scan_cd, scan_reveal, scan_dump,
         # scan_pulse) is CLIENT-AUTHORITATIVE — the client's V/G/T keys
         # mutate it directly (via the command sink) and reconcile must
@@ -1509,33 +1285,33 @@ class PredictedShip:
 
     @property
     def sim_time(self):
-        """The ghost's current PHYSICS sim time (10.11) — the time of its
-        pose, `s.pos`. The ghost advances in real time between reconciles
-        (via `advance`), so this is AHEAD of the newest snapshot's stamp by
-        the amount of time the ghost has advanced since that snapshot was
-        taken. `push_snapshot` passes this as `now` to `reconcile_rewind`
-        (the replay target) instead of the host-time estimate — the estimate
-        is anchored on the newest snapshot and equals `snap_time` exactly,
-        which made the replay 0 ticks and left the ghost's real-time advance
-        un-replayed (the sawtooth). Updated in `advance` (adds n*TICK per
-        step) and `reconcile_rewind` (sets snap_time + n*TICK after the
-        replay). 0.0 until the first seed/reconcile."""
+        """The ghost's current PHYSICS sim time — the time of its pose, `s.pos`.
+        The ghost advances in real time between reconciles (via `advance`),
+        so this is AHEAD of the newest snapshot's stamp by the amount of
+        time the ghost has advanced since that snapshot was taken.
+        `push_snapshot` passes this as `now` to `reconcile_rewind` (the
+        replay target) instead of the host-time estimate — the estimate is
+        anchored on the newest snapshot and equals `snap_time` exactly,
+        which would make the replay 0 ticks and leave the ghost's real-time
+        advance un-replayed. Updated in `advance` (adds n*TICK per step)
+        and `reconcile_rewind` (sets snap_time + n*TICK after the replay).
+        0.0 until the first seed/reconcile."""
         return self._sim_time
 
     def seed(self, ship_s, snap_time=0.0, real_time=None, rate=1.0):
         """Apply the FIRST authoritative ship snapshot (index 0 of the Game
         snapshot) to the ghost. Subsequent snapshots use `reconcile`.
 
-        10.11: `snap_time` (the snapshot's sim time) initializes the
-        ghost's physics clock (`_sim_time`) so the first `reconcile_rewind`
-        has a valid `now` (the ghost's current sim time) to replay from.
+        `snap_time` (the snapshot's sim time) initializes the ghost's
+        physics clock (`_sim_time`) so the first `reconcile_rewind` has a
+        valid `now` (the ghost's current sim time) to replay from.
 
         `real_time` (the client's real time at the seed) anchors the
         branch-3 free-run clock (see the GHOST CLOCK CONTRACT in
         advance())."""
         self._ship.apply_snapshot(ship_s)
         self._seeded = True
-        self._sim_time = snap_time   # 10.11: start the physics clock
+        self._sim_time = snap_time   # start the physics clock
         # Anchor the branch-3 free-run clock to the seed. The pose is at
         # snap_time, so _last_step_time = snap_time (render phase 0).
         self._sim_base = snap_time
@@ -1543,33 +1319,29 @@ class PredictedShip:
         self._last_step_time = snap_time
         # Branch 3 free-runs at exactly 1x real time (the host sim runs at
         # 1x real time overall). The `rate` param is kept for API
-        # compatibility but ignored (the 10.11d decision dropped the noisy
-        # HostTimeEstimator rate EMA).
+        # compatibility but ignored.
         self._rate = 1.0
-        # 10.9: start the render interpolation from the seeded pose (no
-        # phantom lerp from a pre-seed pose).
+        # Start the render interpolation from the seeded pose (no phantom
+        # lerp from a pre-seed pose).
         self._prev_pos = pygame.Vector2(self._ship.pos)
         self._prev_angle = self._ship.angle
 
     def reconcile(self, ship_s):
-        """Snap the ghost to an authoritative ship snapshot.
-
-        Full snap for v1 (see class docstring for the dead-reckoning
-        limitation). Idempotent with `seed` — a caller may use either for
-        the first snapshot. Session 7.6: the game loop uses
-        `reconcile_rewind` instead (dead-reckoning); this stays for tests
-        and as the v1 fallback."""
+        """Snap the ghost to an authoritative ship snapshot (full snap, no
+        replay). Idempotent with `seed` — a caller may use either for the
+        first snapshot. The game loop uses `reconcile_rewind` instead
+        (dead-reckoning); this stays for tests and as the simple fallback."""
         self._capture_client_sensor_state()
         self._ship.apply_snapshot(ship_s)
         self._seeded = True
         self._restore_client_sensor_state()
-        # 10.9: the reconcile moved the pose — restart the render
-        # interpolation from the new pose (no phantom lerp).
+        # The reconcile moved the pose — restart the render interpolation
+        # from the new pose (no phantom lerp).
         self._prev_pos = pygame.Vector2(self._ship.pos)
         self._prev_angle = self._ship.angle
 
     def _capture_client_sensor_state(self):
-        """10.6 V/G/T (option A): save the ghost's sensor fields before an
+        """V/G/T (option A): save the ghost's sensor fields before an
         apply_snapshot overwrites them. No-op when the client is not
         authoritative for its sensor state (host's ghost + tests)."""
         if not self.client_sensor_authoritative:
@@ -1583,8 +1355,8 @@ class PredictedShip:
         self._client_scan_pulse = s.scan_pulse
 
     def _restore_client_sensor_state(self):
-        """10.6 V/G/T (option A): re-apply the ghost's own sensor state
-        after an apply_snapshot, when the client is authoritative for it.
+        """V/G/T (option A): re-apply the ghost's own sensor state after an
+        apply_snapshot, when the client is authoritative for it.
 
         apply_snapshot restores the host's sensor fields (sensor_on,
         scan_cd, scan_reveal, scan_dump, scan_pulse, targeting_on) — but
@@ -1606,15 +1378,15 @@ class PredictedShip:
         s.scan_pulse = self._client_scan_pulse
 
     def record_input(self, host_time, inp):
-        """Record the local input sampled at host time `host_time`
-        (Session 7.6). `host_time` is the client's estimate of the host's
-        sim clock at the moment the input was sampled (the 7.1
-        HostTimeEstimator) — NOT the local wall clock — so that when a
-        snapshot arrives at sim time T, `reconcile_rewind` can replay the
-        inputs the host actually applied between T and now: the host
-        applies the LATEST received input each tick (pinned #5), so the
-        replay must select inputs by their host-time stamp, and the stamp
-        must be in the host's clock for that selection to line up.
+        """Record the local input sampled at host time `host_time`.
+        `host_time` is the client's estimate of the host's sim clock at
+        the moment the input was sampled (the HostTimeEstimator) — NOT the
+        local wall clock — so that when a snapshot arrives at sim time T,
+        `reconcile_rewind` can replay the inputs the host actually applied
+        between T and now: the host applies the LATEST received input each
+        tick (pinned #5), so the replay must select inputs by their
+        host-time stamp, and the stamp must be in the host's clock for
+        that selection to line up.
 
         The buffer is bounded to INPUT_BUFFER_MAX seconds of host time
         (oldest entries dropped). `inp` is stored by reference; the caller
@@ -1627,12 +1399,12 @@ class PredictedShip:
             self._input_buffer.pop(0)
 
     def record_echo(self, sim_time, inp):
-        """Record one input-echo entry (10.10): the input the host
-        ACTUALLY applied to the local player on the tick that STARTS at
-        `sim_time` (the T_ECHO message's stamp — the host's own sim clock,
-        not the client's estimate). The client loop calls this once per
-        T_ECHO entry, in arrival order (the wire is in-order TCP, so the
-        buffer stays ordered by sim_time).
+        """Record one input-echo entry: the input the host ACTUALLY applied to
+        the local player on the tick that STARTS at `sim_time` (the T_ECHO
+        message's stamp — the host's own sim clock, not the client's
+        estimate). The client loop calls this once per T_ECHO entry, in
+        arrival order (the wire is in-order TCP, so the buffer stays
+        ordered by sim_time).
 
         Bounded to INPUT_BUFFER_MAX seconds of sim time (oldest dropped) —
         the same bound as `record_input`: a rewind replays at most
@@ -1647,88 +1419,86 @@ class PredictedShip:
 
     def reconcile_rewind(self, ship_s, snap_time, now, enemies=None,
                      real_time=None, rate=1.0):
-        """Dead-reckoning reconcile (Session 7.6) — replaces the v1 full
-        snap. Apply the authoritative ship snapshot taken at sim time
-        `snap_time`, then REPLAY the local inputs the host applied between
-        `snap_time` and `now`, so the ghost ends up at exactly
-        `authority @ snap_time + local inputs since snap_time` — the
-        100 ms of prediction is REBUILT, not snapped (pinned #4).
+        """Dead-reckoning reconcile. Apply the authoritative ship snapshot taken
+        at sim time `snap_time`, then REPLAY the local inputs the host
+        applied between `snap_time` and `now`, so the ghost ends up at
+        exactly `authority @ snap_time + local inputs since snap_time` —
+        the 100 ms of prediction is REBUILT, not snapped (pinned #4).
+        Full contract in ARCHITECTURE.md.
 
-        10.3a: `enemies` (a list of lightweight enemy proxies, see
-        `step`) is fed to each replayed step so the replayed laser
-        charge/lock state matches the host's (the host's replayed ticks
-        saw the live enemies in the wedge). The caller passes the
-        buffer's enemy proxies at the snapshot's render point; a None
-        (tests) replays with no targets — the pre-10.3a behavior.
+        `enemies` (a list of lightweight enemy proxies, see `step`) is fed
+        to each replayed step so the replayed laser charge/lock state
+        matches the host's (the host's replayed ticks saw the live enemies
+        in the wedge). The caller passes the buffer's enemy proxies at the
+        snapshot's render point; a None (tests) replays with no targets.
 
         The replay mirrors the host's own tick loop: for each sim tick T
-        from snap_time to now (step STEP), the host applies the LATEST
+        from snap_time to now (step TICK), the host applies the LATEST
         received input (pinned #5), so the replay steps the ghost with the
         newest buffered input whose host_time <= T. That input-selection
         is what makes the replay reproduce the host's motion — the
         test_interpolation (l) battery proves it to ~1e-9 with the same
         input the host used.
 
-        The 7.3 local bullet list is rebuilt the same way: `step` re-fires
+        The local bullet list is rebuilt the same way: `step` re-fires
         from the ghost's re-seeded weapon state (apply_snapshot restores
         cooldown/charge/lock), so the ghost's own shots resume from the
         authoritative fire cadence instead of the predicted one.
 
         `now` is the client's current estimate of the host's sim clock
         (the same value the caller uses to stamp inputs). The replay runs
-        at most (now - snap_time)/STEP steps — one snapshot interval
+        at most (now - snap_time)/TICK steps — one snapshot interval
         (~6 steps) in steady state. The fixed-step accumulator is reset
         so the next `advance` starts clean from the replayed state.
 
-        10.6 V/G/T (option A): the client's sensor state is captured
-        before the apply_snapshot (which would overwrite it with the
-        host's) and restored after, so the replay advances the CLIENT's
-        sensor state forward (the host never saw the client's V/G/T).
+        V/G/T (option A): the client's sensor state is captured before the
+        apply_snapshot (which would overwrite it with the host's) and
+        restored after, so the replay advances the CLIENT's sensor state
+        forward (the host never saw the client's V/G/T).
         """
         self._capture_client_sensor_state()
-        # 11.x diagnostics: the pre-reconcile clock state (the REC record).
+        # Diagnostics: the pre-reconcile clock state (the REC record).
         _pre_sim, _pre_last = self._sim_time, self._last_step_time
-        # 10.11: the replay (step, not advance) moves the physics state but
-        # does NOT touch `_acc` or `_sim_time`. After the replay, the
-        # physics clock is set to max(now, snap_time + n*TICK) and the
-        # accumulator to the time since the last replayed step (see the
-        # end of this method).
+        # The replay (step, not advance) moves the physics state but does
+        # NOT touch `_acc` or `_sim_time`. After the replay, the physics
+        # clock is set to max(now, snap_time + n*TICK) and the accumulator
+        # to the time since the last replayed step (see the end of this
+        # method).
         self._ship.apply_snapshot(ship_s)
         self._seeded = True
         self._restore_client_sensor_state()
         self._acc = 0.0
-        # 10.10: the replay's input source is the host's ACTUAL applied
-        # input — the echo buffer (T_ECHO, stamped with the host's own sim
-        # clock) — when it has anything, else the client's own sent input
-        # (the 7.6 behavior: initial transient before the first echo, or
-        # total loss). Both buffers are (time, ShipInput) pairs ordered by
-        # time, so the pointer math below is a drop-in swap of the source.
-        # The echo kills the in-flight-input snapback: on an input CHANGE
-        # the client's own input is one-way-latency ahead of what the host
+        # The replay's input source is the host's ACTUAL applied input —
+        # the echo buffer (T_ECHO, stamped with the host's own sim clock)
+        # — when it has anything, else the client's own sent input
+        # (initial transient before the first echo, or total loss). Both
+        # buffers are (time, ShipInput) pairs ordered by time, so the
+        # pointer math below is a drop-in swap of the source. The echo
+        # kills the in-flight-input snapback: on an input CHANGE the
+        # client's own input is one-way-latency ahead of what the host
         # actually applied, and the old replay (own input) diverged
         # ~MAX_SPEED x latency before the reconcile yanked it back. A
         # dropped echo degrades gracefully — the monotone pointer holds
         # the last echoed input across the gap, exactly what the host
         # itself did (pinned #5).
         buf = self._echo_buffer or self._input_buffer
-        # 10.11: record the replay length for the net-debug CSV (the
-        # sawtooth diagnosis). `n` (whole ticks replayed) + the raw span
-        # (now - snap_time) are the two numbers that decide the ghost's
-        # post-reconcile pose. Set to 0/0 on the no-replay path.
+        # Record the replay length for the net-debug CSV. `n` (whole ticks
+        # replayed) + the raw span (now - snap_time) are the two numbers
+        # that decide the ghost's post-reconcile pose. Set to 0/0 on the
+        # no-replay path.
         self._last_replay_ticks = 0
         self._last_replay_span = (now - snap_time)
         if not buf:
-            # 10.9: no replay — the pose is the snapshot's; anchor the
-            # render interpolation on it (no phantom lerp).
+            # No replay — the pose is the snapshot's; anchor the render
+            # interpolation on it (no phantom lerp).
             self._prev_pos = pygame.Vector2(self._ship.pos)
             self._prev_angle = self._ship.angle
-            # 10.11: no replay — the pose IS the snapshot's (at snap_time).
-            # Set the physics clock to max(now, snap_time) and the
-            # accumulator to the time since the snapshot's pose (the same
-            # logic as the replayed path with n=0). Keeping the clock at
-            # `now` (not snap_time) avoids pulling it back, which would
-            # make the ghost fall behind the host (the negative
-            # replay_ticks / lag spikes).
+            # No replay — the pose IS the snapshot's (at snap_time). Set
+            # the physics clock to max(now, snap_time) and the accumulator
+            # to the time since the snapshot's pose (the same logic as the
+            # replayed path with n=0). Keeping the clock at `now` (not
+            # snap_time) avoids pulling it back, which would make the ghost
+            # fall behind the host (the negative replay_ticks / lag spikes).
             self._sim_time = max(now, snap_time)
             self._acc = self._sim_time - snap_time
             # Anchor the branch-3 free-run clock to this reconcile (see the
@@ -1740,7 +1510,7 @@ class PredictedShip:
             self._last_step_time = snap_time
             # Branch 3 free-runs at exactly 1x real time (see seed()).
             self._rate = 1.0
-            # 11.x diagnostics: the no-replay REC record.
+            # Diagnostics: the no-replay REC record.
             self._diag('REC', {'real_time': real_time, 'snap_time': snap_time,
                                 'now': now, 'n': 0,
                                 'pre_sim': _pre_sim, 'pre_last': _pre_last,
@@ -1750,26 +1520,26 @@ class PredictedShip:
             return
         # Walk the sim ticks from snap_time to now. `i` is the tick index
         # (0 = snap_time itself, the snapshot's own tick — already applied
-        # by the snapshot, so the first replayed tick is snap_time + STEP).
+        # by the snapshot, so the first replayed tick is snap_time + TICK).
         # Index of the newest buffered input with host_time <= tick time.
         # The buffer is ordered by host_time (input is sampled in order),
         # so this is a monotone pointer.
         j = -1
-        # The number of whole STEP steps between snap_time and now. The
+        # The number of whole TICK steps between snap_time and now. The
         # snapshot reflects the state AFTER the tick that ended at
         # snap_time, so the first replayed tick is the one that STARTS at
         # snap_time (the host applies the input stamped at a tick's start
         # during that tick — the client records the input at the same
         # host-time the host samples it).
         n = int((now - snap_time) / TICK + 1e-9)
-        # 10.11: clamp n to >= 0. When the ghost's clock falls behind the
+        # Clamp n to >= 0. When the ghost's clock falls behind the
         # snapshot (now < snap_time, from a lag spike), the replay span is
         # negative. Replaying negative ticks is meaningless (the ghost is
         # already behind the snapshot), so skip the replay (n=0) and let
         # the accumulator clamp to 0 below. The ghost will catch up on the
         # next reconcile (when now > snap_time again).
         n = max(0, n)
-        self._last_replay_ticks = n   # 10.11: net-debug CSV
+        self._last_replay_ticks = n   # net-debug CSV
         for i in range(n):
             t = snap_time + i * TICK
             while j + 1 < len(buf) and buf[j + 1][0] <= t + 1e-9:
@@ -1778,8 +1548,8 @@ class PredictedShip:
             self.step(TICK, inp, enemies=enemies)
             self.step_local_bullets(TICK)
             self.step_local_beams(TICK)
-            self.step_local_missiles(TICK, enemies)   # 10.3b
-        # 10.11: the replay moved the physics state to snap_time + n*TICK. Set the
+            self.step_local_missiles(TICK, enemies)
+        # The replay moved the physics state to snap_time + n*TICK. Set the
         # physics clock to max(now, snap_time + n*TICK):
         #   - normal case (now >= snap_time): the clock stays at `now` (the
         #     ghost's current sim time, AHEAD of the snapshot). This avoids
@@ -1803,87 +1573,78 @@ class PredictedShip:
         self._last_step_time = snap_time + n * TICK
         # Branch 3 free-runs at exactly 1x real time (see seed()).
         self._rate = 1.0
-        # 11.x diagnostics: the replayed REC record.
+        # Diagnostics: the replayed REC record.
         self._diag('REC', {'real_time': real_time, 'snap_time': snap_time,
                             'now': now, 'n': n,
                             'pre_sim': _pre_sim, 'pre_last': _pre_last,
                             'post_sim': self._sim_time,
                             'post_last': self._last_step_time,
                             'post_acc': self._acc})
-        # 10.16 pre-step REMOVED (10.17). It advanced the PHYSICS pose one tick
-        # ahead of the ghost's own clock (_sim_time), so after a reconcile
-        # the pose was at snap_time+(n+1)*TICK while _sim_time was at
-        # snap_time+n*TICK. That made the pose and the clock disagree, and
-        # the render interpolation (which lerps _prev -> curr at
-        # _acc/TICK) had a "next" pose to chase that was one tick ahead of
-        # where the clock said the ghost was. The phase rewrite (step 4)
-        # makes the pose and the clock agree, so the pre-step is gone.
-        # The pose is now at snap_time + n*TICK (the replay end), and
+        # The pose is at snap_time + n*TICK (the replay end), and
         # _last_step_time is the same, so the render interpolation phase
         # is _acc = _sim_time - _last_step_time (in [0, TICK)).
 
     def step(self, dt, inp, enemies=None):
         """Advance the ghost ONE fixed step with the LOCAL input.
 
-        `dt` is passed by the caller (the sim's STEP) because netcode.py
+        `dt` is passed by the caller (the sim's TICK) because netcode.py
         must not import it from game.py (game.py imports netcode.py). The
         Game-fed per-tick fields are reset to idle before the step — the
         ghost has no enemy list to target (see class docstring).
 
-        Session 7.3: the SHOTS the ghost's gun fires this step are kept as
-        presentation `Bullet`s in `self.local_bullets` (capped at
-        MAX_BULLETS, mirroring the host's world cap) so the player sees
-        their own shots immediately instead of waiting ~100 ms for the
-        host's next snapshot. Call `step_local_bullets` after `step` to
-        advance + cull the list (the game loop does this via `advance`).
+        The SHOTS the ghost's gun fires this step are kept as presentation
+        `Bullet`s in `self.local_bullets` (capped at MAX_BULLETS,
+        mirroring the host's world cap) so the player sees their own shots
+        immediately instead of waiting ~100 ms for the host's next
+        snapshot. Call `step_local_bullets` after `step` to advance +
+        cull the list (the game loop does this via `advance`).
 
-        10.3a: `enemies` is a list of lightweight enemy proxies (objects
-        exposing `.pos`) built by the caller from the interpolation
-        buffer's enemy entries. When given, the ghost's laser target is
-        picked from them (the SAME nearest-in-range math the host's
-        `_pick_laser_target` uses) so the ghost charges + fires a beam on
-        the same tick the host does. The BEAMS `s.update()` returns are
-        kept as presentation entries in `self.local_beams` (hull-local
-        muzzle -> world target; 10.4c re-anchors the muzzle to the ghost's
-        current pose at draw time), so the player sees their own beam immediately
+        `enemies` is a list of lightweight enemy proxies (objects exposing
+        `.pos`) built by the caller from the interpolation buffer's enemy
+        entries. When given, the ghost's laser target is picked from them
+        (the SAME nearest-in-range math the host's `_pick_laser_target`
+        uses) so the ghost charges + fires a beam on the same tick the
+        host does. The BEAMS `s.update()` returns are kept as presentation
+        entries in `self.local_beams` (hull-local muzzle -> world target;
+        predicted_view re-anchors the muzzle to the ghost's current pose
+        at draw time), so the player sees their own beam immediately
         instead of waiting ~100 ms for the host's next snapshot. Call
         `step_local_beams` after `step` to age + cull the list. When
         `enemies` is None (tests, or before the buffer has a window) the
-        laser target stays None — the pre-10.3a behavior.
+        laser target stays None.
 
         The game loop does NOT call this directly — it calls `advance`,
         which decides how many fixed steps a real frame warrants. Tests
         call it directly to step the ghost at exactly the sim's rate.
         """
         s = self._ship
-        # 10.18: remember the input for the render pre-step (it reads
-        # .turn to predict the angular motion over the L gap).
+        # Remember the input for the render pre-step (it reads .turn to
+        # predict the angular motion over the L gap).
         self._last_inp = inp
         s.tracked = 0
         s.laser_target = self._pick_laser_target(s, enemies)
-        # 10.3b: pick the ghost's missile target from the proxies (the SAME
+        # Pick the ghost's missile target from the proxies (the SAME
         # nearest-in-range math the host's _pick_missile_target uses), so
         # the ghost locks + launches on the same tick the host does.
         s.missile_target = self._pick_missile_target(s, enemies)
         s.contacts = []
         shots, beams, missiles = s.update(dt, inp)
-        # 10.3c: build the ghost's sensor contacts AFTER s.update — the
-        # ghost's own sensor state (sensor_on, scan_reveal, scan_cd) is
-        # this tick's value (synced from the snapshot on reconcile, and
-        # mutated immediately by the client's V/G command sink), so the
-        # contacts match what the host's _update_contacts would produce
-        # given the same sensor state + the same enemy positions. The
-        # enemies are the buffer's proxies (at the render point, ~
-        # INTERP_DELAY behind the host's live positions) — acceptable for
-        # presentation (the contacts are 10 Hz blips/arrows).
+        # Build the ghost's sensor contacts AFTER s.update — the ghost's
+        # own sensor state (sensor_on, scan_reveal, scan_cd) is this
+        # tick's value (synced from the snapshot on reconcile, and mutated
+        # immediately by the client's V/G command sink), so the contacts
+        # match what the host's _update_contacts would produce given the
+        # same sensor state + the same enemy positions. The enemies are
+        # the buffer's proxies (at the render point, ~INTERP_DELAY behind
+        # the host's live positions) — acceptable for presentation (the
+        # contacts are 10 Hz blips/arrows).
         self._update_contacts(s, enemies)
-        # Keep the ghost's own gun shots (Session 7.3). The host's world
-        # cap is MAX_BULLETS total; the ghost's list holds only the local
-        # player's shots, so capping it at MAX_BULLETS is a faithful
-        # (slightly generous) stand-in — the gun's own cooldown is the
-        # real limiter.
-        # 10.7: each ghost bullet gets the SAME unique id the host assigns
-        # at fire — (player_index, per-ship bullet_seq) — and the ghost's
+        # Keep the ghost's own gun shots. The host's world cap is
+        # MAX_BULLETS total; the ghost's list holds only the local player's
+        # shots, so capping it at MAX_BULLETS is a faithful (slightly
+        # generous) stand-in — the gun's own cooldown is the real limiter.
+        # Each ghost bullet gets the SAME unique id the host assigns at
+        # fire — (player_index, per-ship bullet_seq) — and the ghost's
         # bullet_seq is bumped to match (it is resynced to the host's via
         # the ship snapshot on reconcile, so the ids stay aligned). The id
         # is the no-double-draw dedup key: predicted_view skips the
@@ -1891,44 +1652,43 @@ class PredictedShip:
         # ghost draws it, predicted, immediate). `pending` (set by
         # handback_bullets) marks a bullet whose buffer copy is visible in
         # the newest snapshot — predicted_view hands it off to the buffer
-        # once that copy has ADVANCED (the 10.3g wait-until-advancing
-        # rule, reused).
+        # once that copy has ADVANCED (the wait-until-advancing rule,
+        # reused from the missile handoff).
         for shot in shots:
             if len(self.local_bullets) < MAX_BULLETS:
                 seq_before = s.bullet_seq
                 bid = (self.local_index, seq_before)
                 s.bullet_seq += 1
-                # 10.7 fix: the reconcile REWIND (reconcile_rewind) re-runs
-                # the fire tick after apply_snapshot has RESET bullet_seq
-                # to the host's pre-fire value — so the replay re-fires the
-                # SAME bullet with the SAME id the prediction already
-                # emitted in advance(). Without this guard the ghost would
-                # hold two Bullets of one id (the in-flight one + a fresh
-                # one at the muzzle): the player sees a double-draw and,
-                # because the buffer's copy is suppressed by the id-dedup,
-                # BOTH visible ones are collision-less ghost bullets. Skip
-                # the re-fire when the id is already in flight (the
-                # prediction's copy is the fresher one).
+                # The reconcile REWIND (reconcile_rewind) re-runs the fire
+                # tick after apply_snapshot has RESET bullet_seq to the
+                # host's pre-fire value — so the replay re-fires the SAME
+                # bullet with the SAME id the prediction already emitted in
+                # advance(). Without this guard the ghost would hold two
+                # Bullets of one id (the in-flight one + a fresh one at the
+                # muzzle): the player sees a double-draw and, because the
+                # buffer's copy is suppressed by the id-dedup, BOTH visible
+                # ones are collision-less ghost bullets. Skip the re-fire
+                # when the id is already in flight (the prediction's copy
+                # is the fresher one).
                 if any(tuple(b.id) == bid for b in self.local_bullets):
                     continue
                 b = Bullet(shot.pos, shot.vel, owner=shot.owner, bid=bid)
-                b.pending = False   # 10.7: handback state (client-only)
+                b.pending = False   # handback state (client-only)
                 self.local_bullets.append(b)
-        # 10.3a: keep the ghost's own laser discharges as presentation
-        # entries [local_start, end, age, ttl]. 10.4c (detach fix): the
-        # muzzle is the HULL-LOCAL offset (beam.local_start), NOT the frozen
-        # world-space point (beam.start) — predicted_view re-anchors it to
-        # the ghost's CURRENT pose each frame (the exact math the host's
-        # _draw_world_beam uses for its own beams, and the 10.4b remote-beam
-        # fix). Storing the world-space muzzle drew the origin at where the
-        # muzzle WAS at fire time, so as the ghost moved during the 0.15 s
-        # flash the origin was left behind in empty space (the same bug the
-        # 10.4b remote path had). A LIST (not tuple) so step_local_beams can
-        # age `b[2]` in place (mirrors the host's `self.beams` list-of-lists).
+        # Keep the ghost's own laser discharges as presentation entries
+        # [local_start, end, age, ttl]. The muzzle is the HULL-LOCAL offset
+        # (beam.local_start), NOT the frozen world-space point (beam.start)
+        # — predicted_view re-anchors it to the ghost's CURRENT pose each
+        # frame (the exact math the host's _draw_world_beam uses for its
+        # own beams). Storing the world-space muzzle drew the origin at
+        # where the muzzle WAS at fire time, so as the ghost moved during
+        # the 0.15 s flash the origin was left behind in empty space. A
+        # LIST (not tuple) so step_local_beams can age `b[2]` in place
+        # (mirrors the host's `self.beams` list-of-lists).
         for beam in beams:
             self.local_beams.append(
                 [beam.local_start, beam.end.copy(), 0.0, BEAM_TTL])
-        # 10.3b: keep the ghost's own LAUNCHED missiles as presentation
+        # Keep the ghost's own LAUNCHED missiles as presentation
         # GhostMissiles. Each gets the SAME unique id the host assigns at
         # launch — (player_index, per-ship seq) — and the ghost's
         # missile_seq is bumped to match (it is resynced to the host's via
@@ -1943,22 +1703,22 @@ class PredictedShip:
                 seq_before = s.missile_seq
                 mid = (self.local_index, seq_before)
                 s.missile_seq += 1
-                # 10.3b fix: the reconcile REWIND (reconcile_rewind) re-runs
-                # the fire tick after apply_snapshot has RESET missile_seq
-                # to the host's pre-fire value — so the replay re-fires the
-                # SAME missile with the SAME id the prediction already
-                # emitted in advance(). Without this guard the ghost would
-                # hold two GhostMissiles of one id (the in-flight one + a
-                # fresh one at the muzzle): the player sees "two missiles"
-                # (one right behind the other) and, because the buffer's
-                # copy is suppressed by the id-dedup, BOTH of the visible
-                # ones are collision-less ghost missiles that pass through
-                # the target and orbit it. Skip the re-fire when the id is
+                # The reconcile REWIND (reconcile_rewind) re-runs the fire
+                # tick after apply_snapshot has RESET missile_seq to the
+                # host's pre-fire value — so the replay re-fires the SAME
+                # missile with the SAME id the prediction already emitted
+                # in advance(). Without this guard the ghost would hold two
+                # GhostMissiles of one id (the in-flight one + a fresh one
+                # at the muzzle): the player sees "two missiles" (one right
+                # behind the other) and, because the buffer's copy is
+                # suppressed by the id-dedup, BOTH of the visible ones are
+                # collision-less ghost missiles that pass through the
+                # target and orbit it. Skip the re-fire when the id is
                 # already in flight (the prediction's copy is the fresher
                 # one — it has already integrated the host's flight).
                 guard = any(tuple(g.id) == mid for g in self.local_missiles)
                 if guard:
-                    # TELEMETRY (10.3b): a re-fire was SUPPRESSED. If the
+                    # TELEMETRY: a re-fire was SUPPRESSED. If the
                     # suppressed id differs from the in-flight id, the seq
                     # resync drifted — capture it.
                     _mtel.log("FIRE", f_mid=_mtel.fmt_ids([mid]),
@@ -1969,9 +1729,9 @@ class PredictedShip:
                     continue
                 self.local_missiles.append(
                     GhostMissile(m.pos, m.vel, mid, target=m.target))
-                # TELEMETRY (10.3b): a GhostMissile was CREATED. This is the
-                # id the ghost will dedup + handback on. seq_before/after show
-                # the counter move; f_local_ids is the full in-flight set.
+                # TELEMETRY: a GhostMissile was CREATED. This is the id the
+                # ghost will dedup + handback on. seq_before/after show the
+                # counter move; f_local_ids is the full in-flight set.
                 _mtel.log("FIRE", f_mid=_mtel.fmt_ids([mid]),
                           f_seq_before=seq_before,
                           f_seq_after=s.missile_seq, f_guard=0,
@@ -1984,7 +1744,7 @@ class PredictedShip:
         `Game._pick_laser_target` (nearest-in-range) so the ghost charges +
         fires on the same tick the host does, given the same target in the
         wedge. Reads only `.pos` off each proxy — the buffer's enemy
-        proxies expose that (10.3a shared plumbing)."""
+        proxies expose that."""
         if not enemies:
             return None
         max_range = max((w.comp.laser_range for w in s.weapons
@@ -2003,8 +1763,7 @@ class PredictedShip:
         missile is fitted or `enemies` is empty/None. Mirrors the host's
         `Game._pick_missile_target` (nearest-in-range) so the ghost locks +
         launches on the same tick the host does, given the same target in
-        the wedge. Reads only `.pos` off each proxy (10.3a shared
-        plumbing)."""
+        the wedge. Reads only `.pos` off each proxy."""
         if not enemies:
             return None
         max_range = max((w.comp.missile_lock_range for w in s.weapons
@@ -2021,13 +1780,13 @@ class PredictedShip:
     def _update_contacts(self, s, enemies):
         """Build the ghost's sensor contacts from the fitted sensor.
 
-        10.3c: mirrors the host's `Game._update_contacts` EXACTLY so the
-        ghost's contacts match the host's given the same sensor state +
-        the same enemy positions. The host iterates `self.enemies` (live
-        AIEnemies) and reads `e.ship.power_used - e.ship.power_idle_total`;
-        the ghost iterates the buffer's enemy PROXIES and reads the same
-        off `proxy.ship` (a `_GhostEnemyShip` stand-in whose power fields
-        are filled by `_ghost_enemy_proxies` — power_used from the buffer,
+        Mirrors the host's `Game._update_contacts` EXACTLY so the ghost's
+        contacts match the host's given the same sensor state + the same
+        enemy positions. The host iterates `self.enemies` (live AIEnemies)
+        and reads `e.ship.power_used - e.ship.power_idle_total`; the ghost
+        iterates the buffer's enemy PROXIES and reads the same off
+        `proxy.ship` (a `_GhostEnemyShip` stand-in whose power fields are
+        filled by `_ghost_enemy_proxies` — power_used from the buffer,
         power_idle_total derived from the tag's loadout).
 
         Passive: enemies in sensor_range whose active power draw
@@ -2039,7 +1798,7 @@ class PredictedShip:
 
         `enemies` is the list of proxies (or None) — the ghost has no
         enemy list of its own. When None (tests, or before the buffer has
-        a window) the contacts stay empty (the pre-10.3c behavior).
+        a window) the contacts stay empty.
         """
         c = s.sensor_comp
         s.contacts = []
@@ -2065,35 +1824,34 @@ class PredictedShip:
         s.contacts = list(found.values())
 
     def step_local_beams(self, dt):
-        """Age the ghost's local beams by `dt` and cull the expired
-        (10.3a). Each entry is [start, end, age, ttl] (a list — age is
-        mutated in place). Mirrors the host's `for b in self.beams:
-        b[4] += dt` + `self.beams = [b for b in self.beams if b[4] <
-        b[5]]`. Called by `advance` after each ghost step; tests may
-        call it directly. `dt` is the sim's STEP (passed in, not
-        imported)."""
+        """Age the ghost's local beams by `dt` and cull the expired. Each entry
+        is [start, end, age, ttl] (a list — age is mutated in place).
+        Mirrors the host's `for b in self.beams: b[4] += dt` +
+        `self.beams = [b for b in self.beams if b[4] < b[5]]`. Called by
+        `advance` after each ghost step; tests may call it directly. `dt`
+        is the sim's TICK (passed in, not imported)."""
         for b in self.local_beams:
             b[2] += dt
         self.local_beams = [b for b in self.local_beams if b[2] < b[3]]
 
     def step_local_bullets(self, dt):
-        """Advance the ghost's local bullets by `dt` and cull the dead
-        (Session 7.3). Mirrors the host's `for b in self.bullets:
-        b.update(dt)` + `self.bullets = [b for b in ... if b.life > 0]`.
-        Called by `advance` after each ghost step; tests may call it
-        directly. `dt` is the sim's STEP (passed in, not imported)."""
+        """Advance the ghost's local bullets by `dt` and cull the dead. Mirrors
+        the host's `for b in self.bullets: b.update(dt)` +
+        `self.bullets = [b for b in ... if b.life > 0]`. Called by
+        `advance` after each ghost step; tests may call it directly. `dt`
+        is the sim's TICK (passed in, not imported)."""
         for b in self.local_bullets:
             b.update(dt)
         self.local_bullets = [b for b in self.local_bullets if b.life > 0]
 
     def step_local_missiles(self, dt, enemies=None):
-        """Advance the ghost's local missiles by `dt` and cull the dead
-        (10.3b). Mirrors the host's `for m in self.missiles: m.update(dt)`
-        + `self.missiles = [m for m in ... if m.life > 0]` — except the
+        """Advance the ghost's local missiles by `dt` and cull the dead. Mirrors
+        the host's `for m in self.missiles: m.update(dt)` +
+        `self.missiles = [m for m in ... if m.life > 0]` — except the
         homing target is the buffer's enemy PROXY for the missile's target
         id (re-resolved each step from `enemies`; None when the target has
         left the buffer, so the missile coasts). Called by `advance` after
-        each ghost step; tests may call it directly. `dt` is the sim's STEP
+        each ghost step; tests may call it directly. `dt` is the sim's TICK
         (passed in, not imported)."""
         # Map enemy id -> proxy for this step (the buffer's current view).
         by_id = {e.id: e for e in (enemies or [])}
@@ -2106,8 +1864,7 @@ class PredictedShip:
                                if m.life > 0]
 
     def handback_missiles(self, host_seq, latest_missiles=None):
-        """Mark the ghost's OWN missiles as handed back to the buffer
-        (10.3b fix, refined in 10.3e).
+        """Mark the ghost's OWN missiles as handed back to the buffer.
 
         A ghost missile is marked `pending` (NOT culled) once BOTH hold:
           * `seq < host_seq` — the snapshot's authoritative
@@ -2121,39 +1878,32 @@ class PredictedShip:
             list, each entry's id at field 8; None when the buffer is
             empty).
 
-        Why the second condition (the "disappears, then reappears" fix):
-        the snapshot that arrives right after a launch is the PRE-fire
-        one — the host snapshots every SNAPSHOT_INTERVAL ticks, so the
-        first snapshot to carry the missile arrives up to one interval
-        (~100 ms) later. The seq alone says "hand back" the moment ANY
-        snapshot reports a higher seq, but the buffer's copy only becomes
-        drawable when the CARRYING snapshot enters the buffer — and the
-        render point (newest stamp - INTERP_DELAY) reaches it only
-        ~INTERP_DELAY after that.
+        Why the second condition: the snapshot that arrives right after a
+        launch is the PRE-fire one — the host snapshots every
+        SNAPSHOT_INTERVAL ticks, so the first snapshot to carry the
+        missile arrives up to one interval (~100 ms) later. The seq alone
+        says "hand back" the moment ANY snapshot reports a higher seq,
+        but the buffer's copy only becomes drawable when the CARRYING
+        snapshot enters the buffer — and the render point (newest stamp -
+        INTERP_DELAY) reaches it only ~INTERP_DELAY after that.
 
-        10.3e (the "blink" fix): the 10.3b/10.3d behavior CULLED the ghost
-        copy here, at snapshot arrival. But the buffer's copy is not
-        VISIBLE until the render point reaches the carrying snapshot
-        (~INTERP_DELAY later), so the missile was drawn by NEITHER the
-        ghost nor the buffer for 6-15 frames — a visible blink. Now the
-        ghost copy is kept (marked `pending`) and the ghost KEEPS DRAWING
-        it; predicted_view hands it off on the frame the buffer copy is
-        actually visible — removing it from local_missiles (so the buffer
-        copy is no longer dedup-skipped) and seeding the decoupled render
-        offset from the ghost's position AT THAT MOMENT (ghost_pos -
-        interp_pos), which the 10.3d decay then smooths to the buffer's
-        position. The missile is drawn continuously, by the ghost until
-        the buffer copy appears and by the buffer (offset-corrected)
-        after.
+        The ghost copy is kept (marked `pending`) and the ghost KEEPS
+        DRAWING it; predicted_view hands it off on the frame the buffer
+        copy is actually visible — removing it from local_missiles (so
+        the buffer copy is no longer dedup-skipped) and seeding the
+        decoupled render offset from the ghost's position AT THAT MOMENT
+        (ghost_pos - interp_pos), which the MISSILE_HANDOFF_DECAY then
+        smooths to the buffer's position. The missile is drawn
+        continuously, by the ghost until the buffer copy appears and by
+        the buffer (offset-corrected) after.
 
         (If the host's copy had already expired by the snapshot, the
         ghost's copy — same age — would be dead too, so the pending mark
         is a no-op: the missile is life-culled by step_local_missiles
         before the buffer copy is ever visible.)
 
-        RETURNS an empty dict (the 10.3d ghost-position return is no
-        longer used — the offset is seeded by predicted_view at the
-        handoff frame, not at snapshot arrival)."""
+        RETURNS an empty dict (the offset is seeded by predicted_view at
+        the handoff frame, not at snapshot arrival)."""
         if latest_missiles is None:
             ids = None
         else:
@@ -2167,30 +1917,30 @@ class PredictedShip:
             for e in latest_missiles:
                 if e[8] is not None:
                     buf_pos[tuple(e[8])] = (e[0], e[1])
-        # 10.3e: the ghost missile is NOT culled here. It is marked
-        # `pending` and KEPT in local_missiles so the ghost keeps DRAWING
-        # it. The buffer's copy only becomes VISIBLE when the render point
-        # reaches the carrying snapshot (~INTERP_DELAY after this
-        # snapshot), so culling here (the 10.3b/10.3d behavior) left a
-        # 6-15 frame gap where the missile was drawn by NEITHER the ghost
-        # nor the buffer — the "blink". predicted_view hands it off on the
-        # frame the buffer copy is visible: it removes the pending missile
-        # from local_missiles (so the buffer copy is no longer dedup-skipped)
-        # and seeds the decoupled render offset from the ghost's position
-        # AT THAT MOMENT (ghost_pos - interp_pos), which the existing
-        # 10.3d decay then smooths to the buffer's position.
+        # The ghost missile is NOT culled here. It is marked `pending` and KEPT
+        # in local_missiles so the ghost keeps DRAWING it. The buffer's
+        # copy only becomes VISIBLE when the render point reaches the
+        # carrying snapshot (~INTERP_DELAY after this snapshot), so
+        # culling here left a 6-15 frame gap where the missile was drawn
+        # by NEITHER the ghost nor the buffer — the "blink".
+        # predicted_view hands it off on the frame the buffer copy is
+        # visible: it removes the pending missile from local_missiles (so
+        # the buffer copy is no longer dedup-skipped) and seeds the
+        # decoupled render offset from the ghost's position AT THAT
+        # MOMENT (ghost_pos - interp_pos), which the existing decay then
+        # smooths to the buffer's position.
         #
         # Safe against the reconcile re-fire: a pending missile has
         # seq < host_seq, i.e. it was launched BEFORE this snapshot, so
         # its fire tick is not in the rewind replay span [snap_time, now]
         # — apply_snapshot's seq reset + replay cannot re-fire it (the
-        # 10.3b guard would catch a duplicate anyway).
+        # re-fire guard would catch a duplicate anyway).
         #
-        # TELEMETRY (10.3b): h_pending lists the ids just marked pending
-        # (the handback decision). h_jump is the distance (px) between the
+        # TELEMETRY: h_pending lists the ids just marked pending (the
+        # handback decision). h_jump is the distance (px) between the
         # ghost's position and the buffer's NEWEST-snapshot copy position
-        # — the offset 10.3d's decay smooths out (informational; the
-        # handoff now happens ~INTERP_DELAY later, at the render point).
+        # — the offset the decay smooths out (informational; the handoff
+        # now happens ~INTERP_DELAY later, at the render point).
         pending = []
         jump_parts = []
         for m in self.local_missiles:
@@ -2217,8 +1967,8 @@ class PredictedShip:
         return {}
 
     def handback_bullets(self, host_seq, latest_bullets=None):
-        """Mark the ghost's OWN bullets as handed back to the buffer
-        (10.7 — the lightweight mirror of `handback_missiles`).
+        """Mark the ghost's OWN bullets as handed back to the buffer (the
+        lightweight mirror of `handback_missiles`).
 
         A ghost bullet is marked `pending` (NOT culled) once BOTH hold:
           * `seq < host_seq` — the snapshot's authoritative
@@ -2233,7 +1983,7 @@ class PredictedShip:
 
         The ghost KEEPS DRAWING a pending bullet; predicted_view hands it
         off on the frame the buffer's copy is visible AND has ADVANCED
-        (the 10.3g wait-until-advancing rule, reused) — removing it from
+        (the wait-until-advancing rule, reused) — removing it from
         local_bullets (so the buffer copy is no longer dedup-skipped) and
         drawing the buffer copy PULLED FORWARD by V*delay (the closed-form
         handoff — no offset state, no decay, no backward cap, because a
@@ -2272,11 +2022,12 @@ class PredictedShip:
 
     def advance(self, dt, inp, enemies=None, real_time=None,
                 host_time=None, rtt_ow=0.0):
-        """Advance the ghost by real time `dt` (Session 7.1).
+        """Advance the ghost by real time `dt`.
 
         THE GHOST CLOCK CONTRACT — the single source of truth for how the
         ghost's sim clock and step grid work. Read this before touching
-        advance / reconcile_rewind / render_pose.
+        advance / reconcile_rewind / render_pose (also summarized in
+        ARCHITECTURE.md).
 
         The ghost is a presentation copy of the local ship. It must sit at
         the HOST's sim time (not the client's display time) so that when a
@@ -2298,15 +2049,15 @@ class PredictedShip:
           1. real_time is None (tests that drive advance with a bare dt
              and no reconcile): _sim_time += clamped dt — a simple
              free-run. The only branch the pure ghost-clock tests
-             (n_steps == floor(total/STEP)) use.
+             (n_steps == floor(total/TICK)) use.
           2. host_time is ready (the LIVE client — host_time is always set
-             on a real client): _sim_time = host_time.now(real_time) +
-             rtt_ow. The ghost's clock IS the host's clock (the
-             HostTimeEstimator's point-slope model) plus the one-way
-             latency. This locks the step grid to the host's tick grid, so
-             the phase offset at the next reconcile is 0 and the
-             reconcile's pose correction is ~0. This is the branch that
-             matters for 2P smoothness.
+             on a real client): _sim_time =
+             host_time.now_smooth(real_time) + rtt_ow. The ghost's clock
+             IS the host's clock (the HostTimeEstimator's smoothed
+             estimate) plus the one-way latency. This locks the step grid
+             to the host's tick grid, so the phase offset at the next
+             reconcile is 0 and the reconcile's pose correction is ~0.
+             This is the branch that matters for 2P smoothness.
           3. real_time given but host_time not ready (the window before the
              first snapshot, and some tests — e.g. test_10_11c): free-run
              from the last reconcile anchor, _sim_time = _sim_base +
@@ -2322,32 +2073,32 @@ class PredictedShip:
         latest received input each tick). Returns the number of fixed
         steps taken.
 
-        `enemies` (10.3a): a list of lightweight enemy proxies from the
+        `enemies`: a list of lightweight enemy proxies from the
         interpolation buffer, fed to every step so the ghost's laser
         target tracks the buffer's enemies and it fires a beam on the same
         tick the host does.
 
-        A DEAD ghost does not advance (10.1): the host freezes a dead
-        ship, so predicting it with the local input would race ahead and
-        every reconcile yank it back. Freezing matches authority exactly
-        (snap size 0 while dead); the accumulator is discarded so the
-        first advance after a respawn starts clean.
+        A DEAD ghost does not advance: the host freezes a dead ship, so
+        predicting it with the local input would race ahead and every
+        reconcile yank it back. Freezing matches authority exactly (snap
+        size 0 while dead); the accumulator is discarded so the first
+        advance after a respawn starts clean.
         """
         if self._ship.dead:
             self._acc = 0.0
-            # 10.9: a dead ghost is frozen — keep the render interpolation
+            # A dead ghost is frozen — keep the render interpolation
             # anchored on the (static) pose so render_pose returns it
             # exactly (alpha 0 would otherwise lerp from a stale _prev).
             self._prev_pos = pygame.Vector2(self._ship.pos)
             self._prev_angle = self._ship.angle
-            # 10.3a: a beam is a 0.15 s flash — age + cull it even while
-            # the ghost is dead, mirroring the host (Game._step ages
+            # A beam is a 0.15 s flash — age + cull it even while the
+            # ghost is dead, mirroring the host (Game._step ages
             # self.beams outside the game_over guard). Without this a beam
             # fired at the moment of death would hang frozen in the air
             # until the respawn.
             self.step_local_beams(min(dt, MAX_FRAME_DT))
-            # 10.3b: a missile in flight at the moment of death coasts +
-            # ages out too (no enemies while dead — it can no longer home).
+            # A missile in flight at the moment of death coasts + ages out
+            # too (no enemies while dead — it can no longer home).
             self.step_local_missiles(min(dt, MAX_FRAME_DT))
             self._diag('ADV', {'real_time': real_time,
                                 'pre_sim': self._sim_time,
@@ -2359,7 +2110,7 @@ class PredictedShip:
                                 'post_last': self._last_step_time,
                                 'post_acc': self._acc, 'dead': 1})
             return 0
-        # 11.x diagnostics: the pre-call clock state (the ADV record).
+        # Diagnostics: the pre-call clock state (the ADV record).
         _pre_sim, _pre_last, _pre_acc = (self._sim_time, self._last_step_time,
                                          self._acc)
         # The clock (see the GHOST CLOCK CONTRACT in the docstring above).
@@ -2375,21 +2126,21 @@ class PredictedShip:
         # ~0. The estimator re-anchors on every snapshot arrival, so this
         # tracks the host's clock without any client-side drift.
         elif host_time is not None and host_time.ready:
-            # 11.x diagnostics: capture the estimator's UNCAPPED estimate
+            # Diagnostics: capture the estimator's UNCAPPED estimate
             # (now_raw) alongside the capped one (now) so the CSV can show
             # whether the MAX_LEAD cap is binding (now_raw > now).
             _ht_raw = host_time.now_raw(real_time)
             _ht_cap = host_time.now(real_time)
-            # 11.x: the RENDER clock is the SMOOTH estimate (now_smooth),
-            # not the raw capped one. The raw estimate is noisy frame-to-
-            # frame (anchor re-anchors ~43 Hz, the rate wobbles, the cap
-            # freezes-then-jumps 18% of frames) — and the render pose is
+            # The RENDER clock is the SMOOTH estimate (now_smooth), not
+            # the raw capped one. The raw estimate is noisy frame-to-frame
+            # (anchor re-anchors, the rate wobbles, the cap
+            # freezes-then-jumps) — and the render pose is
             # `physics_pose + v * _acc`, with _acc driven by this clock, so
             # every wobble in the raw clock is a wobble in the rendered
-            # ship (measured: 15% freeze / 10% jump / 1.5% backward frames).
-            # now_smooth advances at the smoothed rate + a slow bounded
-            # correction toward the raw estimate, and is monotonic — so the
-            # render clock is smooth while still tracking the host's clock.
+            # ship. now_smooth advances at the smoothed rate + a slow
+            # bounded correction toward the raw estimate, and is monotonic
+            # — so the render clock is smooth while still tracking the
+            # host's clock.
             self._sim_time = host_time.now_smooth(real_time) + rtt_ow
         # Branch 3: real_time given but host_time not ready (the window
         # before the first snapshot, and some tests — e.g. test_10_11c).
@@ -2404,24 +2155,24 @@ class PredictedShip:
         # by TICK and moves _last_step_time to the new boundary. The
         # number of steps per snapshot interval is exactly 2 (the sim time
         # advances 2*TICK per 2-tick interval, since the host sim runs at
-        # 1x real time) — not 1/2/3 (the phase-drift bug).
+        # 1x real time) — not 1/2/3.
         n = 0
         while self._sim_time - self._last_step_time >= TICK - 1e-9:
-            # 10.9: capture the pose BEFORE the step so render_pose can
+            # Capture the pose BEFORE the step so render_pose can
             # interpolate across the in-progress step (the host's
             # _ship_pose does the same from the model's prev/curr).
             self._prev_pos = pygame.Vector2(self._ship.pos)
             self._prev_angle = self._ship.angle
             self.step(TICK, inp, enemies=enemies)
-            self.step_local_bullets(TICK)   # Session 7.3: advance + cull
-            self.step_local_beams(TICK)     # 10.3a: age + cull
-            self.step_local_missiles(TICK, enemies)   # 10.3b: home + cull
+            self.step_local_bullets(TICK)   # advance + cull
+            self.step_local_beams(TICK)     # age + cull
+            self.step_local_missiles(TICK, enemies)   # home + cull
             self._last_step_time += TICK
             n += 1
         # The render interpolation phase: the time since the last step
         # (0 to TICK). render_pose lerps _prev -> curr at alpha = _acc/TICK.
         self._acc = self._sim_time - self._last_step_time
-        # 11.x diagnostics: the post-call ADV record (one per advance()).
+        # Diagnostics: the post-call ADV record (one per advance()).
         self._diag('ADV', {'real_time': real_time,
                             'pre_sim': _pre_sim, 'pre_last': _pre_last,
                             'pre_acc': _pre_acc,
@@ -2433,9 +2184,9 @@ class PredictedShip:
         return n
 
     def _diag(self, kind, rec):
-        """11.x diagnostics: forward one clock record to the class-level
-        `diag_sink` (a no-op when it is None — tests + the host's ghost).
-        The sink is set by the client loop only while debug_net is on.
+        """Diagnostics: forward one clock record to the class-level `diag_sink`
+        (a no-op when it is None — tests + the host's ghost). The sink is
+        set by the client loop only while debug_net is on.
 
         Read via the CLASS (`PredictedShip.diag_sink`), NOT `self.diag_sink`:
         a function stored as a class attribute is a descriptor, so instance
@@ -2447,27 +2198,22 @@ class PredictedShip:
             sink(kind, rec)
 
     def _render_pre_step(self):
-        """10.18: compute the RENDER-ONLY pre-step pose (the sawtooth fix).
+        """Compute the RENDER-ONLY pre-step pose (the sawtooth fix).
 
         The physics pose (s.pos) sits at the replay end (snap_time +
-        n*TICK), but the render clock (_sim_time) is L = rtt_ow AHEAD of it.
-        Rendering the physics pose pins the render to snap_time while the
-        clock is at snap_time + L, so each reconcile jumps the pose 1 tick
-        (the 8.67 px sawtooth). The fix: render at the CLOCK's time by
-        lerping the pose at the replay end (snap_time + n*TICK) toward the
-        pose ONE TICK ahead (snap_time + (n+1)*TICK) at alpha = L/TICK.
+        n*TICK), but the render clock (_sim_time) is L = rtt_ow AHEAD of
+        it. Rendering the physics pose pins the render to snap_time while
+        the clock is at snap_time + L, so each reconcile jumps the pose 1
+        tick (the sawtooth). The fix: render at the CLOCK's time by
+        lerping the pose at the replay end toward the pose ONE TICK ahead
+        at alpha = L/TICK (full contract in ARCHITECTURE.md).
 
         The "one tick ahead" pose is a KINEMATIC pre-step, NOT a full
         physics step: it integrates the CURRENT velocity (pos += vel*TICK)
         and applies the CURRENT turn input (angle += turn*ROT_SPEED*
-        turn_rate_factor*TICK) — the same motion the next real step would
-        produce for the first sub-tick, without re-running the full
-        pipeline (weapons, power, shield, sensors). That is exactly the
-        motion the render needs to fill the L gap, and it is cheap (no
-        side effects, no shots/beams/missiles). It is RECOMPUTED every
-        frame from the current physics pose + input, so it always tracks
-        the live pose (the pose advances in TICK chunks between reconciles,
-        and the pre-step advances with it).
+        turn_rate_factor*TICK) — no side effects, no shots/beams/missiles.
+        It is RECOMPUTED every frame from the current physics pose +
+        input, so it always tracks the live pose.
 
         Sets _render_base/_render_base_angle (the pose at the replay end,
         == s.pos) and _render_next/_render_next_angle (the pose one tick
@@ -2490,7 +2236,7 @@ class PredictedShip:
         self._render_next_angle = next_angle
 
     def render_pose(self):
-        """The ghost's INTERPOLATED render pose (10.18) — (pos, angle).
+        """The ghost's INTERPOLATED render pose — (pos, angle).
 
         The render pose sits at the CLOCK's time (_sim_time), NOT the
         physics pose's time (the replay end, snap_time + n*TICK). The
@@ -2498,11 +2244,11 @@ class PredictedShip:
         now = snap_time + L (L = rtt_ow), so the clock is L AHEAD of the
         physics pose. Rendering the physics pose directly pins the render
         to snap_time while the clock is at snap_time + L — each reconcile
-        then jumps the pose 1 tick (the 8.67 px sawtooth).
+        then jumps the pose 1 tick (the sawtooth).
 
-        The fix (10.18): lerp the pose at the replay end (snap_time +
-        n*TICK, == s.pos) toward the pose ONE TICK ahead (snap_time +
-        (n+1)*TICK, the kinematic pre-step) at alpha = L/TICK, where
+        The fix: lerp the pose at the replay end (snap_time + n*TICK, ==
+        s.pos) toward the pose ONE TICK ahead (snap_time + (n+1)*TICK, the
+        kinematic pre-step) at alpha = L/TICK, where
         L = _sim_time - (snap_time + n*TICK) = _acc. That puts the render
         pose at snap_time + L (the clock's time) and makes it CONTINUOUS
         across the reconcile: the pre-reconcile render pose (at the old

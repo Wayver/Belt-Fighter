@@ -61,9 +61,6 @@ def _far_pos(ship, min_dist, tries=20, rng=None):
     return pygame.Vector2(rng.uniform(-WIDTH, 2 * WIDTH),
                           rng.uniform(-HEIGHT, 2 * HEIGHT))
 
-# old enemy
-#def spawn_enemy(enemies, ship, min_dist=400):
-#    enemies.append(EnemyShip(_far_pos(ship, min_dist)))
 def spawn_enemy(enemies, ship, min_dist=400, rng=None):
     rng = rng or random
     p = _far_pos(ship, min_dist, rng=rng)
@@ -117,9 +114,9 @@ def update_field(asteroids, players, dt, rng=None):
     """
     rng = rng or random
     if not players:
-        # No one alive to anchor the field (10.1: 2P, both players dead
-        # waiting to respawn). Leave the field as-is — no cull, no top-up —
-        # until a respawn gives it a centroid again.
+        # No one alive to anchor the field (2P, both players dead waiting to
+        # respawn). Leave the field as-is — no cull, no top-up — until a
+        # respawn gives it a centroid again.
         return
     centroid = pygame.Vector2(sum(p.x for p in players) / len(players),
                               sum(p.y for p in players) / len(players))

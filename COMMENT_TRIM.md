@@ -32,7 +32,7 @@ Run: cd /mnt && SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy python -m ship5.<tes
 | game.py | DONE | b46c276 | 3515→3126 lines (−389); all narrative markers gone; gates green |
 | __main__.py | DONE | 3e2ee20 | 1161→1126 lines; all narrative markers gone; gates green |
 | net.py | DONE | 19a2f35 | 1479→1458 lines; all narrative markers gone; gates green (test_determinism, net self-test 18 PASS, test_network ALL PASS) |
-| netcode.py | pending | | ARCHITECTURE.md FIRST (rule 3) |
+| netcode.py | DONE | a3a2d92 | 2540→2286 lines (−254); AST-verified code-identical; all 69 markers gone; gates green |
 | ship.py | pending | | |
 | sim_thread.py | pending | | |
 | config.py | pending | | |
@@ -59,25 +59,40 @@ verified (json.dumps = 7340 B). Gates green: test_determinism exit=0,
 net self-test 18 PASS / 0 FAIL, test_network ALL PASS (the 7.5b
 informational FAIL is the known load-flaky one).
 
-## NEXT: netcode.py (~1700+ lines) — CREATE ARCHITECTURE.md FIRST
+## netcode.py — DONE (commit a3a2d92, 2026-10-14)
 
-Rule 3: before touching netcode.py, create ARCHITECTURE.md extracting the
-surviving invariants (ghost clock, reconcile/rewind, render point,
-interpolation buffer, handoff rules) so the trimmed comments have a single
-current-state home. Then:
-1. Grep for narrative markers (same pattern as before).
-2. Condense the big blocks (reconcile_rewind, PredictedShip,
-   SnapshotBuffer, interp_positions) to 1-2 lines each, pointing at
-   ARCHITECTURE.md for the full contract.
+2540 → 2286 lines (−254). ARCHITECTURE.md created first (commit a818714)
+as the single current-state home for the netcode invariants (topology &
+authority, wire, interpolation buffer, render point, adaptive delay, host
+clock estimate, ghost clock contract, reconcile/rewind, render pose,
+ghost presentation entities & handoff). All 69 session-history markers
+killed (Session 5b/6.8/7.x/8.x, 10.x, 11.x). Stale claims fixed:
+_match_bullets "10 Hz cadence / 86 px" → 60 Hz / ~14 px; advance()
+branch-2 docstring `now()` → `now_smooth()` (the smooth estimate is what
+feeds the ghost's clock); reconcile_rewind "STEP" → TICK; removed the
+dead "Known limitation (v1): reconciliation is a FULL SNAP" paragraph
+(reconcile_rewind is the live path) and the "10.16 pre-step REMOVED
+(10.17)" narrative block. Big blocks (PredictedShip class docstring,
+reconcile_rewind, handback_missiles, advance GHOST CLOCK CONTRACT,
+render_pose, _render_pre_step) condensed to invariants pointing at
+ARCHITECTURE.md. BEHAVIOR-NEUTRAL PROVEN: AST dump with comments +
+docstrings stripped is byte-identical to HEAD. Gates: test_determinism
+bit-identical (exit 0), all test_10_x ALL PASS (the 3 known pre-existing
+FAILs unchanged: test_interpolation "bullets — vacuous",
+test_10_9_ghost_pose, test_10_11c_phase_lock), net self-test ALL PASS,
+test_network ALL PASS.
+
+## NEXT: ship.py
+
+1. Grep for narrative markers (same pattern).
+2. Condense big blocks; invariants that would be lost go to
+   ARCHITECTURE.md (append a section) — though ship.py is sim-side, so
+   most invariants stay in-file.
 3. Sweep inline markers.
-4. Test gate: test_determinism + test_network + test_interpolation +
-   test_10_1..10_12 (the netcode tests).
+4. Test gate: test_determinism (bit-identical) + the sim tests
+   (test_m2a_world, test_m2b_local, test_sim_thread) + spot-check
+   test_10_x.
 5. Commit + update this tracker.
-
-NOTE: before netcode.py (the highest-value, highest-risk file), create
-ARCHITECTURE.md extracting the surviving invariants (ghost clock,
-reconcile/rewind, render point, interpolation buffer, handoff rules) so
-the trimmed comments have a single current-state home.
 
 **Invariants to PRESERVE in game.py (condense, don't delete):**
 - RenderModel is plain-data; render thread reads ONLY the model, never live sim state.
@@ -91,6 +106,33 @@ the trimmed comments have a single current-state home.
 
 ## Per-file notes
 (Findings as I go: stale claims found, invariants preserved, etc.)
+
+### netcode.py
+- Stale claims found & fixed: _match_bullets "860 * 0.1 = 86 px at the
+  10 Hz cadence" (now 60 Hz → ~14 px/window); advance() branch-2
+  docstring said `host_time.now(real_time)` but the code uses
+  `now_smooth` (fixed the docstring, not the code); reconcile_rewind
+  "snap_time + STEP" → TICK (code uses TICK); SnapshotBuffer "16
+  snapshots / 30 Hz" → 24 / 60 Hz (done in the pre-commit session).
+- Dead narrative removed: "Known limitation (v1): reconciliation is a
+  FULL SNAP ... dead-reckoning rewind is OUT of scope" (reconcile_rewind
+  IS the live path now); "10.16 pre-step REMOVED (10.17)" block (pure
+  history — the surviving invariant, pose and clock agree, was already
+  stated above it).
+- Invariants preserved (condensed, pointing at ARCHITECTURE.md): ghost
+  clock contract (3 branches, now_smooth + rtt_ow), reconcile/rewind
+  (echo-first input source, n = max(0, ...), _sim_time = max(now,
+  snap_time + n*TICK)), render pose (kinematic pre-step, alpha = L/TICK,
+  continuous across reconcile), handback (seq < host_seq AND buffer
+  carries the id; ghost keeps drawing pending; handoff at visibility),
+  re-fire guards (bullet + missile id dedup), sensor-state capture/
+  restore (client_sensor_authoritative), diag_sink class-attribute
+  descriptor gotcha.
+- Verified claims kept: ship snapshot field indices (missile_seq=21,
+  bullet_seq=24, dead=20, brownout=16, flame_mags=23, power_factor=17,
+  shield_dump=6, shield_clock=7, power_used=22), missile snapshot id at
+  field 8, player-bullet id at field 6, INPUT_BUFFER_MAX 2.0 s,
+  BEAM_TTL 0.15 s, MATCH_RADIUS 30 px.
 
 ### net.py
 - Stale claims found & fixed: "30 Hz snapshots" (now 60 Hz, per-step

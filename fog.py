@@ -1,28 +1,17 @@
 """Fog of war: a light bubble around the ship, with a forward lobe.
 
-Session 8.x render-cost optimization (the host-FPS backlog item):
-  * The lights are now SUB-ed DIRECTLY onto the fog surface — the old
-    "draw into a separate light_surf, then one full-screen BLEND_RGBA_SUB"
-    round-trip is gone. This is visually identical: fog_surf starts at
-    FOG_ALPHA and each light does alpha = max(0, alpha - light_alpha);
-    subtracting the lights one-at-a-time reaches the same clamped result
-    as subtracting min(255, sum) at once in every region that matters
-    (any overlap saturates to fully bright either way, since FOG_ALPHA is
-    small). The only difference is a sub-perceptual delta in faint
-    overlap regions (measured max 5/255, mean ~0.02, ~1.6% of pixels off
-    by 1-5 levels — see test_fog_pixel.py).
+Render-cost notes (measured headless, profile_render.py — ~5.3 → ~2.6 ms):
+  * Lights are SUB-ed DIRECTLY onto fog_surf (no separate light_surf
+    round-trip). Visually identical: fog_surf starts at FOG_ALPHA and each
+    light does alpha = max(0, alpha - light_alpha); the only difference is
+    a sub-perceptual delta in faint overlap regions (test_fog_pixel.py).
   * The base light is a CIRCLE (radius_x == radius_y), so it never needs
-    rotating — the old per-frame rotate of it was pure waste.
-  * The forward lobe is rotated at HALF res and scaled up 2x (a uniform
-    scale, so the aspect ratio is preserved) — far cheaper than rotating
-    the full-res 860x400 ellipse (whose rotated bbox is ~950x950). This
-    adds a tiny resampling delta at the lobe's soft edge (part of the
-    sub-perceptual delta above).
-  * The per-radius point-light textures (and their intensity-scaled
-    variants) are cached, so the per-frame transform.scale calls are gone.
-
-Net effect: the fog drops from ~5.3 ms to ~2.6 ms per frame (measured
-headless, profile_render.py) with a sub-perceptual visual delta.
+    rotating.
+  * The forward lobe is rotated at HALF res and scaled up 2x (uniform, so
+    the aspect ratio is preserved) — far cheaper than rotating the full-res
+    860x400 ellipse (rotated bbox ~950x950).
+  * Point-light textures (and intensity-scaled variants) are cached, so
+    per-frame transform.scale calls are gone.
 """
 import math
 
@@ -51,17 +40,13 @@ def make_light_texture(size=256):
     return tex
 
 
-# --- Session 8.x: cached fog textures -------------------------------------
+# --- cached fog textures ---------------------------------------------------
 #
-# The light textures are scaled to their final sizes ONCE (the sizes are
-# config constants, so they never change) and cached. Per frame we only
-# rotate (the forward lobe) and blit. This removes the per-frame
-# transform.scale calls that were ~0.35 ms of the fog cost.
-#
-# Keyed by id(light_tex): in practice there is a single light_tex (created
-# once in main()), so the cache has one entry. make_light_texture is
-# deterministic, so even if a test builds a second one the cached geometry
-# is still valid.
+# Light textures are scaled to their final sizes ONCE (config constants,
+# never change) and cached; per frame we only rotate (the forward lobe)
+# and blit. Keyed by id(light_tex): in practice a single light_tex
+# (created once in main()), so the cache has one entry; make_light_texture
+# is deterministic, so a second one in a test still gets valid geometry.
 _CACHE = {}
 _POINT_CACHE = {}
 
@@ -112,8 +97,8 @@ def _sub(fog_surf, tex, center):
 
 def draw_fog(screen, ship, cam, light_tex, fog_surf, light_surf, lights=()):
     # light_surf is kept in the signature for call-site compatibility but is
-    # no longer used: the lights are SUB-ed directly onto fog_surf (see the
-    # module docstring for why that is visually identical).
+    # unused: the lights are SUB-ed directly onto fog_surf (see module
+    # docstring).
     c = _get_cache(light_tex)
     fog_surf.fill((0, 0, 0, FOG_ALPHA))
     fwd, _ = ship.axes()

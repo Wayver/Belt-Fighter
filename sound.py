@@ -4,8 +4,8 @@ All sounds are synthesized at startup — no audio assets, no files.
 SoundBank is a pure side-effect layer: the sim never reads from it and
 never feeds it rng, so determinism (test_determinism.py) is unaffected.
 
-S2: full recipe set. Synthesis uses numpy when available; without it the
-bank degrades to a single placeholder tone (game still runs, mostly silent).
+Synthesis uses numpy when available; without it the bank degrades to a
+single placeholder tone (game still runs, mostly silent).
 """
 import array
 import math
@@ -181,7 +181,7 @@ class SoundBank:
         snd.set_volume(SFX_MASTER_VOLUME)
         return snd
 
-    # --- synthesis: the S2 recipe set ------------------------------------
+    # --- synthesis: the recipe set ----------------------------------------
     def _build_all(self):
         # laser: fast downward sweep, punchy decay
         dur = 0.12
@@ -244,5 +244,6 @@ class SoundBank:
         x = (_np.sin(ph) + 0.5 * _np.sin(2 * ph) + 0.25 * _np.sin(3 * ph)) / 1.75
         self._reg("game_over", x * _np.exp(-2.5 * t / dur))
 
-        # placeholder: kept for the TEMP trigger in game.py (removed in S3)
+        # placeholder: vestigial fallback tone (also created in the no-numpy path);
+        # not referenced by any play() call.
         self._sounds["placeholder"] = self._tone(440.0, 0.15)

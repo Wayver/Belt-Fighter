@@ -2141,7 +2141,17 @@ class PredictedShip:
             # bounded correction toward the raw estimate, and is monotonic
             # — so the render clock is smooth while still tracking the
             # host's clock.
-            self._sim_time = host_time.now_smooth(real_time) + rtt_ow
+            #
+            # >>> TEMP DIAGNOSTIC #3 (raw clock vs smooth clock) <<<
+            # Use the RAW capped estimate (now) instead of now_smooth.
+            # The reconcile anchors the ghost at now = snap_time + rtt_ow
+            # (the raw anchor), but the pre-reconcile clock is now_smooth,
+            # which LAGS the raw anchor by ~6 ms (slow bounded correction).
+            # That 6 ms gap IS the remaining ~3 px snap. Using the raw
+            # clock makes the pre-reconcile clock match the reconcile's
+            # anchor, so the snap should drop to ~1 px (physics
+            # divergence only). REVERT: search "TEMP DIAGNOSTIC #3".
+            self._sim_time = host_time.now(real_time) + rtt_ow
         # Branch 3: real_time given but host_time not ready (the window
         # before the first snapshot, and some tests — e.g. test_10_11c).
         # Free-run from the last reconcile anchor. _sim_base/_real_base/

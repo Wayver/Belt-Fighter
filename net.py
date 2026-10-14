@@ -1,4 +1,4 @@
-"""Network transport (Session 6.3): TCP, non-blocking, length-prefixed JSON.
+"""Network transport: TCP, non-blocking, length-prefixed JSON.
 
 This is the top of the netcode stack. Everything below it (the deterministic
 sim, the 11-tuple `Game.snapshot()`, `SnapshotBuffer`, `PredictedShip`,
@@ -7,29 +7,34 @@ module is the wire that carries them between the two peers.
 
 Pinned decisions (see the pinned plan note — do NOT re-derive):
   * Transport: TCP, non-blocking. Reliable + ordered, so there is no loss or
-    reorder to handle. 30 Hz snapshots + 60 Hz input are tiny. The socket is
-    polled in the game loop (no threads, no shared state). Outgoing messages
-    go to a send buffer that is drained each frame. Connection setup
+    reorder to handle. 60 Hz snapshots + per-frame input are tiny. In
+    steady state the socket I/O + JSON run on the NetWorker daemon thread
+    (below); the main thread only queues/polls it. Connection setup
     (connect/accept + the join/welcome handshake) is a separate, BLOCKING
     phase that happens BEFORE the game loop; only then does the socket flip
     to non-blocking.
   * Topology: 2P, host-authoritative. The host runs the sim and broadcasts a
     snapshot every `SNAPSHOT_INTERVAL` ticks; the client predicts its own
     ship and renders remote entities from the buffer.
-  * Protocol: 4-byte big-endian length + JSON payload. Four message types:
+  * Protocol: 4-byte big-endian length + JSON payload. Message types:
         join    (client->host)  {'type':'join','hull':h,'loadout':{...}}
         welcome (host->client)  {'type':'welcome','hull':h,'loadout':{...}}
-        input   (client->host)  {'type':'input','inp':{...}}
+        input   (client->host)  {'type':'input','inp':{...},'tag':n}
         snap    (host->client)  {'type':'snap','sim_time':t,'snap':[...]}
+        respawn (client->host)  {'type':'respawn'}
+        beam    (host->client)  {'type':'beam','sim_time':t,'sx':..,'sy':..,
+                                 'ex':..,'ey':..}
+        echo    (host->client)  {'type':'echo','entries':[[t,inp],...]}
+        pong    (host->client)  {'type':'pong','tag':n}
   * `ShipInput` serializes via `dataclasses.asdict` / `ShipInput(**dict)`.
-  * The snapshot is PRUNED on the wire (Session 7.11): the remote peer is a
+  * The snapshot is PRUNED on the wire: the remote peer is a
     presentation peer (it never runs the sim / never calls apply_snapshot),
     so `serialize_snapshot` sends only what the interpolation buffer + the
     prediction ghost read — asteroids as `[id, x, y]` (1-decimal) and the
     rng state as a `None` placeholder. `deserialize_snapshot` is a
     passthrough. The host keeps the full snapshot in its sim; this is a
     send-side serialization only.
-  * Stream integrity (Session 6.9): the send side sends frames in PARTS and
+  * Stream integrity: the send side sends frames in PARTS and
     keeps only the UNSENT remainder when the buffer fills (re-sending a
     partially-sent frame would duplicate bytes and corrupt the stream —
     invisible on loopback, real on a congested LAN). The receive side
@@ -79,23 +84,23 @@ T_JOIN = "join"
 T_WELCOME = "welcome"
 T_INPUT = "input"
 T_SNAP = "snap"
-# 10.1: the client asks the host to respawn ITS ship (player 1) after a
+# The client asks the host to respawn ITS ship (player 1) after a
 # per-player death. The host applies it on the sim thread (respawn_player
 # is a no-op unless that ship is actually dead, so a spammy client is
 # harmless).
 T_RESPAWN = "respawn"
-# 10.4: a laser beam the host fired — an EVENT, not a state. A beam is a
+# A laser beam the host fired — an EVENT, not a state. A beam is a
 # 0.15 s flash (BEAM_TTL), but the client renders INTERP_DELAY (0.1-0.35 s)
 # in the PAST, so a beam whose age rode the snapshot would be expired (or
 # only a flicker) by the time the render point reached it. Instead the host
 # sends the beam the moment it fires: {"type": T_BEAM, "sim_time": t,
 # "sx":.., "sy":.., "ex":.., "ey":..} (world-space muzzle -> endpoint). The
 # client draws it immediately on receipt, fading over BEAM_TTL — the same
-# way the ghost draws its OWN beams (10.3a). One-way LAN latency (~10-20 ms)
-# is imperceptible against a 0.15 s flash.
+# way the ghost draws its OWN beams. One-way LAN latency (~10-20 ms) is
+# imperceptible against a 0.15 s flash.
 T_BEAM = "beam"
-# 10.10: the input-echo — the input the host ACTUALLY applied to player 1
-# (the remote player), per sim tick. The client's dead-reckoning rewind
+# The input-echo — the input the host ACTUALLY applied to player 1 (the
+# remote player), per sim tick. The client's dead-reckoning rewind
 # (reconcile_rewind) replays the ticks since the snapshot with the client's
 # OWN sent input, but the host applied the latest input it had RECEIVED
 # (up to one-way latency stale) — on an input CHANGE (turn/thrust) the
@@ -112,16 +117,16 @@ T_BEAM = "beam"
 # gracefully: the replay holds the last echoed input — exactly what the
 # host itself did (pinned #5).
 T_ECHO = "echo"
-# 10.11b: the RTT-echo — the client tags each T_INPUT with a monotonic
-# `tag` + records its LOCAL send time; the host immediately replies
+# The RTT-echo — the client tags each T_INPUT with a monotonic `tag` +
+# records its LOCAL send time; the host immediately replies
 # {"type": T_PONG, "tag": <same tag>} (no sim work — it is a pure
 # reflection, so the round trip is input-send -> host-receive ->
 # pong-send -> client-receive). The client computes
 # RTT = now - sent_time[tag], one-way L = RTT / 2 (EMA-smoothed), and
-# anchors the prediction ghost's clock at snap_time + L (the 10.11b
-# sawtooth fix: the ghost must sit at the real-time present, not at the
-# snapshot's time L in the past). A dropped pong just means no sample
-# that round — the EMA holds the last value.
+# anchors the prediction ghost's clock at snap_time + L (the ghost must
+# sit at the real-time present, not at the snapshot's time L in the
+# past). A dropped pong just means no sample that round — the EMA holds
+# the last value.
 T_PONG = "pong"
 
 
@@ -176,7 +181,7 @@ def extract_frames(buf):
     frame is complete only once its full length-prefixed payload has arrived,
     so this is safe to call on a partial buffer.
 
-    CORRUPTION RESYNC (Session 6.9): if a frame's bytes do not decode (a
+    CORRUPTION RESYNC: if a frame's bytes do not decode (a
     duplicated/dropped byte misaligned the stream), the length prefix at
     that position is garbage. Instead of raising (which would crash the game
     loop), the scanner RESYNCS — it skips the corrupted region and resumes
@@ -235,7 +240,7 @@ def deserialize_input(d):
 
 
 def serialize_snapshot(snap):
-    """Game.snapshot() tuple -> the PRUNED wire structure (Session 7.11).
+    """Game.snapshot() tuple -> the PRUNED wire structure.
 
     The remote peer is a PRESENTATION peer: it never runs the sim and never
     calls `Game.apply_snapshot` — it only feeds the interpolation buffer
@@ -283,13 +288,12 @@ def deserialize_snapshot(snap):
     `interp_positions` never type-checks). The asteroids are already in the
     pruned `[id, x, y]` form from `serialize_snapshot`, and the rng slot is
     the `None` placeholder — neither needs a reverse conversion, so this is
-    a passthrough. (The pre-7.11 rng-tuple restore is gone: the client no
-    longer receives an rng state.)
+    a passthrough (the client no longer receives an rng state).
     """
     return snap
 
 
-# --- hull/loadout wire mapping (Session 6.5) ------------------------------
+# --- hull/loadout wire mapping --------------------------------------------
 #
 # The join/welcome messages carry each peer's hull + loadout, but the menu
 # produces HullType/ComponentType OBJECTS while the wire is JSON. The
@@ -402,7 +406,7 @@ class Connection:
         remaining frames stay queued for the next frame. Returns the number of
         frames sent this call.
 
-        CRITICAL (Session 6.9): a frame larger than the free send-buffer
+        CRITICAL: a frame larger than the free send-buffer
         space is sent in PARTS — `sendall` on a non-blocking socket sends
         what fits, raises BlockingIOError, and the UNSENT REMAINDER must be
         kept (not the whole frame). Re-sending the whole frame duplicates the
@@ -435,7 +439,7 @@ class Connection:
             except ConnectionError:
                 # The peer is gone (RST / reset / broken pipe): mark the
                 # connection closed so the game loop notices via self.closed
-                # and stop trying to send. (Session 6.7 — see poll().)
+                # and stop trying to send. (See poll().)
                 self.closed = True
                 break
         return sent
@@ -469,11 +473,10 @@ class Connection:
         except ConnectionError:
             # A real socket error (RST / reset / aborted): the peer is gone.
             # Treat it as a close (like a FIN) so the game loop notices via
-            # self.closed instead of crashing. (Session 6.7: the e2e test
-            # surfaced this — a peer that closes while the other side still
-            # has unread data makes the kernel send a RST, and the other
-            # side's recv raises ConnectionResetError rather than returning
-            # b"".)
+            # self.closed instead of crashing. (A peer that closes while the other
+            # side still has unread data makes the kernel send a RST, and
+            # the other side's recv raises ConnectionResetError rather than
+            # returning b"".)
             self.closed = True
             msgs, self._recv_buf = extract_frames(self._recv_buf)
             return msgs
@@ -542,8 +545,8 @@ def _disable_nagle(sock):
     arrives in ~40 ms bursts instead of smoothly. The host applies the LATEST
     received input each tick, so between bursts it acts on input up to ~40 ms
     stale while the client's prediction ghost uses the CURRENT local input —
-    they diverge and the reconcile snaps the ghost back (the 7.8 log's
-    ~19 px mean snap_px is exactly a 40 ms stall at MAX_SPEED 520 px/s).
+    they diverge and the reconcile snaps the ghost back (a 40 ms stall at
+    MAX_SPEED 520 px/s is ~19 px of snap).
 
     For a real-time game we want small messages out IMMEDIATELY, not
     coalesced, so TCP_NODELAY is set on BOTH peers' sockets (the host's
@@ -617,22 +620,16 @@ def do_handshake_host(conn, host_hull, host_loadout, timeout=30.0):
     return None, None
 
 
-# --- async worker: socket I/O + JSON off the main thread (Session 8.1) -----
+# --- async worker: socket I/O + JSON off the main thread ------------------
 #
-# The 7.x netcode ran the socket recv + a ~30 KB json.loads (client) /
-# json.dumps (host) INSIDE the main pygame loop, once per frame. Two
-# problems: (1) the 7.10c "decoupled" snapshot timer is checked once per
-# frame, so at a 24 FPS host the 100 ms timer actually fires at ~112 ms mean
-# / 150 ms max gaps (frame-quantized, not a true 10 Hz); (2) the socket I/O +
-# JSON are CPU time taken from the render — a hiccup there is a frame hiccup.
-#
-# NetWorker moves BOTH to a dedicated daemon thread. The thread owns the
-# Connection (socket + buffers) and the real-time send timer; the main thread
-# talks to it ONLY through two thread-safe queues + a couple of atomic
-# flags. This is the "Network Queue" pattern: the worker does the raw socket
-# work + JSON and blindly dumps parsed messages into `in_queue`; the main
-# thread pulls them out at the start of the frame and updates game state
-# safely (single-threaded pygame).
+# NetWorker moves the socket recv + the ~30 KB json.loads (client) /
+# json.dumps (host) to a dedicated daemon thread. The thread owns the
+# Connection (socket + buffers) and the real-time send timer; the main
+# thread talks to it ONLY through thread-safe queues + a couple of atomic
+# flags. The worker does the raw socket work + JSON and blindly dumps
+# parsed messages into `in_queue`; the main thread pulls them out at the
+# start of the frame and updates game state safely (single-threaded
+# pygame).
 #
 # OWNERSHIP RULE (the fix for the "Python Pygame Trap" — shared-state
 # corruption): the worker thread touches ONLY the socket + JSON. It NEVER
@@ -642,11 +639,11 @@ def do_handshake_host(conn, host_hull, host_loadout, timeout=30.0):
 #   * in_queue  (queue.Queue): worker -> main, parsed message dicts.
 #   * _snap_queue (queue.Queue): host only — the SIM thread pushes a fresh
 #     (sim_time, snapshot) tuple after EVERY step (60 Hz); the worker
-#     serializes + sends each one the moment it lands (10.13). A queue
-#     (not a single slot) so a worker hiccup can't drop a snapshot — the
-#     queue just holds it. The worker drains to the NEWEST (drops stale
-#     ones, like the render thread's latest-wins input rule) so a backlog
-#     never bursts out.
+#     serializes + sends each one the moment it lands. A queue (not a
+#     single slot) so a worker hiccup can't drop a snapshot — the queue
+#     just holds it. The worker drains to the NEWEST (drops stale ones,
+#     like the render thread's latest-wins input rule) so a backlog never
+#     bursts out.
 # The Connection is owned ENTIRELY by the worker after start(); the main
 # thread must NOT call conn.poll()/drain_send()/touch conn.sock once the
 # worker is running.
@@ -664,9 +661,9 @@ class NetWorker:
          call `conn.send` / `conn.poll` / `conn.closed`.
       4. Host only: the SIM thread calls `publish_snapshot((sim_time,
          snap))` after EVERY step (60 Hz); the worker serializes + sends
-         each one the moment it lands (10.13 — the snapshot's age at send
-         is ~0, so the client's `now = sim_time + L` is exact and the
-         delta-wander snap is gone). `period` is kept for the self-test's
+         each one the moment it lands — the snapshot's age at send is ~0,
+         so the client's `now = sim_time + L` is exact and the
+         delta-wander snap is gone. `period` is kept for the self-test's
          cadence gate only; the game no longer uses a send timer.
       5. `stop()` sets the stop flag and joins the thread. Idempotent.
 
@@ -690,25 +687,25 @@ class NetWorker:
     def __init__(self, conn, is_host=False, period=None):
         self._conn = conn
         self._is_host = is_host
-        # 10.13: the host snapshot period in REAL seconds. The GAME no
-        # longer uses a send timer (the sim thread publishes a snapshot
-        # every step and the worker sends each one immediately — see
-        # publish_snapshot); `period` is kept only so the self-test's
-        # cadence gate can drive a SYNTHETIC timer (period=0.1) and prove
-        # the timer MECHANISM is exact, independent of the game's cadence.
+        # The host snapshot period in REAL seconds. The GAME no longer uses a
+        # send timer (the sim thread publishes a snapshot every step and
+        # the worker sends each one immediately — see publish_snapshot);
+        # `period` is kept only so the self-test's cadence gate can drive
+        # a SYNTHETIC timer (period=0.1) and prove the timer MECHANISM is
+        # exact, independent of the game's cadence.
         self._period = (SNAPSHOT_INTERVAL * TICK) if period is None else period
         self._out = queue.Queue()
         self._in = queue.Queue()
-        # 10.13: the host's snapshot queue — the SIM thread pushes a fresh
+        # The host's snapshot queue — the SIM thread pushes a fresh
         # (sim_time, snapshot) tuple after every step (60 Hz); the worker
         # drains it to the NEWEST and sends that one (serialize + send on
         # the worker thread). A queue (not a single slot) so a worker
         # hiccup can't drop a snapshot — it just holds it; the drain-to-
         # newest drops the stale ones so a backlog never bursts out.
         self._snap_queue = queue.Queue()
-        # 10.12: the host's client-input sink — a callable the worker thread
-        # invokes the moment a T_INPUT lands (see set_input_sink). None for
-        # the client's worker and the tests (the input is just queued).
+        # The host's client-input sink — a callable the worker thread invokes the
+        # moment a T_INPUT lands (see set_input_sink). None for the
+        # client's worker and the tests (the input is just queued).
         self._input_sink = None
         self._stop = threading.Event()
         self._thread = None
@@ -744,40 +741,31 @@ class NetWorker:
         (serialize_snapshot + json.dumps happen on the WORKER thread, not
         the sim thread) and sends it the moment it lands.
 
-        10.13: this REPLACES the 30 Hz send timer + set_latest_snapshot.
-        The old timer sent the LATEST published snapshot every 33.3 ms of
-        REAL time, but the worker's 1 ms loop does recv + JSON + OS
-        scheduling, so each send fired 1-15 ms after its ideal deadline —
-        the snapshot's age at send (delta) wandered by up to a full tick,
-        and the client's reconcile (now = sim_time + L) corrected that
-        wander every snapshot (the delta-wander snap, the #2 snap source).
-        Publishing at the STEP (the moment the snapshot is fresh) makes
-        delta ~ 0: the snapshot's sim_time IS its send time, so the
-        client's `now = sim_time + L` is exact and the wander is gone.
+        Publishing at the STEP (the moment the snapshot is fresh) keeps the
+        snapshot's age at send ~0: its sim_time IS its send time, so the
+        client's `now = sim_time + L` is exact (a periodic send timer
+        instead fires 1-15 ms late in the worker's 1 ms loop, and the
+        client's reconcile would correct that wander every snapshot).
         The client's interpolation stack reads the cadence from
-        config.SNAPSHOT_INTERVAL (now 1 tick = 60 Hz) and
-        SNAPSHOT_BUFFER_MAX (bumped to 24 to bracket INTERP_DELAY_MAX at
-        60 Hz). Bandwidth doubles to ~366 KB/s — fine on a LAN."""
+        config.SNAPSHOT_INTERVAL (1 tick = 60 Hz) and
+        SNAPSHOT_BUFFER_MAX (24, to bracket INTERP_DELAY_MAX at 60 Hz).
+        Bandwidth is ~370 KB/s — fine on a LAN."""
         self._snap_queue.put((sim_time, snap))
 
     def set_input_sink(self, fn):
         """Host only: register a callable the WORKER thread invokes the
-        moment a T_INPUT message lands (10.12). `fn` receives the WHOLE
-        parsed message dict (it needs the top-level 'tag' for the T_PONG
+        moment a T_INPUT message lands. `fn` receives the WHOLE parsed
+        message dict (it needs the top-level 'tag' for the T_PONG
         reflection, not just 'inp') and must return True if it consumed
         the message (the worker then skips queueing it into in_queue) or
         False/None to also queue it (the main thread still polls it).
 
-        WHY: the 10.11 host polled the client's input on the RENDER thread
-        (worker.poll() once per frame), but the host renders at ~42-47 FPS
-        (21-24 ms/frame), so the input sat in the worker's in_queue for up
-        to a full frame before the sim thread could apply it — a 0-24 ms
-        (mean ~12 ms) poll-phase added to the wire latency. The host
-        applies the LATEST received input each tick (pinned #5), so that
-        stale input diverged from the client's prediction ghost and the
-        reconcile snapped the ghost back (the in-flight-input snap). Moving
-        the hand-off to the worker thread (which drains the socket every
-        ~1 ms) cuts the poll-phase to ~1 ms.
+        WHY the worker (not the render thread) does the hand-off: the host
+        applies the LATEST received input each tick (pinned #5), so input
+        that sits in in_queue for a full render frame (~21 ms) is stale
+        when applied — it diverges from the client's prediction ghost and
+        the reconcile snaps the ghost back. The worker drains the socket
+        every ~1 ms, so the poll-phase is ~1 ms.
 
         OWNERSHIP: `fn` runs on the WORKER thread, not the main thread. The
         host's sink (run_host) does a single reference swap
@@ -788,8 +776,8 @@ class NetWorker:
         pygame or any other main-thread state. Reflecting the pong HERE
         (worker thread, ~1 ms) instead of on the render thread keeps the
         measured RTT honest: a render-thread reflection would add a full
-        frame (~21 ms at the host's 42-47 FPS) to the round trip and
-        inflate the client's one-way-latency estimate (10.11b).
+        frame to the round trip and inflate the client's one-way-latency
+        estimate.
 
         Call BEFORE start() (the worker thread must not be running when the
         reference is set)."""
@@ -818,17 +806,12 @@ class NetWorker:
     # -- worker thread ------------------------------------------------------
     def _run(self):
         conn = self._conn
-        # 10.13: the host has NO send timer anymore. The sim thread
-        # publishes a snapshot after EVERY step (publish_snapshot, 60 Hz)
-        # and the worker sends each one the moment it lands (step 3
-        # below) — the snapshot's age at send is ~0, so the client's
-        # `now = sim_time + L` is exact. The 10.11d ideal-grid timer
-        # (next_snap += period) fixed the PHASE DRIFT (jitter no longer
-        # accumulated) but not the PER-SEND jitter: the 1 ms loop does
-        # recv + JSON + OS scheduling, so each send still fired 1-15 ms
-        # after its ideal deadline and the snapshot's age wandered by up
-        # to a full tick — the delta-wander snap. Sending at the publish
-        # (the step) removes the wander entirely.
+        # The host has NO send timer: the sim thread publishes a snapshot after
+        # EVERY step (publish_snapshot, 60 Hz) and the worker sends each
+        # one the moment it lands (step 3 below) — the snapshot's age at
+        # send is ~0, so the client's `now = sim_time + L` is exact.
+        # (A periodic timer fires 1-15 ms late in this 1 ms loop, and the
+        # client's reconcile would correct that wander every snapshot.)
         while not self._stop.is_set():
             try:
                 # 1. send side: queue any pending messages, then flush.
@@ -839,15 +822,15 @@ class NetWorker:
                         break
                 conn.drain_send()
                 # 2. receive side: drain the socket, parse JSON HERE, hand off.
-                # 10.12: a T_INPUT with a registered sink is handed to the
-                # sink HERE (on the worker thread, ~1 ms after landing)
-                # instead of sitting in in_queue until the main thread's
-                # next poll (up to a full render frame later — the host's
-                # input poll-phase). The sink receives the WHOLE message
-                # (it needs the top-level 'tag' for the T_PONG reflection,
-                # not just 'inp') and returns True when it consumed the
-                # message (skip the queue). The main thread still polls
-                # every other message type (T_RESPAWN, etc.).
+                # A T_INPUT with a registered sink is handed to the sink
+                # HERE (worker thread, ~1 ms after landing) instead of
+                # sitting in in_queue until the main thread's next poll
+                # (up to a full render frame later). The sink receives
+                # the WHOLE message (it needs the top-level 'tag' for the
+                # T_PONG reflection, not just 'inp') and returns True
+                # when it consumed the message (skip the queue). The main
+                # thread still polls every other message type (T_RESPAWN,
+                # etc.).
                 for m in conn.poll():
                     if (m.get("type") == T_INPUT
                             and self._input_sink is not None
@@ -855,7 +838,7 @@ class NetWorker:
                         continue
                     self._in.put(m)
                 # 3. host: drain the snapshot queue to the NEWEST and send it
-                #    (10.13 — publish-driven, no timer). The sim thread
+                #    (publish-driven, no timer). The sim thread
                 #    pushes one (sim_time, snap) per step (60 Hz); the
                 #    worker serializes + sends the NEWEST one here, on
                 #    the worker thread (serialize_snapshot + json.dumps
@@ -945,7 +928,7 @@ def _self_test():
         print("FAIL: framing reassembly ->", frames2, rest3)
 
     # --- 1b. congested send: a frame larger than the free buffer space must
-    # be sent in PARTS without duplicating bytes (Session 6.9). A fake
+    # be sent in PARTS without duplicating bytes. A fake
     # socket whose send buffer holds only `capacity` bytes; recv() frees
     # space, simulating the peer reading. The whole stream must arrive
     # byte-identical and decode to the exact messages sent.
@@ -1000,7 +983,7 @@ def _self_test():
 
     # --- 1c. receive resync: a corrupted region (duplicated bytes) must be
     # skipped, not raised — the stream re-aligns at the next valid frame
-    # (Session 6.9 safety net).
+    # (safety net).
     good = [{"type": T_SNAP, "data": "a" * 100},
             {"type": T_SNAP, "data": "b" * 100},
             {"type": T_SNAP, "data": "c" * 100}]
@@ -1026,7 +1009,7 @@ def _self_test():
         ok = False
         print("FAIL: ShipInput round-trip ->", back)
 
-    # --- 2c. T_ECHO round-trip (10.10): the input-echo message shape the
+    # --- 2c. T_ECHO round-trip: the input-echo message shape the
     # sim thread sends (one per stepped iteration: a list of
     # [sim_time, inp_dict] entries) must survive the wire and invert
     # back to the exact (sim_time, ShipInput) pairs the host applied.
@@ -1052,7 +1035,7 @@ def _self_test():
         ok = False
         print("FAIL: T_ECHO round-trip ->", echo_msgs, echo_rest)
 
-    # --- 2d. T_PONG round-trip (10.11b): the RTT-echo message shape the
+    # --- 2d. T_PONG round-trip: the RTT-echo message shape the
     # host reflects back ({"type": T_PONG, "tag": <the client's tag>}) must
     # survive the wire and carry the tag intact — the client matches it
     # against its sent-time map to compute the one-way latency.
@@ -1067,7 +1050,7 @@ def _self_test():
         ok = False
         print("FAIL: T_PONG round-trip ->", pong_msgs, pong_rest)
 
-    # --- 2b. hull/loadout wire mapping (Session 6.5) ---
+    # --- 2b. hull/loadout wire mapping ---
     from .hulls import (PLAYER_HULLS, COMPONENT_CATALOG, DEFAULT_HULL,
                         default_loadout)
     # Ids must be unique for the mapping to be well-defined.
@@ -1110,7 +1093,7 @@ def _self_test():
     if ok:
         print("PASS: hostile payload falls back to a valid stock fit")
 
-    # --- 3. snapshot wire pruning (Session 7.11) ---
+    # --- 3. snapshot wire pruning ---
     # The remote peer is a PRESENTATION peer: it never runs the sim and never
     # calls apply_snapshot, so the wire carries only what the interpolation
     # buffer + the prediction ghost read. Verify (a) the pruned wire shape and
@@ -1221,7 +1204,7 @@ def _self_test():
             d2 = deserialize_snapshot(got["snap"])
             # Integrity: the sim_time stamp matches and the wire carried the
             # same rocks (by id) the host snapshotted. (The rng state is no
-            # longer on the wire — Session 7.11 — so the rock ids are the
+            # longer on the wire — so the rock ids are the
             # meaningful integrity check.)
             if (got["sim_time"] == g.sim_time
                     and [r[0] for r in d2[5]] == [a[0] for a in snap[5]]):
@@ -1238,7 +1221,7 @@ def _self_test():
     finally:
         host.close()
 
-    # --- 5. NetWorker (Session 8.1): the async worker thread, loopback ---
+    # --- 5. NetWorker: the async worker thread, loopback ---
     # Exercises the worker in isolation (no pygame game loop): the send path,
     # the receive path, the host real-time snapshot timer's cadence, clean
     # shutdown, and close propagation. Each sub-test uses a fresh loopback
@@ -1288,14 +1271,11 @@ def _self_test():
         client.close()
         host.close()
 
-    # (c) publish-driven snapshot cadence (10.13): the "sim thread" (this
-    # thread) publishes one snapshot every ~16.7 ms (60 Hz) and the worker
-    # must send EACH one promptly — the client's arrival gaps should be
-    # ~16.7 ms (the PUBLISH rate), not the old 33.3 ms timer period, and
-    # there must be no large gaps (no timer quantization, no backlog burst).
-    # This is the 10.13 regression check: the worker sends at the publish
-    # (the step), not on a 30 Hz timer. (The old gate drove a synthetic
-    # 10 Hz timer via period=; that timer no longer exists in the game.)
+    # (c) publish-driven snapshot cadence: the "sim thread" (this thread)
+    # publishes one snapshot every ~16.7 ms (60 Hz) and the worker must
+    # send EACH one promptly — the client's arrival gaps should be
+    # ~16.7 ms (the PUBLISH rate), with no large gaps (no timer
+    # quantization, no backlog burst).
     host, hconn, client = _loopback()
     hw = NetWorker(hconn, is_host=True)
     cw = NetWorker(client, is_host=False)
@@ -1336,10 +1316,9 @@ def _self_test():
         mean_gap = (sum(gaps) / len(gaps)) if gaps else 0.0
         max_gap = max(gaps) if gaps else 0.0
         # Expect ~30 publishes over 0.5 s at 60 Hz, each sent promptly.
-        # The mean gap must be ~16.7 ms (the publish rate) — clearly NOT
-        # the old 33.3 ms timer (a 33 ms mean would fail the <= 0.030
-        # bound) — and the max gap must be small (no burst). Generous
-        # bounds so a slow CI machine does not fail it.
+        # The mean gap must be ~16.7 ms (the publish rate) and the max gap
+        # small (no burst). Generous bounds so a slow CI machine does not
+        # fail it.
         cadence_ok = (18 <= n <= pub
                       and 0.010 <= mean_gap <= 0.030
                       and max_gap <= 0.080)

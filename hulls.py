@@ -188,13 +188,13 @@ DEFAULT_HULL = HullType(
 )
 
 # Component types for the default loadout.
-# Two main engines sum to SHIP_ACCEL straight ahead; nose + RCS match the
-# old single-vector magnitudes.
+# Two main engines sum to SHIP_ACCEL straight ahead; nose + RCS each
+# apply SHIP_ACCEL.
 #
-## Stock power/compute budget (deliberately generous — feel must not change):
-#   power idle:   2*1 + 1 + 2*1 + 2 + 5 + 2 = 14
-#   power steady: + 10 (shield) = 24 at rest
-#   power max:    + 2*20 + 15 + 2*5 + 5 = 94  (of 100)  -> never brownouts
+# Stock power/compute budget (deliberately generous — feel must not change):
+#   power idle:   2*1 + 1 + 2*1 + 2 + 1 + 2 = 10
+#   power steady: + 10 (shield) = 20 at rest
+#   power max:    + 2*20 + 15 + 2*5 + 5 = 90  (of 100)  -> never brownouts
 #   hit dump:     + 25 (transient, decays 50/s) -> brief brownout at full thrust
 #
 # Priority: RCS (1) is fine control near rocks, mains (2) propulsion,
@@ -248,7 +248,7 @@ E_SHIELD_TYPE = ComponentType('shield', 'Shield', ('shield',),
 LASER_TYPE = ComponentType('laser', 'Laser', ('weapon',),
     mass=3.0, power_idle=2.0, power_active=12.0,   # power_active = charge draw
     laser_arc_start_deg=-20.0, laser_arc_end_deg=20.0,
-    laser_range=600.0,          # <-- the arbitrary range; turn this
+    laser_range=600.0,          # max firing range (0 = not a laser)
     laser_charge_time=1.0,
     laser_damage=2,
     laser_discharge_dump=30.0,
@@ -635,7 +635,7 @@ ENEMY_HULL = HullType(
     cockpit=(10, 0),
 )
 
-# Enemy guns use the enemy's own config values (not the player's) — see notes.
+# Enemy guns use the enemy's own config values (not the player's).
 ENEMY_GUN = ComponentType('enemy_gun', 'Enemy Gun', ('weapon',), mass=1.0,
                           power_idle=2.0, power_active=5.0,
                           fire_cooldown=ENEMY_FIRE_COOLDOWN,

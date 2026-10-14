@@ -33,7 +33,7 @@ Run: cd /mnt && SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy python -m ship5.<tes
 | __main__.py | DONE | 3e2ee20 | 1161→1126 lines; all narrative markers gone; gates green |
 | net.py | DONE | 19a2f35 | 1479→1458 lines; all narrative markers gone; gates green (test_determinism, net self-test 18 PASS, test_network ALL PASS) |
 | netcode.py | DONE | a3a2d92 | 2540→2286 lines (−254); AST-verified code-identical; all 69 markers gone; gates green |
-| ship.py | pending | | |
+| ship.py | DONE | acbba3c | 1138→1107 lines (−31); AST-verified code-identical; all markers gone; gates green |
 | sim_thread.py | pending | | |
 | config.py | pending | | |
 | other small files | pending | | |
@@ -82,16 +82,40 @@ FAILs unchanged: test_interpolation "bullets — vacuous",
 test_10_9_ghost_pose, test_10_11c_phase_lock), net self-test ALL PASS,
 test_network ALL PASS.
 
-## NEXT: ship.py
+## ship.py — DONE (commit acbba3c, 2026-10-14)
+
+1138 → 1107 lines (−31). All session-history markers killed (10.1,
+10.3b, 10.3c, 10.6, 10.7, Phase 2, For now, Before 10.3c, "unchanged",
+"promotes"). Stale claims fixed: `flame_mags = {} # presentation only —
+never serialized` (it IS synced now), "the enemy's Ship snapshot is the
+same 24-tuple" (now 25 — verified via AST), arc-interval comment
+"0.25s -> 0.10s" (the formula 0.45 - 0.15*severity gives 0.45s -> 0.30s),
+_allocate pipeline line "For now: always 1.0" (it resolves the
+power/compute budgets now), _fire docstring "The cooldown advances only
+for shots that actually fire" (contradicted the code — cooldown always
+ticks down; firing resets it; also dropped the stale "capped by the
+caller" — no caller caps shots), update() docstring stray leading "...".
+Invariants condensed in place (nothing moved to ARCHITECTURE.md —
+ship.py is sim-side): raw unbounded angle round-trip (snapshot +
+classification), seq-counter dedup key (missile_seq/bullet_seq merged
+into one entry), power_used sensor-signature rationale, flame_mags
+sync rationale, the full SYNCED vs PRESENTATION-ONLY classification.
+BEHAVIOR-NEUTRAL PROVEN: AST dump with comments + docstrings stripped
+is byte-identical to HEAD. Gates: test_determinism bit-identical (exit
+0), test_m2a_world / test_m2b_local / test_sim_thread ALL PASS,
+test_10_x spot-check matches baseline (the 3 known pre-existing FAILs
+unchanged: test_10_9_ghost_pose, test_10_11c_phase_lock,
+test_interpolation "bullets — vacuous").
+
+## NEXT: sim_thread.py
 
 1. Grep for narrative markers (same pattern).
 2. Condense big blocks; invariants that would be lost go to
-   ARCHITECTURE.md (append a section) — though ship.py is sim-side, so
-   most invariants stay in-file.
+   ARCHITECTURE.md (append a section) if they're netcode-side, else
+   stay in-file.
 3. Sweep inline markers.
-4. Test gate: test_determinism (bit-identical) + the sim tests
-   (test_m2a_world, test_m2b_local, test_sim_thread) + spot-check
-   test_10_x.
+4. Test gate: test_determinism (bit-identical) + test_sim_thread +
+   test_m2a_world / test_m2b_local + spot-check test_10_x.
 5. Commit + update this tracker.
 
 **Invariants to PRESERVE in game.py (condense, don't delete):**
@@ -106,6 +130,31 @@ test_network ALL PASS.
 
 ## Per-file notes
 (Findings as I go: stale claims found, invariants preserved, etc.)
+
+### ship.py
+- Stale claims found & fixed: `flame_mags = {} # presentation only —
+  never serialized` (flame_mags is in the snapshot — synced); "the
+  enemy's Ship snapshot is the same 24-tuple" (25 fields now —
+  bullet_seq added; verified by counting the snapshot() return tuple
+  via AST); `_update_arcs` interval comment "0.25s -> 0.10s as it
+  deepens" (0.45 - 0.15*severity is 0.45s -> 0.30s); module docstring
+  pipeline line "_allocate ... For now: always 1.0" (it resolves the
+  power/compute budgets); _fire docstring "The cooldown advances only
+  for shots that actually fire, so a ship that can't fire (capped by
+  the caller, or browned out) fires the instant it can" (cooldown
+  always ticks down unconditionally; firing resets it to
+  fire_cooldown; "capped by the caller" has no caller — dropped).
+- Invariants preserved (condensed, in-file): raw unbounded angle
+  round-trip (snapshot() comment + SYNCED classification), the
+  missile_seq/bullet_seq dedup-key rationale (merged into one
+  classification entry + one __init__ comment), power_used as the
+  client-side sensor-contact signature (not derivable client-side;
+  power_idle_total is a loadout constant), flame_mags sync rationale
+  (client draws remote player + enemy exhaust; recomputed every tick —
+  always the current frame's exhaust), the whole SYNCED vs
+  PRESENTATION-ONLY classification (kept, de-tagged).
+- Trailing-whitespace lines in ship.py: 136, 331, 563, 962, 974, 979
+  (pre-trim line numbers) — none were spanned in a search block.
 
 ### netcode.py
 - Stale claims found & fixed: _match_bullets "860 * 0.1 = 86 px at the

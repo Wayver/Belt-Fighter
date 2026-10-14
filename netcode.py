@@ -165,8 +165,11 @@ class HostTimeEstimator:
     and the data disagree under jitter/loss, and the render must not wander
     by the disagreement. The estimator still runs for two reasons: its
     per-arrival jitter sample (`last_jitter`) is the input the
-    LatencyTracker consumes, and `now_smooth()` is the ghost's render clock
-    (see the GHOST CLOCK CONTRACT in PredictedShip.advance).
+    LatencyTracker consumes, and `now()` (the raw capped estimate) is the
+    ghost's clock (see the GHOST CLOCK CONTRACT in PredictedShip.advance).
+    `now_smooth()` is retained for diagnostics/tests but is NOT the ghost's
+    clock — a smoothed clock lags the raw anchor the reconcile re-anchors
+    to, and that lag reads as a per-reconcile snap.
     """
 
     RATE_ALPHA = 0.1
@@ -1445,11 +1448,19 @@ class PredictedShip:
         cooldown/charge/lock), so the ghost's own shots resume from the
         authoritative fire cadence instead of the predicted one.
 
-        `now` is the client's current estimate of the host's sim clock
-        (the same value the caller uses to stamp inputs). The replay runs
-        at most (now - snap_time)/TICK steps — one snapshot interval
-        (~6 steps) in steady state. The fixed-step accumulator is reset
-        so the next `advance` starts clean from the replayed state.
+        `now` is the ghost's OWN current sim clock (the caller passes
+        `ghost.sim_time` — the clock the ghost was advanced to this
+        frame, NOT snap_time + rtt_ow). Reconciling at the ghost's own
+        clock means the reconcile does NOT jump the clock forward (the
+        old snap_time + rtt_ow anchor sat ~3 ms ahead of the raw clock
+        and each reconcile jumped it -> a per-reconcile snap); it only
+        corrects the pose to the snapshot and re-anchors the tick grid.
+        The replay runs at most (now - snap_time)/TICK steps — ~one-way
+        latency in steady state (sub-tick on a LAN, so n=0 and the
+        render lerp rebuilds the prediction; the replay fires when the
+        span is >= 1 tick, e.g. after a hiccup). The fixed-step
+        accumulator is reset so the next `advance` starts clean from the
+        replayed state.
 
         V/G/T (option A): the client's sensor state is captured before the
         apply_snapshot (which would overwrite it with the host's) and
@@ -2052,12 +2063,15 @@ class PredictedShip:
              (n_steps == floor(total/TICK)) use.
           2. host_time is ready (the LIVE client — host_time is always set
              on a real client): _sim_time =
-             host_time.now_smooth(real_time) + rtt_ow. The ghost's clock
-             IS the host's clock (the HostTimeEstimator's smoothed
-             estimate) plus the one-way latency. This locks the step grid
-             to the host's tick grid, so the phase offset at the next
-             reconcile is 0 and the reconcile's pose correction is ~0.
-             This is the branch that matters for 2P smoothness.
+             host_time.now(real_time) + rtt_ow. The ghost's clock IS the
+             host's clock (the HostTimeEstimator's RAW capped estimate)
+             plus the one-way latency. This locks the step grid to the
+             host's tick grid, so the phase offset at the next reconcile
+             is 0 and the reconcile's pose correction is ~0. The RAW
+             estimate (not now_smooth) is the ghost's clock: the
+             reconcile re-anchors to the raw estimate each snapshot, so
+             a smoothed clock would lag the anchor and snap. This is the
+             branch that matters for 2P smoothness.
           3. real_time given but host_time not ready (the window before the
              first snapshot, and some tests — e.g. test_10_11c): free-run
              from the last reconcile anchor, _sim_time = _sim_base +
@@ -2131,26 +2145,18 @@ class PredictedShip:
             # whether the MAX_LEAD cap is binding (now_raw > now).
             _ht_raw = host_time.now_raw(real_time)
             _ht_cap = host_time.now(real_time)
-            # The RENDER clock is the SMOOTH estimate (now_smooth), not
-            # the raw capped one. The raw estimate is noisy frame-to-frame
-            # (anchor re-anchors, the rate wobbles, the cap
-            # freezes-then-jumps) — and the render pose is
-            # `physics_pose + v * _acc`, with _acc driven by this clock, so
-            # every wobble in the raw clock is a wobble in the rendered
-            # ship. now_smooth advances at the smoothed rate + a slow
-            # bounded correction toward the raw estimate, and is monotonic
-            # — so the render clock is smooth while still tracking the
-            # host's clock.
-            #
-            # >>> TEMP DIAGNOSTIC #3 (raw clock vs smooth clock) <<<
-            # Use the RAW capped estimate (now) instead of now_smooth.
-            # The reconcile anchors the ghost at now = snap_time + rtt_ow
-            # (the raw anchor), but the pre-reconcile clock is now_smooth,
-            # which LAGS the raw anchor by ~6 ms (slow bounded correction).
-            # That 6 ms gap IS the remaining ~3 px snap. Using the raw
-            # clock makes the pre-reconcile clock match the reconcile's
-            # anchor, so the snap should drop to ~1 px (physics
-            # divergence only). REVERT: search "TEMP DIAGNOSTIC #3".
+            # The RENDER clock is the RAW capped estimate (now), NOT
+            # now_smooth. The reconcile re-anchors the ghost's clock to
+            # the raw estimate each snapshot (the caller passes
+            # now = ghost.sim_time, which is raw + rtt_ow), so the
+            # pre-reconcile clock must be the SAME raw estimate — a
+            # smoothed clock lags the raw anchor by its correction
+            # time-constant (~6 ms at SMOOTH_ALPHA 0.05) and that lag
+            # IS a per-reconcile snap. The raw estimate is already
+            # smooth between arrivals (it advances at the fitted rate
+            # with a fixed anchor, and re-anchors continuously), so
+            # smoothing it added lag without removing wobble (measured:
+            # raw and smooth frame-to-frame wobble are identical).
             self._sim_time = host_time.now(real_time) + rtt_ow
         # Branch 3: real_time given but host_time not ready (the window
         # before the first snapshot, and some tests — e.g. test_10_11c).

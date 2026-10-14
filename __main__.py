@@ -871,14 +871,14 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
         est_now = game.host_time.now(now)
         if est_now is not None:
             game.ghost.record_input(est_now, inp)
-        # >>> TEMP DIAGNOSTIC #2 (advance-then-reconcile) <<<
         # Advance the ghost to the CURRENT frame BEFORE the poll loop, so
         # the reconcile (inside the loop) sees a current-frame pose/clock
-        # instead of the previous frame's. Mirrors predicted_view's advance
-        # (same dt/inp/enemies/clock). predicted_view's own advance later in
-        # the frame is harmless: the branch-2 clock is a pure function of
-        # real_time and steps are boundary-based, so no double-stepping.
-        # REVERT: delete this block (search "TEMP DIAGNOSTIC").
+        # instead of the previous frame's — a 1-frame-stale clock sat 12 ms
+        # behind the fresh snapshot stamp and caused the ~8 px snap on
+        # nearly every reconcile. Mirrors predicted_view's advance (same
+        # dt/inp/enemies/clock); predicted_view's own advance later in the
+        # frame is a no-op on the step grid (the branch-2 clock is a pure
+        # function of real_time, and steps are boundary-based).
         if game.ghost.seeded:
             _rp = game.render_point.now()
             if _rp is not None:
@@ -892,38 +892,26 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
         # wire stamp vs the local arrival time — the estimator's
         # per-arrival jitter sample is the adaptive delay's input) and
         # then the interpolation buffer + prediction ghost (seed on the
-        # first, dead-reckoning rewind on the rest). `now` is the
-        # client's current estimate of the host's sim clock: the rewind
-        # replays from the snapshot's stamp up to it. worker.poll()
+        # first, dead-reckoning rewind on the rest). The rewind replays
+        # from the snapshot's stamp up to the ghost's own clock
+        # (ghost.sim_time — advanced to this frame above). worker.poll()
         # drains the messages the worker thread already parsed off the
         # render thread (the JSON decode no longer happens here).
         for m in worker.poll():
             if m.get("type") == T_SNAP:
                 if game.host_time.record(now, m["sim_time"]):
                     game.latency.update(game.host_time.last_jitter)
-                # Anchor the ghost's clock at the REAL-TIME PRESENT — `snap_time + L`,
-                # where L is the RTT-measured one-way latency
-                # (game._rtt_ow). The snapshot's pose is the authority at
-                # snap_time (L in the past); the ghost must sit at the
-                # present, so the replay span is ~L and the replay
-                # rebuilds the prediction forward.
-                #
-                # >>> TEMP DIAGNOSTIC #4 (reconcile at the ghost's own
-                # clock) <<<
-                # `now` = the ghost's ACTUAL current sim clock (advanced to
-                # this frame before the poll loop, see the block above).
-                # The reconcile no longer jumps the clock to
-                # snap_time + rtt_ow (which lagged the raw clock by ~3 ms
-                # -> ~1.5 px snap); it corrects the pose to the snapshot
-                # and replays from the ghost's real time. If the clock gap
-                # was the last piece, snap_px should drop to ~0.6 px
-                # (physics divergence only). REVERT: search
-                # "TEMP DIAGNOSTIC".
-                print("[REPLAY-DIAG4] snap=%.4f ghost_sim=%.4f "
-                      "span=%.4f" % (
-                          m["sim_time"], game.ghost.sim_time,
-                          game.ghost.sim_time - m["sim_time"]),
-                      flush=True)
+                # Reconcile at the ghost's OWN current clock (advanced to
+                # this frame before the poll loop, see the block above):
+                # the reconcile corrects the pose to the snapshot and
+                # replays from the ghost's real time, WITHOUT jumping the
+                # clock to snap_time + rtt_ow (that anchor sat ~3 ms ahead
+                # of the raw clock, so every reconcile jumped the clock
+                # forward -> a ~1.5 px snap). The replay span is
+                # ghost.sim_time - snap_time (~one-way latency — sub-tick
+                # on a LAN, so n=0 in steady state and the render lerp
+                # rebuilds the prediction; the replay fires when the span
+                # is >= 1 tick, e.g. after a hiccup).
                 game.push_snapshot(m["sim_time"],
                                    deserialize_snapshot(m["snap"]),
                                    now=game.ghost.sim_time,
@@ -1004,12 +992,12 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
         if rp is None:
             _draw_waiting_client(screen, font, big_font)
         else:
-            # Render: local ship from the prediction ghost (advanced at
-            # the sim's fixed rate inside predicted_view), remote
-            # entities from the interpolation buffer at the render point.
-            # host_time keeps self.sim_time = the host's clock as carried
-            # by the wire, for the ghost's reconcile bookkeeping and
-            # diagnostics.
+            # Render: local ship from the prediction ghost (advanced to
+            # this frame before the poll loop; predicted_view's advance
+            # is a no-op on the step grid), remote entities from the
+            # interpolation buffer at the render point. host_time keeps
+            # self.sim_time = the host's clock as carried by the wire,
+            # for the ghost's reconcile bookkeeping and diagnostics.
             game.predicted_view(dt, keys, host_time=game.host_time.now(now),
                               real_time=now)
         # Net debug overlay + CSV log (F3-toggled, client only).

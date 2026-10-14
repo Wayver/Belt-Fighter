@@ -2083,12 +2083,15 @@ class Game:
         reconcile on every one after. The ghost is the LOCAL player's
         ship, so it takes snap[0][self.local_index].
 
-        When `now` (the client's estimate of the host's sim clock) is
-        given, the reconcile is a REWIND — the ghost is set to the
+        When `now` (the ghost's OWN current sim clock — the caller passes
+        `ghost.sim_time`, advanced to this frame before the poll loop)
+        is given, the reconcile is a REWIND — the ghost is set to the
         authoritative snapshot and the inputs the host applied since the
         snapshot are replayed (the prediction is rebuilt, not snapped).
-        When `now` is None (tests / v1 fallback) it defaults to
-        `sim_time`, so the replay span is 0 and this is a pure full snap."""
+        Reconciling at the ghost's own clock (not snap_time + rtt_ow)
+        keeps the reconcile from jumping the clock forward. When `now`
+        is None (tests / v1 fallback) it defaults to `sim_time`, so the
+        replay span is 0 and this is a pure full snap."""
         self.snap_buf.push(sim_time, snap)
         local_s = snap[0][self.local_index]
         if not self.ghost.seeded:
@@ -2278,6 +2281,13 @@ class Game:
         # client's real time — the ghost's step grid is locked to the
         # host's tick grid, so the reconcile's phase offset is 0. See
         # PredictedShip.advance.
+        # On the LIVE client the client loop already advanced the ghost
+        # to this frame BEFORE the poll loop (so the reconcile sees a
+        # current-frame clock — a 1-frame-stale clock caused the ~8 px
+        # snap), so this advance is a no-op on the step grid (the
+        # branch-2 clock is a pure function of real_time, steps are
+        # boundary-based). It still runs for TESTS, which call
+        # predicted_view directly and rely on it to step the ghost.
         # Accumulate the step count across frames (the reconcile happens
         # earlier in the frame, before this advance); push_snapshot reads
         # + resets the accumulator, so last_advance_steps = the steps the

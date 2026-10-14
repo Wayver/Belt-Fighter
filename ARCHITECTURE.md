@@ -15,7 +15,11 @@ re-explaining. History (why a rule changed) lives in git, not here.
 - The host applies the LATEST received input each tick (pinned #5).
 - Snapshots are published at the sim STEP (60 Hz, one per step) and sent
   immediately by the NetWorker — no send timer. The snapshot's sim_time
-  IS its send time, so the client's `now = sim_time + L` is exact.
+  IS its send time. The client reconciles at the ghost's OWN clock
+  (`ghost.sim_time`, advanced to the current frame BEFORE the poll
+  loop) — NOT at `sim_time + L` (that anchor sat ~3 ms ahead of the raw
+  clock and each reconcile jumped the clock forward -> a per-reconcile
+  snap).
 
 ## Wire
 - TCP, non-blocking, 4-byte big-endian length prefix + JSON. Message
@@ -89,11 +93,13 @@ re-explaining. History (why a rule changed) lives in git, not here.
 - `last_jitter` = PREDICTION RESIDUAL: how far this arrival's stamp is
   from where the PREVIOUS anchor + rate predicted it (computed with the
   rate BEFORE the update — the innovation). Feeds the LatencyTracker.
-- `now_smooth` is the RENDER clock: advances at the smoothed rate + a
-  slow bounded correction toward the raw capped estimate
-  (SMOOTH_ALPHA 0.05, SMOOTH_MAX_JUMP 0.02 s/frame), monotonic. The raw
-  estimate is noisy frame-to-frame (re-anchor, rate wobble, cap
-  freeze-then-jump) and would wobble the rendered ship.
+- `now` (the raw capped estimate) is the GHOST's clock (see the GHOST
+  CLOCK CONTRACT). `now_smooth` is retained for diagnostics/tests but is
+  NOT the ghost's clock: the reconcile re-anchors the ghost to the raw
+  estimate each snapshot, so a smoothed clock lags the anchor by its
+  correction time-constant (~6 ms at SMOOTH_ALPHA 0.05) and that lag
+  reads as a per-reconcile snap. The raw estimate is already smooth
+  between arrivals (fixed anchor + fitted rate, continuous re-anchor).
 
 ## Ghost clock contract (PredictedShip.advance)
 - Three quantities: `_sim_time` (the time of the physics pose),
@@ -103,9 +109,11 @@ re-explaining. History (why a rule changed) lives in git, not here.
 - The clock sets `_sim_time` each call, in priority order:
   1. `real_time is None` (tests): free-run `_sim_time += clamped dt`.
   2. `host_time` ready (the LIVE client): `_sim_time =
-     host_time.now_smooth(real_time) + rtt_ow` — the ghost's clock IS
-     the host's clock plus one-way latency, so the step grid locks to
-     the host's tick grid and the reconcile's pose correction is ~0.
+     host_time.now(real_time) + rtt_ow` — the ghost's clock IS the
+     host's clock (the RAW capped estimate, NOT now_smooth — see the
+     Host clock estimate section) plus one-way latency, so the step grid
+     locks to the host's tick grid and the reconcile's pose correction
+     is ~0.
   3. `real_time` given, host_time not ready (pre-first-snapshot window,
      some tests): free-run from the last reconcile anchor
      (`_sim_base + _rate * (real_time - _real_base)`; `_rate` is always
@@ -120,9 +128,19 @@ re-explaining. History (why a rule changed) lives in git, not here.
 ## Reconcile / rewind (PredictedShip.reconcile_rewind)
 - Apply the authoritative ship snapshot taken at `snap_time`, then
   REPLAY the local inputs the host applied between `snap_time` and
-  `now` (the ghost's current sim time — NOT the host-time estimate,
-  which equals snap_time exactly and would make the replay 0 ticks).
-  The prediction is REBUILT, not snapped (pinned #4).
+  `now` (the ghost's OWN current sim time — the caller passes
+  `ghost.sim_time`, advanced to the current frame BEFORE the poll loop;
+  a 1-frame-stale clock sat 12 ms behind the fresh stamp and caused the
+  ~8 px snap). Reconciling at the ghost's own clock (NOT
+  `snap_time + rtt_ow`, which sat ~3 ms ahead of the raw clock and made
+  each reconcile jump the clock forward) means the reconcile only
+  corrects the pose + re-anchors the tick grid. The prediction is
+  REBUILT, not snapped (pinned #4).
+- The replay span is ~one-way latency: sub-tick on a LAN, so `n=0` in
+  steady state and the render lerp (snapshot pose -> one tick ahead, at
+  `_acc/TICK`) rebuilds the prediction. The replay fires when the span
+  is >= 1 tick (after a hiccup, or higher latency) — and when it does,
+  it reconstructs the pose to ~0.06 px (measured).
 - Input source: the ECHO buffer (the inputs the host ACTUALLY applied,
   T_ECHO, stamped with the host's own sim clock) when it has anything,
   else the client's own sent input (initial transient / loss). Both are

@@ -4,11 +4,11 @@ W/S  forward / reverse thrusters
 A/D  lateral thrusters (A = starboard fires -> ship goes left)
 Q/E  rotate (aim the gun)
 SPACE fire
-B    retro-thrust: fires the right thrusters to kill your velocity
+B    auto-stop: commands thrusters against your velocity to kill it
 R    restart (after game over)
 ESC  quit
 
-Enemy ships chase, circle, and shoot back. They take 3 hits and also
+Enemy ships chase, circle, and shoot back. They take one hit and also
 die if they crash into an asteroid. Each kill instantly spawns a
 replacement far from the player.
 

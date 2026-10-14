@@ -34,7 +34,7 @@ Run: cd /mnt && SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy python -m ship5.<tes
 | net.py | DONE | 19a2f35 | 1479→1458 lines; all narrative markers gone; gates green (test_determinism, net self-test 18 PASS, test_network ALL PASS) |
 | netcode.py | DONE | a3a2d92 | 2540→2286 lines (−254); AST-verified code-identical; all 69 markers gone; gates green |
 | ship.py | DONE | acbba3c | 1138→1107 lines (−31); AST-verified code-identical; all markers gone; gates green |
-| sim_thread.py | pending | | |
+| sim_thread.py | DONE | f0d09f2 | 291→278 lines (−13); AST-verified code-identical; all markers gone; gates green |
 | config.py | pending | | |
 | other small files | pending | | |
 
@@ -107,15 +107,45 @@ test_10_x spot-check matches baseline (the 3 known pre-existing FAILs
 unchanged: test_10_9_ghost_pose, test_10_11c_phase_lock,
 test_interpolation "bullets — vacuous").
 
-## NEXT: sim_thread.py
+## sim_thread.py — DONE (commit f0d09f2, 2026-10-14)
+
+291 → 278 lines (−13). All session-history markers killed (Session 9.x
+M3/M5, 10.1, 10.4, 10.10, 10.13, 10.17). Stale claims fixed: module
+docstring step 4 "stop_event.wait(WAIT) (~1 ms)" (the run loop now uses
+DYNAMIC sleep — `self._stop.wait(STEP - acc)`; the WAIT constant is
+defined but unused by the run loop — kept, since removing it is a code
+change — and its comment now says so), and "see _render_alpha in
+__main__.py" (the class is _HostRenderClock). Invariants condensed in
+place (sim-side — nothing moved to ARCHITECTURE.md): GIL-atomic
+ref-swap hand-offs (no locks, no shared mutable state), sim thread OWNS
+the Game (render thread never mutates it), remote_input swap safety
+(ShipInput is read-only; the world-cap `replace(p_inp, ...)` builds a
+NEW object), publish-only-on-a-step (model identity stability for the
+render clock + ~94% wasted render_model() calls avoided), `g.acc = acc`
+before publish (render_model reads self.acc for step_alpha; without it
+step_alpha is always 0 and the render clock re-anchors at alpha=0),
+T_BEAM/T_ECHO per-tick event pattern (drained on the sim thread — the
+only thread that touches g._beam_events; T_ECHO = the input the host
+ACTUALLY applied, feeds the client's rewind replay), _steps_total
+monotone counter (per-window delta for the host CSV; 1-per-line = the
+dynamic-sleep design working), dynamic-sleep rationale (wake on the tick
+boundary → exactly 1 tick per wake-up, no 1-7 tick batching).
+BEHAVIOR-NEUTRAL PROVEN: AST dump with comments + docstrings stripped is
+byte-identical to HEAD. Gates: test_determinism bit-identical (exit 0),
+test_sim_thread / test_m2a_world / test_m2b_local ALL PASS,
+test_10_x spot-check matches baseline (the 3 known pre-existing FAILs
+unchanged: test_10_9_ghost_pose, test_10_11c_phase_lock,
+test_interpolation "bullets — vacuous").
+
+## NEXT: config.py
 
 1. Grep for narrative markers (same pattern).
 2. Condense big blocks; invariants that would be lost go to
    ARCHITECTURE.md (append a section) if they're netcode-side, else
    stay in-file.
 3. Sweep inline markers.
-4. Test gate: test_determinism (bit-identical) + test_sim_thread +
-   test_m2a_world / test_m2b_local + spot-check test_10_x.
+4. Test gate: test_determinism (bit-identical) + test_m2a_world /
+   test_m2b_local + test_sim_thread + spot-check test_10_x.
 5. Commit + update this tracker.
 
 **Invariants to PRESERVE in game.py (condense, don't delete):**
@@ -130,6 +160,39 @@ test_interpolation "bullets — vacuous").
 
 ## Per-file notes
 (Findings as I go: stale claims found, invariants preserved, etc.)
+
+### sim_thread.py
+- Stale claims found & fixed: module docstring step 4 "stop_event.wait
+  (WAIT) (~1 ms; bounds CPU + makes stop() prompt)" (the run loop now
+  sleeps DYNAMICALLY — `self._stop.wait(STEP - acc)` — so the fixed
+  WAIT is no longer the sleep; the WAIT constant is defined but unused
+  by the run loop; kept, since removing it is a code change, and its
+  comment now says "Unused by the run loop ... Kept for parity with
+  NetWorker.WAIT"); "see _render_alpha in __main__.py" (the class is
+  _HostRenderClock — verified by grep).
+- Verified claims kept: 60 Hz real-time accumulator (STEP = 1/60),
+  MAX_STEPS_PER_FRAME = 5 + ACC_BACKLOG_CAP = 0.25 (same guards as
+  Game.update — verified both), `g.acc = acc` before publish
+  (render_model reads self.acc for step_alpha — verified game.py:1047),
+  `replace(p_inp, ...)` builds a NEW object (verified game.py:1258-1260),
+  respawn_player is a no-op unless the ship is dead (verified
+  game.py:829), T_BEAM drained on the sim thread (the only thread that
+  touches g._beam_events — verified), T_ECHO = flush_remote_input_echo
+  (the input the host ACTUALLY applied — verified game.py:1371),
+  _steps_total is a monotone int read by the render thread's telemetry
+  (verified __main__.py:421).
+- Invariants preserved (condensed, in-file — sim-side, nothing moved to
+  ARCHITECTURE.md): GIL-atomic ref-swap hand-offs (no locks, no shared
+  mutable state), sim thread OWNS the Game (render thread never mutates
+  it — publishes input/commands, reads latest_model), remote_input swap
+  safety (ShipInput read-only; replace() builds a new object),
+  publish-only-on-a-step (model identity stability for the render clock
+  + ~94% wasted render_model() calls avoided), g.acc = acc before
+  publish (step_alpha), T_BEAM/T_ECHO per-tick event pattern,
+  _steps_total monotone counter (per-window delta for the host CSV),
+  dynamic-sleep rationale (wake on the tick boundary → exactly 1 tick
+  per wake-up, no 1-7 tick batching).
+- No trailing-whitespace lines in sim_thread.py (verified by grep).
 
 ### ship.py
 - Stale claims found & fixed: `flame_mags = {} # presentation only —

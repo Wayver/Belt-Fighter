@@ -1,16 +1,16 @@
 """Entry point: run with  python -m ship5
 
-Three modes (chosen on the menu's mode screen, Session 6.4):
-  single — the classic solo run. Session 9.x M5: unified onto the
-           SimThread — the same architecture as the host (the sim on its
-           own real-time 60 Hz thread, the render thread a local client
-           of the published RenderModel; no NetWorker).
-  host   — Session 6.5: wait for ONE client, run the authoritative 2-ship
-           sim, apply the client's input, broadcast a snapshot every
+Three modes (chosen on the menu's mode screen):
+  single — the classic solo run. Unified onto the SimThread — the same
+           architecture as the host (the sim on its own real-time 60 Hz
+           thread, the render thread a local client of the published
+           RenderModel; no NetWorker).
+  host   — wait for ONE client, run the authoritative 2-ship sim, apply
+           the client's input, broadcast a snapshot every
            SNAPSHOT_INTERVAL ticks. ESC/QUIT or a client disconnect
            returns to the menu (pinned decision #8: no reconnect in v1).
-  join   — Session 6.6: connect to a host, run the client sim (predict the
-           local ship, interpolate the remote entities), send input every
+  join   — connect to a host, run the client sim (predict the local
+           ship, interpolate the remote entities), send input every
            frame, push each snapshot, render via predicted_view.
 """
 import os
@@ -41,13 +41,13 @@ from . import missile_telemetry
 
 
 class _HostRenderClock:
-    """Session 9.x M3: the host render thread's own interpolation clock.
+    """The host render thread's own interpolation clock.
 
     With the sim on the SimThread, the render thread no longer owns the
     sim's accumulator — so it computes its OWN interpolation alpha
     instead of reading the model's `step_alpha` (the sim's acc/STEP at
-    publish time). The model still CARRIES step_alpha (the M1/M2b parity
-    tests read it), and it is also what this clock re-anchors on.
+    publish time). The model still CARRIES step_alpha (the parity tests
+    read it), and it is also what this clock re-anchors on.
 
     The model carries the local ship's prev+curr pose (the window
     [T - STEP, T], where T = model.sim_time), so no 2-deep model ring is
@@ -65,12 +65,12 @@ class _HostRenderClock:
       * between publishes (the same model re-read): advance t by the
         frame's real dt (1x real time — the host's sim rate).
 
-    The alpha is then (t - T) / STEP, clamped to [0, 1] (the 70460de
-    rule: on a hiccup render the LATEST simulated state, never
-    extrapolate past the current pose). In steady state t - T equals the
-    sim's acc at publish (plus ~1 ms of publish latency), so the alpha
-    matches the old sim-acc/STEP behavior exactly — the rendered pose is
-    sim_now - STEP, one step behind the sim's current time, as before.
+    The alpha is then (t - T) / STEP, clamped to [0, 1] (on a hiccup
+    render the LATEST simulated state, never extrapolate past the
+    current pose). In steady state t - T equals the sim's acc at publish
+    (plus ~1 ms of publish latency), so the alpha matches the old
+    sim-acc/STEP behavior exactly — the rendered pose is sim_now - STEP,
+    one step behind the sim's current time.
     """
 
     def __init__(self):
@@ -159,7 +159,7 @@ def _draw_waiting(screen, font, big_font, ip, port):
 
 def run_host(screen, font, big_font, clock, sfx, menu, seed,
              light_tex, fog_surf, light_surf):
-    """Host a 2P game (Session 6.5).
+    """Host a 2P game.
 
     Phases: (1) draw the waiting screen while a timed accept() waits for
     ONE client; (2) the blocking join/welcome handshake; (3) build the
@@ -180,10 +180,10 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
     conn = None
     game = None   # defined here so the finally can close its debug log even
                   # if the handshake fails before phase 3 builds the Game.
-    worker = None  # Session 8.3: the host's NetWorker (created in phase 3);
+    worker = None  # the host's NetWorker (created in phase 3);
                    # defined here so the finally can stop() it even if the
                    # handshake fails before phase 3 runs.
-    sim_thread = None  # Session 9.x M3: the host's SimThread (created in
+    sim_thread = None  # the host's SimThread (created in
                        # phase 4); defined here so the finally can stop() it
                        # even if the handshake fails before phase 4 runs.
     try:
@@ -214,30 +214,27 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
                     hull=menu.hull, loadout=menu.loadout,
                     seed=seed, sound=sfx, players=2)
         game.set_player_ship(1, Ship(hull=chull, loadout=clout))
-        # Session 8.3: the socket I/O + the 10 Hz snapshot send move to a
-        # NetWorker thread (the "Network Queue" pattern). The worker owns the
-        # Connection: it drains the client's input off the render thread
-        # (10.12: applies it via the input sink the moment it lands) and
-        # sends snapshots the moment the SIM thread publishes them
-        # (10.13: the sim thread calls worker.publish_snapshot after every
-        # step — 60 Hz — and the worker serializes + sends each one
-        # immediately; there is no send timer anymore, so the snapshot's
-        # age at send is ~0 and the client's `now = sim_time + L` is
-        # exact). start() flips the socket to non-blocking + launches the
-        # thread.
+        # The socket I/O + snapshot send run on a NetWorker thread (the
+        # "Network Queue" pattern). The worker owns the Connection: it
+        # drains the client's input off the render thread (applies it via
+        # the input sink the moment it lands) and sends snapshots the
+        # moment the SIM thread publishes them (the sim thread calls
+        # worker.publish_snapshot after every step — 60 Hz — and the
+        # worker serializes + sends each one immediately; there is no send
+        # timer, so the snapshot's age at send is ~0 and the client's
+        # `now = sim_time + L` is exact). start() flips the socket to
+        # non-blocking + launches the thread.
         worker = NetWorker(conn, is_host=True)
-        # 10.12: the client's input is applied by the WORKER thread the
-        # moment it lands (a reference swap, race-free — the sim thread
-        # only reads remote_input), NOT polled off the render thread once
-        # per frame. The host renders at ~42-47 FPS, so the old render-
-        # thread poll added a 0-24 ms (mean ~12 ms) poll-phase to the
-        # input latency; the worker drains the socket every ~1 ms, so the
-        # input now reaches the sim within ~1 ms. The sink ALSO reflects
-        # the T_PONG here (worker thread, ~1 ms) — worker.send() is a
-        # thread-safe queue put — because a render-thread reflection would
-        # add a full frame (~21 ms) to the measured RTT and inflate the
-        # client's one-way-latency estimate (10.11b). The sink returns
-        # True (consumed) so the T_INPUT is not also queued for the main
+        # The client's input is applied by the WORKER thread the moment it
+        # lands (a reference swap, race-free — the sim thread only reads
+        # remote_input), NOT polled off the render thread once per frame.
+        # The worker drains the socket every ~1 ms, so the input reaches
+        # the sim within ~1 ms. The sink ALSO reflects the T_PONG here
+        # (worker thread, ~1 ms) — worker.send() is a thread-safe queue
+        # put — because a render-thread reflection would add a full frame
+        # (~21 ms) to the measured RTT and inflate the client's
+        # one-way-latency estimate. The sink returns True (consumed) so
+        # the T_INPUT is not also queued for the main
         # thread.
         def _client_input_sink(m):
             game.set_remote_input(deserialize_input(m["inp"]))
@@ -248,58 +245,47 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
         worker.start()
 
         # --- 4. the authoritative game loop ---
-        # Session 9.x M3: the sim moves OFF the render thread onto the
-        # SimThread — a daemon thread that steps the Game at a real-time
-        # 60 Hz clock (a monotonic accumulator, NOT tied to the frame
-        # rate) and publishes the plain-data RenderModel via an atomic
-        # reference swap (the NetWorker hand-off pattern). The
-        # render thread becomes a LOCAL CLIENT of that sim: it publishes
-        # the latest local input + T/V/G/R/F commands, and reads
-        # sim_thread.latest_model to draw. The snapshot hand-off to the
-        # worker (publish_snapshot, 10.13) happens on the sim thread —
-        # the worker serializes + sends each snapshot the moment it lands
-        # (60 Hz, age ~0), and the snapshot is stamped with game.sim_time
-        # (the host's sim clock, 1x real time regardless of frame rate),
-        # so the client's interpolation window is unchanged.
-        # `game` is now OWNED by the sim thread: the render thread never
-        # calls game.update() or mutates sim state — it publishes input
-        # (a fresh ShipInput per frame), commands (a queue), and reads
-        # latest_model (a reference swap).
+        # The sim runs OFF the render thread, on the SimThread — a daemon
+        # thread that steps the Game at a real-time 60 Hz clock (a
+        # monotonic accumulator, NOT tied to the frame rate) and publishes
+        # the plain-data RenderModel via an atomic reference swap. The
+        # render thread is a LOCAL CLIENT of that sim: it publishes the
+        # latest local input + T/V/G/R/F commands and reads
+        # sim_thread.latest_model to draw. `game` is OWNED by the sim
+        # thread: the render thread never calls game.update() or mutates
+        # sim state. The snapshot hand-off to the worker (publish_snapshot)
+        # happens on the sim thread — the worker serializes + sends each
+        # snapshot the moment it lands (60 Hz, age ~0), stamped with
+        # game.sim_time (the host's sim clock, 1x real time regardless of
+        # frame rate), so the client's interpolation window is unchanged.
         sim_thread = SimThread(game, worker)
         sim_thread.start()
-        # Session 9.x M3: the render thread's own interpolation clock
-        # (the sim's acc/STEP is no longer the render thread's — see the
-        # class docstring).
+        # The render thread's own interpolation clock (the sim's acc/STEP
+        # is no longer the render thread's — see the class docstring).
         render_clock = _HostRenderClock()
-        # Session 7.10b: host-side frame-rate telemetry (F3-toggled). The
-        # send moved to the worker (8.3), so the telemetry runs on its OWN
-        # 10 Hz real-time timer in the main loop (it measures the host's
-        # FRAME rate — a main-thread concern — and the wall-clock `t` is
-        # the join key to the client's CSV, not the send event).
-        # Session 9.x M3: this is now the headline gate — with the sim
-        # cost OFF the render thread, the host's render FPS should rise
-        # (the 8.5 caveat's outstanding item). last_telem_time anchors it
-        # (0.0 -> the first line is immediate).
+        # Host-side frame-rate telemetry (F3-toggled). The send moved to
+        # the worker, so the telemetry runs on its OWN real-time timer in
+        # the main loop (it measures the host's FRAME rate — a
+        # main-thread concern — and the wall-clock `t` is the join key to
+        # the client's CSV, not the send event). last_telem_time anchors
+        # it (0.0 -> the first line is immediate).
         last_telem_time = 0.0
-        # 10.17: the last-read value of the sim thread's cumulative step
-        # counter (the host CSV's per-window `steps` column is the delta).
-        # Seeded from the current value so the first line covers only the
-        # window after the loop starts (the sim thread may have stepped a
-        # few ticks during setup).
+        # The last-read value of the sim thread's cumulative step counter
+        # (the host CSV's per-window `steps` column is the delta). Seeded
+        # from the current value so the first line covers only the window
+        # after the loop starts (the sim thread may have stepped a few
+        # ticks during setup).
         last_steps_total = sim_thread._steps_total
-        TELEMETRY_PERIOD = SNAPSHOT_INTERVAL * STEP   # 0.0167 s (60 Hz, 10.13)
-        # Session 7.10b: host-side frame-rate telemetry (F3-toggled, mirrors
-        # the client's 7.10a columns). The client's CSV can't tell a WIRE
-        # stall (host sent smoothly, packets queued + released in a burst)
-        # from a HOST frame stall (the host's sim is tied to its frame loop,
-        # so a host hiccup stalls the sim AND the snapshot sending). We log
-        # the host's raw frame time on each telemetry tick (60 Hz, 10.13) so the
+        TELEMETRY_PERIOD = SNAPSHOT_INTERVAL * STEP   # 0.0167 s (60 Hz)
+        # Host-side frame-rate telemetry (F3-toggled, mirrors the client's
+        # columns). The client's CSV can't tell a WIRE stall (host sent
+        # smoothly, packets queued + released in a burst) from a HOST frame
+        # stall (a host hiccup stalls the sim AND the snapshot sending).
+        # We log the host's raw frame time on each telemetry tick so the
         # next re-test can be correlated: if the client's snapshot gap
-        # (newest jumping 1.3-1.6 s) lines up with a host hiccup (dt_max
-        # > 50 ms / low fps) at the same wall-clock time, it's a HOST stall
-        # (-> decouple the sim from the frame loop); if the host was clean
-        # (60 fps, no hiccups) at that moment, it's a WIRE stall (-> the
-        # catch-up is the right fix, nothing to do on the host).
+        # lines up with a host hiccup (dt_max > 50 ms / low fps) at the
+        # same wall-clock time, it's a HOST stall; if the host was clean
+        # (60 fps, no hiccups) at that moment, it's a WIRE stall.
         game._dbg_frames = 0
         game._dbg_dt_sum = 0.0
         game._dbg_dt_max = 0.0
@@ -307,21 +293,20 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
         game._dbg_log_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "host_debug.csv")
         game._dbg_log_f = None
-        # Session 8.5 Step 1: per-frame sim-clock diagnostic (F3-toggled,
-        # additive). Logs raw_dt (real frame time — what the sim is fed),
-        # draw_dt (the clamped dt that drives draw()), sim_before/sim_after
-        # (the sim clock), advance (sim time gained this frame), and
-        # acc_after (accumulator remainder). Step 1 (pre-fix) used it to
-        # prove the dt clamp was losing time on hiccup frames; post-Step-2
-        # it verifies the fix: sim-clock rate ~1.0, advance tracking
-        # raw_dt (modulo STEP quantization + the backlog cap).
+        # Per-frame sim-clock diagnostic (F3-toggled, additive). Logs raw_dt
+        # (real frame time — what the sim is fed), draw_dt (the clamped
+        # dt that drives draw()), sim_before/sim_after (the sim clock),
+        # advance (sim time gained this frame), and acc_after
+        # (accumulator remainder). Used to verify the sim-clock rate is
+        # ~1.0 and advance tracks raw_dt (modulo STEP quantization + the
+        # backlog cap).
         game._dbg_sim_log_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "host_sim_debug.csv")
         game._dbg_sim_log_f = None
         while True:
-            # Session 7.10b: capture the RAW frame time before the clamp
-            # (the clamp hides hiccups from the sim, but a raw frame > 50 ms
-            # is exactly the frame that stalls the sim + snapshot sending).
+            # Capture the RAW frame time before the clamp (the clamp hides
+            # hiccups from the sim, but a raw frame > 50 ms is exactly
+            # the frame that stalls the sim + snapshot sending).
             raw_dt = clock.tick(FPS) / 1000.0
             dt = min(raw_dt, 0.05)
             if game.debug_net:
@@ -331,78 +316,69 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
                     game._dbg_dt_max = raw_dt
                 if raw_dt > 0.05:
                     game._dbg_hiccups += 1
-            # Session 9.x M3: the T/V/G/R/F keys are ROUTED to the sim thread
-            # (command_sink) instead of mutating live state — the sim
-            # thread applies them at the top of its next iteration.
-            # QUIT/ESC (exit) + F3 (the render diagnostic) stay handled
-            # here. handle_events still reads game.game_over/test_mode
-            # for the same gating (a bool read — atomic, no mutation).
+            # The T/V/G/R/F keys are ROUTED to the sim thread (command_sink)
+            # instead of mutating live state — the sim thread applies
+            # them at the top of its next iteration. QUIT/ESC (exit) +
+            # F3 (the render diagnostic) stay handled here.
+            # handle_events still reads game.game_over/test_mode for the
+            # same gating (a bool read — atomic, no mutation).
             if not game.handle_events(sim_thread.command):
                 return
             keys = pygame.key.get_pressed()
-            # Poll the client: 10.12 — the T_INPUT branch is GONE. The
-            # client's input is applied by the WORKER thread the moment it
-            # lands (worker.set_input_sink, above — a reference swap on
-            # game.remote_input, race-free because the sim thread only
-            # READS it). The old render-thread poll ran once per frame
-            # (~42-47 FPS here = 21-24 ms), so the input sat in the
-            # worker's in_queue for up to a full frame before the sim
-            # thread could apply it — a 0-24 ms (mean ~12 ms) poll-phase
-            # on top of the wire latency that the client's prediction
-            # ghost did not have (it used the input immediately). The
-            # worker drains the socket every ~1 ms, so the input now
-            # reaches the sim within ~1 ms. T_INPUT is consumed by the
-            # sink (not re-queued), so it never reaches this poll.
+            # Poll the client. The client's input is applied by the WORKER thread
+            # the moment it lands (worker.set_input_sink, above — a
+            # reference swap on game.remote_input, race-free because the
+            # sim thread only READS it); the worker drains the socket
+            # every ~1 ms, so the input reaches the sim within ~1 ms.
+            # T_INPUT is consumed by the sink (not re-queued), so it
+            # never reaches this poll.
             for m in worker.poll():
                 if m.get("type") == T_INPUT:
-                    # 10.12: UNREACHABLE in the current wiring — the sink
+                    # UNREACHABLE in the current wiring — the sink
                     # (worker thread) applies the input AND reflects the
-                    # T_PONG (10.11b) the moment the message lands, then
-                    # consumes it (returns True), so it is never queued.
-                    # Kept as a fallback: if the sink is ever unset, the
-                    # input is still applied here (render thread) and the
-                    # RTT tag is still reflected (the client measures
+                    # T_PONG the moment the message lands, then consumes
+                    # it (returns True), so it is never queued. Kept as a
+                    # fallback: if the sink is ever unset, the input is
+                    # still applied here (render thread) and the RTT tag
+                    # is still reflected (the client measures
                     # RTT = now - sent_time[tag] -> one-way L = RTT / 2,
                     # which anchors its prediction ghost's clock).
                     game.set_remote_input(deserialize_input(m["inp"]))
                     if "tag" in m:
                         worker.send({"type": T_PONG, "tag": m["tag"]})
                 elif m.get("type") == T_RESPAWN:
-                    # 10.1: the client's dead player asks to respawn.
-                    # The client is player 1; the sim thread applies it
-                    # (a no-op unless that ship is actually dead).
+                    # The client's dead player asks to respawn. The
+                    # client is player 1; the sim thread applies it (a
+                    # no-op unless that ship is actually dead).
                     sim_thread.command("respawn", 1)
-            # Session 8.3: the worker owns the socket now — read
-            # worker.closed (the worker mirrors conn.closed) and never
-            # touch conn.* here. The worker also does the drain_send()
-            # (off the render thread), so the in-loop conn.drain_send() is
-            # gone.
+            # The worker owns the socket now — read worker.closed (the worker
+            # mirrors conn.closed) and never touch conn.* here. The
+            # worker also does the drain_send() (off the render thread).
             if worker.closed:
                 _notice(screen, font, big_font, clock,
                         ["DISCONNECTED", "the other player left"])
                 return
-            # Session 9.x M3: the sim no longer runs here. The SimThread steps it
-            # at a real-time 60 Hz clock (its own monotonic accumulator —
-            # the 8.5 hiccup policy, MAX_STEPS_PER_FRAME + ACC_BACKLOG_CAP,
-            # now lives in sim_thread.py) and publishes the RenderModel +
-            # the wire snapshot. The render thread's job each frame:
-            # publish the latest local input, read the published model,
-            # draw. `dt` (clamped) drives draw() + the render clock —
-            # presentation only.
+            # The sim no longer runs here. The SimThread steps it at a real-time
+            # 60 Hz clock (its own monotonic accumulator — the hiccup
+            # policy, MAX_STEPS_PER_FRAME + ACC_BACKLOG_CAP, lives in
+            # sim_thread.py) and publishes the RenderModel + the wire
+            # snapshot. The render thread's job each frame: publish the
+            # latest local input, read the published model, draw. `dt`
+            # (clamped) drives draw() + the render clock — presentation
+            # only.
             sim_thread.publish_input(ShipInput.from_keys(keys))
-            # Session 9.x M3: read the PUBLISHED model (an atomic reference read —
-            # the render thread never reads live sim state, which would
-            # race the sim thread's _step) and compute the render
-            # thread's own interpolation alpha (see _HostRenderClock).
+            # Read the PUBLISHED model (an atomic reference read — the
+            # render thread never reads live sim state, which would race
+            # the sim thread's _step) and compute the render thread's own
+            # interpolation alpha (see _HostRenderClock).
             model = sim_thread.latest_model
             alpha = render_clock.advance(dt, model)
-            # Session 9.x M3: the per-frame sim-clock diagnostic (F3-
-            # toggled, additive) now reads the published model + the
-            # render thread's alpha instead of the live game.sim_time /
-            # game.acc. One line per frame: t (wall clock), raw_dt (real
-            # frame time), draw_dt (the clamped dt that drives draw() —
-            # presentation only), sim_time (the published model's sim
-            # clock), alpha (the render thread's interpolation alpha).
+            # The per-frame sim-clock diagnostic (F3-toggled, additive)
+            # reads the published model + the render thread's alpha. One
+            # line per frame: t (wall clock), raw_dt (real frame time),
+            # draw_dt (the clamped dt that drives draw() — presentation
+            # only), sim_time (the published model's sim clock), alpha
+            # (the render thread's interpolation alpha).
             if game.debug_net:
                 f = game._dbg_sim_log_f
                 if f is None:
@@ -412,15 +388,15 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
                 f.write("%.3f,%.4f,%.4f,%.4f,%.4f\n" % (
                     time.time(), raw_dt, dt,
                     model["sim_time"] if model else 0.0, alpha))
-            # Session 7.10b: host-side frame-rate telemetry (F3-toggled), on
-            # its OWN 10 Hz real-time timer (the send moved to the worker, so
-            # it no longer rides the send). One line per 100 ms, mirroring
-            # the client's 7.10a columns: t (wall clock), sim_time (the
-            # host's sim clock), fps (1/mean raw frame time since the last
-            # line), dt_max (longest raw frame), hic (frames past the 50 ms
-            # clamp), n (frames in the window). The wall-clock `t` is the
-            # join key: the client's CSV has the same `t` (both machines'
-            # wall clocks are roughly synced on the same LAN), so a client
+            # Host-side frame-rate telemetry (F3-toggled), on its OWN real-time
+            # timer (the send moved to the worker, so it no longer rides
+            # the send). One line per 100 ms, mirroring the client's
+            # columns: t (wall clock), sim_time (the host's sim clock),
+            # fps (1/mean raw frame time since the last line), dt_max
+            # (longest raw frame), hic (frames past the 50 ms clamp), n
+            # (frames in the window). The wall-clock `t` is the join key:
+            # the client's CSV has the same `t` (both machines' wall
+            # clocks are roughly synced on the same LAN), so a client
             # snapshot gap at t=X can be checked against the host's
             # fps/dt_max/hic at t=X to tell a wire stall from a host stall.
             now_t = pygame.time.get_ticks() / 1000.0
@@ -440,8 +416,8 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
                     game._dbg_dt_sum = 0.0
                     game._dbg_dt_max = 0.0
                     game._dbg_hiccups = 0
-                    # 10.17: the sim thread's fixed steps this window (the
-                    # snapshot cadence — see _steps_total in sim_thread).
+                    # The sim thread's fixed steps this window (the snapshot
+                    # cadence — see _steps_total in sim_thread).
                     steps = sim_thread._steps_total - last_steps_total
                     last_steps_total = sim_thread._steps_total
                     f.write("%.3f,%.4f,%.1f,%.4f,%d,%d,%d\n" % (
@@ -449,35 +425,34 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
                         model["sim_time"] if model else 0.0,
                         fps, dt_max, hic, n, steps))
                     f.flush()
-            # Session 9.x M3: draw the PUBLISHED model (the M3 seam:
-            # draw(dt, model) — the model is built by the sim thread, not
-            # here), with the render thread's OWN interpolation alpha
-            # (the sim's acc/STEP is no longer the render thread's — see
-            # the _HostRenderClock docstring). The model still carries
-            # the sim's step_alpha (the M1/M2b parity tests read it);
-            # draw() uses the render thread's instead.
+            # Draw the PUBLISHED model (draw(dt, model) — the model is built by
+            # the sim thread, not here), with the render thread's OWN
+            # interpolation alpha (the sim's acc/STEP is no longer the
+            # render thread's — see the _HostRenderClock docstring). The
+            # model still carries the sim's step_alpha (the parity tests
+            # read it); draw() uses the render thread's instead.
             game.draw(dt, {**model, "step_alpha": alpha} if model else None)
             pygame.display.flip()
     finally:
         if getattr(game, "_dbg_log_f", None) is not None:
             game._dbg_log_f.close()
             game._dbg_log_f = None
-        # Session 8.5 Step 1: close the per-frame sim-clock diagnostic log.
+        # Close the per-frame sim-clock diagnostic log.
         if getattr(game, "_dbg_sim_log_f", None) is not None:
             game._dbg_sim_log_f.close()
             game._dbg_sim_log_f = None
-        # Session 9.x M3: stop the sim thread (join it) BEFORE stopping the
-        # worker — the sim thread feeds the worker (set_latest_snapshot),
-        # and the worker must not be sending a snapshot the sim thread is
-        # about to mutate (a reset). stop() is idempotent.
+        # Stop the sim thread (join it) BEFORE stopping the worker — the
+        # sim thread feeds the worker (set_latest_snapshot), and the
+        # worker must not be sending a snapshot the sim thread is about
+        # to mutate (a reset). stop() is idempotent.
         if sim_thread is not None:
             sim_thread.stop()
-        # Session 8.3: stop the worker (join its thread) BEFORE closing the
-        # connection — the worker owns the socket, and closing a socket a
-        # worker still owns crashes that worker with EBADF (the 8.1 gotcha).
-        # stop() is idempotent + a no-op when the worker was never started
-        # (handshake failed before phase 3), so this is safe on every exit
-        # path (ESC/QUIT, disconnect, port-in-use).
+        # Stop the worker (join its thread) BEFORE closing the connection
+        # — the worker owns the socket, and closing a socket a worker
+        # still owns crashes that worker with EBADF. stop() is idempotent
+        # + a no-op when the worker was never started (handshake failed
+        # before phase 3), so this is safe on every exit path (ESC/QUIT,
+        # disconnect, port-in-use).
         if worker is not None:
             worker.stop()
         if conn is not None:
@@ -527,7 +502,7 @@ def _input_str(inp):
 
 
 def _draw_net_debug(screen, font, game, inp):
-    """Session 7.8: the net debug overlay (client only, F3-toggled). Small
+    """The net debug overlay (client only, F3-toggled). Small
     text top-right (the HUD occupies the top-left). Shows the live
     feel-layer state: adaptive delay, latency jitter, buffer depth, newest
     snapshot age, render point, host-time estimate, and the LAST snap size
@@ -556,7 +531,7 @@ def _draw_net_debug(screen, font, game, inp):
 
 
 def _log_net_debug(game, inp):
-    """Session 7.8: append one CSV line per reconcile (10 Hz) to
+    """Append one CSV line per reconcile (10 Hz) to
     net_debug.csv (client only, F3-toggled). The overlay shows the LATEST
     snap size; the log captures the DISTRIBUTION over the session + the
     input that was active, so the snap-size vs input-change correlation
@@ -574,7 +549,7 @@ def _log_net_debug(game, inp):
     newest = game.snap_buf.newest_time()
     est = game.host_time.now(pygame.time.get_ticks() / 1000.0)
     jit = game.latency.jitter_ema   # None until the first sample
-    # Session 7.10 (Chunk 1): frame-rate stats over the frames since the
+    # Frame-rate stats over the frames since the
     # last line, then reset the accumulators. fps = 1/mean(raw_dt);
     # dt_max = longest raw frame; hic = frames past the 50 ms clamp;
     # n = frames in the window.
@@ -653,7 +628,7 @@ def _make_ghost_clock_writer(path):
 
 def run_client(screen, font, big_font, clock, sfx, menu, seed,
                light_tex, fog_surf, light_surf):
-    """Join a 2P game (Session 6.6).
+    """Join a 2P game.
 
     Phases: (1) a 'connecting' screen while the BLOCKING connect +
     join/welcome handshake run (the socket is still blocking here); (2) build
@@ -703,7 +678,7 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
     # builds. Rebuild it with the client's fit (same seam the host uses for
     # its ship, but the ghost is a private presentation object).
     #
-    # 10.3b bug fix: `local_index` MUST be passed. The default is 0 (the
+    # `local_index` MUST be passed. The default is 0 (the
     # host), but the client is player 1 — and the ghost stamps its own
     # missiles with (local_index, seq) as the dedup key. With the default
     # 0 the ghost's ids were (0, seq) while the host's authoritative copy
@@ -715,7 +690,7 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
     # ghost's ids match the host's.
     game.ghost = PredictedShip(hull=menu.hull, loadout=menu.loadout,
                                local_index=game.local_index)
-    # 10.6 V/G/T (option A): the client's sensor state is CLIENT-
+    # The client's sensor state is CLIENT-
     # AUTHORITATIVE. The client's V/G/T keys mutate the ghost directly
     # (via the command sink below), and reconcile preserves them across
     # apply_snapshot (the host never saw the client's V/G/T, so its
@@ -724,46 +699,43 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
     # stays authoritative for everything else (pose, weapons, power,
     # shield). The host's ghost keeps the default (host-authoritative).
     game.ghost.client_sensor_authoritative = True
-    # The client's estimate of the host's sim clock (Session 7.1). The
-    # client never runs the sim, so it has no sim clock of its own — the
-    # estimator derives one from the snapshots: each is stamped with the
-    # host's sim time at send and observed at a known local time, so every
-    # arrival is a sample of (host_time - local_time). This replaced the
-    # 6.6 wall-clock `sim_time += dt` (two independent clocks drifting).
-    # Session 7.5b: the estimate is no longer the RENDER clock — the
-    # render point is anchored on the buffer's newest ARRIVED snapshot
-    # (below). The estimator still runs because its per-arrival jitter
-    # sample is what the adaptive delay consumes.
+    # The client's estimate of the host's sim clock. The client never runs
+    # the sim, so it has no sim clock of its own — the estimator derives
+    # one from the snapshots: each is stamped with the host's sim time at
+    # send and observed at a known local time, so every arrival is a
+    # sample of (host_time - local_time). The estimate is NOT the render
+    # clock — the render point is anchored on the buffer's newest
+    # ARRIVED snapshot (below). The estimator still runs because its
+    # per-arrival jitter sample is what the adaptive delay consumes.
     game.host_time = HostTimeEstimator()
-    # The adaptive interpolation delay (Session 7.5a): a pure function of
-    # the arrival pattern — delay = clamp(BASE + k * EMA(jitter), MIN,
-    # MAX), moved at most 1/60 s per frame. Fed by the estimator's
-    # per-arrival jitter sample, ticked once per frame.
+    # The adaptive interpolation delay: a pure function of the arrival
+    # pattern — delay = clamp(BASE + k * EMA(jitter), MIN, MAX), moved at
+    # most 1/60 s per frame. Fed by the estimator's per-arrival jitter
+    # sample, ticked once per frame.
     game.latency = LatencyTracker()
-    # 10.11b: the RTT-echo state — the client tags each T_INPUT with a
-    # monotonic `tag` + records its LOCAL send time; the host immediately
-    # replies T_PONG with the same tag (a pure reflection, no sim work).
-    # On receipt the client computes RTT = now - sent_time[tag], one-way
+    # RTT-echo state — the client tags each T_INPUT with a monotonic
+    # `tag` + records its LOCAL send time; the host immediately replies
+    # T_PONG with the same tag (a pure reflection, no sim work). On
+    # receipt the client computes RTT = now - sent_time[tag], one-way
     # L = RTT / 2 (EMA-smoothed, clamped), and anchors the prediction
-    # ghost's clock at snap_time + L (the 10.11b sawtooth fix: the ghost
-    # must sit at the real-time present, not at the snapshot's time L in
-    # the past). A dropped pong just means no sample that round — the EMA
-    # holds the last value.
+    # ghost's clock at snap_time + L (the ghost must sit at the
+    # real-time present, not at the snapshot's time L in the past). A
+    # dropped pong just means no sample that round — the EMA holds the
+    # last value.
     game._rtt_tag = 0
     game._rtt_sent = {}
     game._rtt_ow = 0.02   # one-way latency estimate (s); 20 ms LAN default
-    # The render point (Session 7.5b): newest ARRIVED snapshot stamp
-    # minus the adaptive delay, chased at a bounded per-frame rate so a
-    # late packet holds the point on the last window instead of the
-    # point outrunning the data and clamp-stuttering. This replaces the
-    # 7.1 host-time-estimate render clock for the render point.
+    # The render point: newest ARRIVED snapshot stamp minus the adaptive
+    # delay, chased at a bounded per-frame rate so a late packet holds
+    # the point on the last window instead of the point outrunning the
+    # data and clamp-stuttering.
     game.render_point = RenderPoint(game.latency)
-    # Session 7.8: net debug overlay + CSV log (client only). F3 toggles
-    # game.debug_net (via handle_events); while on, the loop draws the
-    # overlay and appends one CSV line per reconcile to net_debug.csv.
-    # `last_logged` tracks the last snap_count written so each reconcile is
-    # logged exactly once (reconciles are 10 Hz, far slower than the 60 Hz
-    # frame rate).
+    # Net debug overlay + CSV log (client only). F3 toggles game.debug_net
+    # (via handle_events); while on, the loop draws the overlay and
+    # appends one CSV line per reconcile to net_debug.csv. `last_logged`
+    # tracks the last snap_count written so each reconcile is logged
+    # exactly once (reconciles are 10 Hz, far slower than the 60 Hz frame
+    # rate).
     game._dbg_last_logged = 0
     game._dbg_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                       "net_debug.csv")
@@ -775,12 +747,12 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
         os.path.dirname(os.path.abspath(__file__)), "ghost_clock.csv")
     game._ghost_clock_f = None
     game._ghost_clock_sink = None
-    # Session 7.10 (Chunk 1): per-frame frame-rate telemetry. The 7.8 CSV is
-    # written once per reconcile (10 Hz), so it can't see individual frames —
-    # the render-point drift could be a low frame rate OR occasional hiccup
-    # frames (dt clamped to 50 ms), and the 10 Hz log can't tell them apart.
-    # We accumulate the RAW (pre-clamp) frame time every frame and emit the
-    # rolling stats on each reconcile line:
+    # Per-frame frame-rate telemetry. The net_debug CSV is written once per
+    # reconcile (10 Hz), so it can't see individual frames — the
+    # render-point drift could be a low frame rate OR occasional hiccup
+    # frames (dt clamped to 50 ms), and the 10 Hz log can't tell them
+    # apart. We accumulate the RAW (pre-clamp) frame time every frame and
+    # emit the rolling stats on each reconcile line:
     #   fps      = 1 / mean(raw_dt) over the frames since the last line
     #   dt_max   = the longest raw frame in that window (a hiccup)
     #   hic      = count of frames whose raw dt exceeded the 50 ms clamp
@@ -792,28 +764,28 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
     game._dbg_dt_sum = 0.0
     game._dbg_dt_max = 0.0
     game._dbg_hiccups = 0
-    # Session 8.2: the socket I/O + JSON move to a NetWorker thread (the
-    # "Network Queue" pattern). The worker owns the Connection: it drains the
-    # OS socket buffer the instant a packet lands (no bunching) and parses
-    # the JSON off the render thread. The main thread talks to it only
-    # through worker.send() / worker.poll() / worker.closed — it never
-    # touches conn.* once the worker starts (the ownership rule that avoids
-    # the "Python Pygame Trap" shared-state corruption). start() flips the
+    # The socket I/O + JSON run on a NetWorker thread (the "Network Queue"
+    # pattern). The worker owns the Connection: it drains the OS socket
+    # buffer the instant a packet lands (no bunching) and parses the JSON
+    # off the render thread. The main thread talks to it only through
+    # worker.send() / worker.poll() / worker.closed — it never touches
+    # conn.* once the worker starts (the ownership rule that avoids the
+    # "Python Pygame Trap" shared-state corruption). start() flips the
     # socket to non-blocking (the handshake used a 0.05 s recv timeout; it
     # must be cleared before the loop) and launches the thread.
     worker = NetWorker(conn, is_host=False)
     worker.start()
 
-    # 10.6 V/G/T (option A): the client's command sink. handle_events
-    # routes T/V/G/R/F through it (a sink is provided), so it must handle
-    # all five — not just the sensor keys. T/V/G mutate the GHOST (the
-    # client's local ship) directly: the client's sensor state is
-    # client-authoritative (game.ghost.client_sensor_authoritative), so
-    # these take effect immediately and survive reconciles (the host never
-    # saw them, so its snapshot can't flicker them off). R and F keep the
-    # client's pre-10.6 behavior: R sets _respawn_requested (the loop
-    # drains it into a T_RESPAWN — the host respawns player 1) and F/reset
-    # calls game.reset() (the client's local presentation reset).
+    # The client's command sink. handle_events routes T/V/G/R/F through it
+    # (a sink is provided), so it must handle all five — not just the
+    # sensor keys. T/V/G mutate the GHOST (the client's local ship)
+    # directly: the client's sensor state is client-authoritative
+    # (game.ghost.client_sensor_authoritative), so these take effect
+    # immediately and survive reconciles (the host never saw them, so its
+    # snapshot can't flicker them off). R and F keep the client's prior
+    # behavior: R sets _respawn_requested (the loop drains it into a
+    # T_RESPAWN — the host respawns player 1) and F/reset calls
+    # game.reset() (the client's local presentation reset).
     def _client_command(name, *args):
         if name == "targeting" and not game.game_over:
             game.ghost.ship.targeting_on = not game.ghost.ship.targeting_on
@@ -827,7 +799,7 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
             game.reset()
 
     while True:
-        # Session 7.10 (Chunk 1): capture the RAW frame time before the
+        # Capture the RAW frame time before the
         # clamp — the clamp hides hiccups from the sim, but the render
         # point only advances by the clamped dt, so a raw frame longer than
         # 50 ms is exactly the frame that lets the point fall behind.
@@ -840,7 +812,7 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
                 game._dbg_dt_max = raw_dt
             if raw_dt > 0.05:
                 game._dbg_hiccups += 1
-        # 10.3b missile telemetry: rides the same F3 toggle as the net
+        # Missile telemetry: rides the same F3 toggle as the net
         # debug overlay (client only — the ghost never runs on the host).
         missile_telemetry.set_enabled(game.debug_net)
         # 11.x diagnostics: open/close ghost_clock.csv on the F3 edge and
@@ -856,7 +828,7 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
             game._ghost_clock_f = None
             PredictedShip.diag_sink = None
         now = pygame.time.get_ticks() / 1000.0
-        # 10.6 V/G/T (option A): route T/V/G/R/F through the client command
+        # Route T/V/G/R/F through the client command
         # sink (T/V/G -> the ghost; R/F -> the client's existing behavior).
         # Without a sink these keys mutated the STALE host ship (self.ship),
         # so the client's V/G/T never reached the ghost.
@@ -869,112 +841,106 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
         # frame.
         inp = ShipInput.from_keys(keys)
         # Send the local input every frame (pinned #5: the host applies the
-        # LATEST received input each tick). Session 8.2: queued to the
-        # worker (it flushes to the socket off the render thread).
-        # 10.11b: tag it with a monotonic id + record the LOCAL send time —
-        # the host reflects the tag back in a T_PONG, and the RTT is the
-        # one-way-latency measurement that anchors the ghost's clock.
+        # LATEST received input each tick). Queued to the worker (it
+        # flushes to the socket off the render thread). Tag it with a
+        # monotonic id + record the LOCAL send time — the host reflects
+        # the tag back in a T_PONG, and the RTT is the one-way-latency
+        # measurement that anchors the ghost's clock.
         game._rtt_tag += 1
         game._rtt_sent[game._rtt_tag] = time.time()
         if len(game._rtt_sent) > 500:   # bound the map (a lost pong)
             del game._rtt_sent[min(game._rtt_sent)]
         worker.send({"type": T_INPUT, "inp": serialize_input(inp),
                      "tag": game._rtt_tag})
-        # 10.1: per-player death — R while the local ship is dead set
+        # Per-player death — R while the local ship is dead set
         # game._respawn_requested in handle_events; send the respawn
         # request to the host (it respawns player 1 — us — leaving the
         # host's ship + world untouched).
         if game._respawn_requested:
             game._respawn_requested = False
             worker.send({"type": T_RESPAWN})
-        # Session 7.6: record the input in the ghost's rewind buffer,
-        # stamped with the client's estimate of the host's sim clock at
-        # this moment (the 7.1 HostTimeEstimator — the same clock the
-        # snapshot stamps are in). When a snapshot arrives,
-        # reconcile_rewind replays the inputs the host applied since it,
-        # selecting them by this stamp (the host applies the LATEST
-        # received input each tick — pinned #5 — so the replay must use
-        # the same selection). Before the first snapshot the estimate is
-        # None and there is nothing to rewind against, so skip the record.
+        # Record the input in the ghost's rewind buffer, stamped with the
+        # client's estimate of the host's sim clock at this moment (the
+        # HostTimeEstimator — the same clock the snapshot stamps are in).
+        # When a snapshot arrives, reconcile_rewind replays the inputs the
+        # host applied since it, selecting them by this stamp (the host
+        # applies the LATEST received input each tick — pinned #5 — so the
+        # replay must use the same selection). Before the first snapshot
+        # the estimate is None and there is nothing to rewind against, so
+        # skip the record.
         est_now = game.host_time.now(now)
         if est_now is not None:
             game.ghost.record_input(est_now, inp)
         # Poll the host: each snapshot feeds the host-time estimator (its
         # wire stamp vs the local arrival time — the estimator's
-        # per-arrival jitter sample is the adaptive delay's input,
-        # Session 7.5a) and then the interpolation buffer + prediction
-        # ghost (seed on the first, dead-reckoning rewind on the rest —
-        # Session 7.6). `now` is the client's current estimate of the
-        # host's sim clock: the rewind replays from the snapshot's stamp
-        # up to it. Session 8.2: worker.poll() drains the messages the
-        # worker thread already parsed off the render thread (the JSON
-        # decode no longer happens here).
+        # per-arrival jitter sample is the adaptive delay's input) and
+        # then the interpolation buffer + prediction ghost (seed on the
+        # first, dead-reckoning rewind on the rest). `now` is the
+        # client's current estimate of the host's sim clock: the rewind
+        # replays from the snapshot's stamp up to it. worker.poll()
+        # drains the messages the worker thread already parsed off the
+        # render thread (the JSON decode no longer happens here).
         for m in worker.poll():
             if m.get("type") == T_SNAP:
                 if game.host_time.record(now, m["sim_time"]):
                     game.latency.update(game.host_time.last_jitter)
-                # 10.11b: anchor the ghost's clock at the REAL-TIME PRESENT —
-                # `snap_time + L`, where L is the RTT-measured one-way
-                # latency (game._rtt_ow). The snapshot's pose is the
-                # authority at snap_time (L in the past); the ghost must
-                # sit at the present, so the replay span is ~L and the
-                # replay rebuilds the prediction forward (the 10.11 bug was
-                # a free-run clock ≈ snap_time, so the span oscillated ±1
-                # tick across zero and the replay was skipped 44% of the
-                # time — the sawtooth).
+                # Anchor the ghost's clock at the REAL-TIME PRESENT — `snap_time + L`,
+                # where L is the RTT-measured one-way latency
+                # (game._rtt_ow). The snapshot's pose is the authority at
+                # snap_time (L in the past); the ghost must sit at the
+                # present, so the replay span is ~L and the replay
+                # rebuilds the prediction forward.
                 game.push_snapshot(m["sim_time"],
                                    deserialize_snapshot(m["snap"]),
                                    now=m["sim_time"] + game._rtt_ow,
                                    real_time=now,
                                    rate=game.host_time.rate)
             elif m.get("type") == T_BEAM:
-                # 10.4: a laser beam the host fired — an EVENT (a 0.15 s
-                # flash, too short to ride the snapshot's INTERP_DELAY
-                # window). Push it into game.remote_beams as
-                # [local_start, end, age, ttl, owner] (hull-local muzzle
-                # + world endpoint); predicted_view draws it immediately
-                # (before the ships), re-anchoring the origin to the
-                # firing ship's interpolated pose, and ages it each frame
-                # (_step_remote_beams). One-way LAN latency (~10-20 ms) is
-                # imperceptible against the 0.15 s flash.
-                # 10.4 fix: SKIP beams from OUR OWN ship (owner ==
-                # local_index) — the ghost already draws those (10.3a),
-                # and drawing the host's copy too (at the slightly
-                # different authoritative pose, ~10-20 ms later) produced
-                # a double-draw "criss-cross". Same dedup idea as the
-                # 10.3b ghost-missile id skip.
+                # A laser beam the host fired — an EVENT (a 0.15 s flash, too short
+                # to ride the snapshot's INTERP_DELAY window). Push it
+                # into game.remote_beams as [local_start, end, age, ttl,
+                # owner] (hull-local muzzle + world endpoint);
+                # predicted_view draws it immediately (before the ships),
+                # re-anchoring the origin to the firing ship's
+                # interpolated pose, and ages it each frame
+                # (_step_remote_beams). One-way LAN latency (~10-20 ms)
+                # is imperceptible against the 0.15 s flash.
+                # SKIP beams from OUR OWN ship (owner == local_index) —
+                # the ghost already draws those, and drawing the host's
+                # copy too (at the slightly different authoritative pose,
+                # ~10-20 ms later) produced a double-draw "criss-cross".
+                # Same dedup idea as the ghost-missile id skip.
                 if m.get("owner") == game.local_index:
                     continue
-                # 10.4b (detach fix): store the HULL-LOCAL muzzle (lx, ly)
-                # + the firing owner, not the frozen world-space start.
-                # predicted_view re-anchors the origin to the firing ship's
-                # INTERPOLATED pose each frame (mirrors the host's
-                # _draw_world_beam / the original 1p fix) — the world-space
-                # start is where the muzzle WAS at fire time, so drawing it
-                # directly left the origin behind in empty space as the ship
-                # moved during the 0.15 s flash. Entry shape:
-                # [local_start, end, age, ttl, owner].
+                # Store the HULL-LOCAL muzzle (lx, ly) + the firing owner,
+                # not the frozen world-space start. predicted_view
+                # re-anchors the origin to the firing ship's INTERPOLATED
+                # pose each frame (mirrors the host's _draw_world_beam) —
+                # the world-space start is where the muzzle WAS at fire
+                # time, so drawing it directly left the origin behind in
+                # empty space as the ship moved during the 0.15 s flash.
+                # Entry shape: [local_start, end, age, ttl, owner].
                 game.remote_beams.append([
                     (m.get("lx", 0.0), m.get("ly", 0.0)),
                     pygame.Vector2(m["ex"], m["ey"]),
                     0.0, BEAM_TTL, m.get("owner", 0)])
             elif m.get("type") == T_ECHO:
-                # 10.10: the input the host ACTUALLY applied to OUR ship
-                # (player 1) on each tick — one (sim_time, input) pair per
-                # entry. Record each in the ghost's echo buffer (in
-                # arrival order — in-order TCP keeps it sorted by
-                # sim_time). reconcile_rewind prefers these over the
-                # client's own sent input for the replay: the host applied
-                # the latest input it had RECEIVED (up to one-way latency
-                # stale), so on an input change the client's own input
-                # diverges from what the host did — the high-speed
-                # snapback. A dropped echo degrades gracefully (the replay
-                # holds the last echoed input — what the host itself did).
+                # The input the host ACTUALLY applied to OUR ship (player 1) on each
+                # tick — one (sim_time, input) pair per entry. Record
+                # each in the ghost's echo buffer (in arrival order —
+                # in-order TCP keeps it sorted by sim_time).
+                # reconcile_rewind prefers these over the client's own
+                # sent input for the replay: the host applied the latest
+                # input it had RECEIVED (up to one-way latency stale), so
+                # on an input change the client's own input diverges from
+                # what the host did — the high-speed snapback. A dropped
+                # echo degrades gracefully (the replay holds the last
+                # echoed input — what the host itself did).
                 for (st, d) in m.get("entries", []):
                     game.ghost.record_echo(st, deserialize_input(d))
             elif m.get("type") == T_PONG:
-                # 10.11b: the host reflected our T_INPUT tag back. The RTT is
-                # now - the LOCAL time we sent that tag; one-way L = RTT / 2.
+                # The host reflected our T_INPUT tag back. The RTT is now - the
+                # LOCAL time we sent that tag; one-way L = RTT / 2.
                 # EMA-smooth + clamp (a hiccup can't spike the anchor). A
                 # missing tag (the map was bounded) just skips the sample.
                 t0 = game._rtt_sent.pop(m.get("tag"), None)
@@ -983,37 +949,36 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
                     ow = rtt / 2.0
                     game._rtt_ow = 0.1 * ow + 0.9 * game._rtt_ow
                     game._rtt_ow = max(0.002, min(0.25, game._rtt_ow))
-        # Session 8.2: the worker owns the socket now — read worker.closed (the
-        # worker mirrors conn.closed) and never touch conn.* here. The
-        # worker also does the drain_send() (off the render thread), so the
-        # in-loop conn.drain_send() is gone.
+        # The worker owns the socket now — read worker.closed (the worker
+        # mirrors conn.closed) and never touch conn.* here. The worker
+        # also does the drain_send() (off the render thread).
         if worker.closed:
             _notice(screen, font, big_font, clock,
                     ["DISCONNECTED", "the host left"])
             break
-        # Render point (Session 7.5b): the newest ARRIVED snapshot's
-        # stamp minus the adaptive delay, chased at a bounded per-frame
-        # rate — the buffer is the anchor, not the 7.1 host-time
-        # estimate (a model of the host clock that disagrees with the
-        # data under jitter/loss). The tracker's per-frame smoothing
-        # step runs here too (one frame moves the delay at most 1/60 s).
-        # None until the first snapshot arrives — draw a waiting state
-        # meanwhile (predicted_view would do the same, but this keeps
-        # the waiting frame free of a ghost step).
+        # Render point: the newest ARRIVED snapshot's stamp minus the
+        # adaptive delay, chased at a bounded per-frame rate — the buffer
+        # is the anchor, not the host-time estimate (a model of the host
+        # clock that disagrees with the data under jitter/loss). The
+        # tracker's per-frame smoothing step runs here too (one frame
+        # moves the delay at most 1/60 s). None until the first snapshot
+        # arrives — draw a waiting state meanwhile (predicted_view would
+        # do the same, but this keeps the waiting frame free of a ghost
+        # step).
         game.latency.tick(dt)
         rp = game.render_point.advance(dt, game.snap_buf.newest_time())
         if rp is None:
             _draw_waiting_client(screen, font, big_font)
         else:
             # Render: local ship from the prediction ghost (advanced at
-            # the sim's fixed rate inside predicted_view, Session 7.1),
-            # remote entities from the interpolation buffer at the
-            # render point. host_time keeps self.sim_time = the host's
-            # clock as carried by the wire (7.1), for the ghost's
-            # reconcile bookkeeping and diagnostics.
+            # the sim's fixed rate inside predicted_view), remote
+            # entities from the interpolation buffer at the render point.
+            # host_time keeps self.sim_time = the host's clock as carried
+            # by the wire, for the ghost's reconcile bookkeeping and
+            # diagnostics.
             game.predicted_view(dt, keys, host_time=game.host_time.now(now),
                               real_time=now)
-        # Session 7.8: net debug overlay + CSV log (F3-toggled, client only).
+        # Net debug overlay + CSV log (F3-toggled, client only).
         # The overlay shows the live feel-layer state; the log appends one
         # line per reconcile (10 Hz) so the snap-size distribution + its
         # correlation with input changes can be analyzed offline.
@@ -1032,9 +997,9 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
         game._ghost_clock_f.close()
         game._ghost_clock_f = None
     PredictedShip.diag_sink = None
-    # 10.3b: flush + close the missile telemetry CSV on every exit path.
+    # Flush + close the missile telemetry CSV on every exit path.
     missile_telemetry.close()
-    # Session 8.2: stop the worker (join its thread) BEFORE closing the
+    # Stop the worker (join its thread) BEFORE closing the
     # connection — the worker owns the socket, and closing a socket a worker
     # still owns crashes that worker with EBADF (the 8.1 gotcha). stop() is
     # idempotent, so this is safe on every exit path (ESC/QUIT, disconnect).
@@ -1094,7 +1059,7 @@ def main():
                        light_tex, fog_surf, light_surf)
             continue          # back to the menu (pinned #8: no reconnect)
 
-        # --- single player (Session 9.x M5: unified onto the SimThread) ---
+        # --- single player (unified onto the SimThread) ---
         # The classic solo run now uses the SAME architecture as the host:
         # the sim runs on a SimThread (a real-time 60 Hz clock — the 8.5
         # hiccup policy, its own monotonic accumulator, NOT tied to the

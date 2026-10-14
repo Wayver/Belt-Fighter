@@ -45,9 +45,8 @@ class Asteroid:
     # SYNCED: id, pos, vel, size, angle, spin, verts (the rock shape — both
     # peers must draw the same rock). id is assigned once from the
     # Asteroid._next_id class counter and never reused within a run — a
-    # stable identity across snapshots (Session 5b.1). radius /
-    # collision_radius are derived from size via ROCK_SIZES, so they are
-    # rebuilt, not stored.
+    # stable identity across snapshots. radius / collision_radius are
+    # derived from size via ROCK_SIZES, so they are rebuilt, not stored.
 
     def snapshot(self):
         return (

@@ -908,21 +908,25 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
                 # present, so the replay span is ~L and the replay
                 # rebuilds the prediction forward.
                 #
-                # >>> TEMP DIAGNOSTIC #2 (advance-then-reconcile) <<<
-                # `now` is back to the original snap_time + rtt_ow. The ghost
-                # was advanced to the CURRENT frame BEFORE the poll loop (see
-                # the block above it), so the reconcile here sees a
-                # current-frame pose/clock instead of the previous frame's.
-                # If the 1-frame staleness is the cause of the ~8 px snap,
-                # snap_px should drop to ~2-3 px. REVERT: search
-                # "TEMP DIAGNOSTIC" (two blocks).
-                print("[REPLAY-DIAG2] snap=%.4f ghost_sim=%.4f "
+                # >>> TEMP DIAGNOSTIC #4 (reconcile at the ghost's own
+                # clock) <<<
+                # `now` = the ghost's ACTUAL current sim clock (advanced to
+                # this frame before the poll loop, see the block above).
+                # The reconcile no longer jumps the clock to
+                # snap_time + rtt_ow (which lagged the raw clock by ~3 ms
+                # -> ~1.5 px snap); it corrects the pose to the snapshot
+                # and replays from the ghost's real time. If the clock gap
+                # was the last piece, snap_px should drop to ~0.6 px
+                # (physics divergence only). REVERT: search
+                # "TEMP DIAGNOSTIC".
+                print("[REPLAY-DIAG4] snap=%.4f ghost_sim=%.4f "
                       "span=%.4f" % (
                           m["sim_time"], game.ghost.sim_time,
-                          game._rtt_ow), flush=True)
+                          game.ghost.sim_time - m["sim_time"]),
+                      flush=True)
                 game.push_snapshot(m["sim_time"],
                                    deserialize_snapshot(m["snap"]),
-                                   now=m["sim_time"] + game._rtt_ow,
+                                   now=game.ghost.sim_time,
                                    real_time=now,
                                    rate=game.host_time.rate)
             elif m.get("type") == T_BEAM:

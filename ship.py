@@ -7,8 +7,8 @@ rendering that reads geometry from self.hull.
 Per-thruster physics pipeline (one fixed step):
   1. _apply_rotation  — Q/E turns the hull
   2. _set_demands     — map input (+ auto-stop guidance) to per-thruster demand (0..1)
-  3. _allocate        — resolve each thruster's allocation (0..1). Phase 2:
-                        power/compute budgets. For now: always 1.0.
+  3. _allocate        — resolve each thruster's allocation (0..1) from the
+                        power/compute budgets
   4. _resolve_forces  — per-thruster force = demand * allocation * comp.thrust,
                         summed into a world-space accel; also sets flame mags
   5. _integrate       — vel += accel*dt, clamp, deadband, pos += vel*dt
@@ -16,14 +16,14 @@ Per-thruster physics pipeline (one fixed step):
 A thruster's Slot.orientation is the direction of the FORCE on the ship;
 the exhaust/flame is rendered in the opposite direction.
 
-Networked-ready (unchanged):
-- update() takes a ShipInput (flat, serializable intent).
-- update() expects a fixed timestep for deterministic simulation.
+Networked:
+- update() takes a ShipInput (flat, serializable intent) and a fixed
+  timestep, for deterministic simulation.
 - snapshot()/apply_snapshot() expose the full synced state (see the
   SYNCED vs PRESENTATION-ONLY classification above the methods).
-- 10.6: flame_mags is now SYNCED (the remote peer draws the remote ship's
-  + enemies' exhaust from it); the other presentation-only state (arcs,
-  shield_impacts, ...) is still never serialized.
+- flame_mags is SYNCED (the remote peer draws the remote ship's +
+  enemies' exhaust from it); the other presentation-only state (arcs,
+  shield_impacts, ...) is never serialized.
 """
 import math
 import random
@@ -62,7 +62,7 @@ class Thruster:
     """Runtime state for one fitted thruster (one per thruster slot).
 
     demand:     0..1, how hard the player/guidance wants it to fire this tick
-    allocation: 0..1, what it's actually allowed (power/compute, Phase 2)
+    allocation: 0..1, what it's actually allowed (power/compute budget)
     force:      resolved force magnitude this tick (drives the flame)
     """
     slot: Slot
@@ -142,17 +142,12 @@ class Ship:
 
         self.missile_target = None   # enemy candidate; set by Game each tick
         self.missile_dump = 0.0      # decaying power spike from launches
-        # 10.3b: per-ship missile launch counter. The host assigns each
-        # launched missile the id (player_index, missile_seq) and bumps
-        # this; it is SYNCED via the ship snapshot so the client's
-        # prediction ghost keeps the same counter (its ghost missiles get
-        # the same ids the host's get — the no-double-draw dedup key).
+        # Per-ship launch/fire counters. The host assigns each missile
+        # (player_index, missile_seq) and each bullet (player_index,
+        # bullet_seq) and bumps the counter; both are SYNCED via the ship
+        # snapshot so the client's prediction ghost derives the same ids
+        # (the no-double-draw dedup key).
         self.missile_seq = 0
-        # 10.7: per-ship gun-fire counter. The host assigns each fired
-        # bullet the id (player_index, bullet_seq) and bumps this; it is
-        # SYNCED via the ship snapshot exactly like missile_seq, so the
-        # client's prediction ghost derives the same ids (the
-        # no-double-draw dedup key for the ghost's own bullets).
         self.bullet_seq = 0
 
         # sensors: passive ear (V) + active ping (G). The fitted part
@@ -175,7 +170,7 @@ class Ship:
         self.power_idle_total = sum(c.power_idle for c in self.components.values())
 
 
-        # Phase 2: power/compute budgets, derived from the fitted parts
+        # Power/compute budgets, derived from the fitted parts
         self.power_supply = sum(c.power_supply for c in self.components.values())
         self.compute_supply = sum(c.compute_supply for c in self.components.values())
         self.power_used = 0.0
@@ -187,11 +182,11 @@ class Ship:
         self.vel = pygame.Vector2(0, 0)
         self.accel = pygame.Vector2(0, 0)
         self.angle = -math.pi / 2
-        self.flame_mags = {}   # presentation only — never serialized
+        self.flame_mags = {}   # per-thruster exhaust mags; SYNCED (see snapshot)
         self.arcs = [] # presentation only: brownout lightning (pts, age, ttl)
         self.arc_clock = 0.0
         self.dampening = False
-        self.dead = False   # 10.1: per-player death (a dead ship is frozen)
+        self.dead = False   # per-player death (a dead ship is frozen)
         self.prev_pos = self.pos.copy()
         self.prev_angle = self.angle
         # exact collision shape: convex hull of the hull polygon, precomputed
@@ -367,44 +362,30 @@ class Ship:
     #                              before its first step)
     #   weapons: per weapon (cooldown, charge, lock_progress)
     #   id                         owner tag for shots (enemy id = None/0)
-    #   missile_seq                10.3b: per-ship missile launch counter
-    #                              (the host bumps it on each launch; the
-    #                              client's ghost resyncs it so its ghost
-    #                              missiles get the same ids the host's do)
-    #   bullet_seq               10.7: per-ship gun-fire counter (the host
-    #                              bumps it on each fired bullet; the
-    #                              client's ghost resyncs it so its ghost
-    #                              bullets get the same ids the host's do —
-    #                              the no-double-draw dedup key)
-    #   power_used                 10.3c: the live total power demand
-    #                              (recomputed by _allocate every tick).
-    #                              Serialized so the CLIENT can compute the
-    #                              sensor-contact signature
-    #                              (power_used - power_idle_total) for the
-    #                              host's enemies — the ghost's
-    #                              _update_contacts needs it and it is not
-    #                              derivable client-side (the enemy's
-    #                              thruster state / ShipInput is not
-    #                              synced). power_idle_total is a loadout
-    #                              constant the client derives. (Was
-    #                              presentation-only; 10.3c promotes it.)
-    #
-    #   flame_mags                 10.6: per-thruster exhaust magnitudes
-    #                              (the 'forward'/'reverse'/'to_left'/
-    #                              'to_right' buckets). Serialized so the
-    #                              CLIENT can draw the REMOTE player ship's
-    #                              AND the REMOTE enemies' exhaust (the
-    #                              host's draw() renders player flames via
-    #                              _sync_local_ship and enemy flames via the
-    #                              model's enemy tuple; the client's buffer
-    #                              path must too, for parity). Recomputed
-    #                              from scratch every tick by
-    #                              _resolve_forces, so it is always the
-    #                              current frame's exhaust. (Was
-    #                              presentation-only; 10.6 promotes it. One
-    #                              field serves both player ships and
-    #                              enemies — the enemy's Ship snapshot is
-    #                              the same 24-tuple.)
+    #   missile_seq, bullet_seq    per-ship launch/fire counters. The host
+    #                              bumps them; the client's ghost resyncs
+    #                              them so its ghost projectiles get the
+    #                              same (player_index, seq) ids the host's
+    #                              do — the no-double-draw dedup key.
+    #   power_used                 live total power demand (recomputed by
+    #                              _allocate every tick). Serialized so the
+    #                              CLIENT can compute the sensor-contact
+    #                              signature (power_used - power_idle_total)
+    #                              for the host's enemies — not derivable
+    #                              client-side (the enemy's thruster state /
+    #                              ShipInput is not synced); power_idle_total
+    #                              is a loadout constant the client derives.
+    #   flame_mags                 per-thruster exhaust magnitudes
+    #                              ('forward'/'reverse'/'to_left'/'to_right'
+    #                              buckets). Serialized so the CLIENT can
+    #                              draw the REMOTE player ship's AND the
+    #                              REMOTE enemies' exhaust (the client's
+    #                              buffer path must match the host's draw).
+    #                              Recomputed from scratch every tick by
+    #                              _resolve_forces — always the current
+    #                              frame's exhaust. One field serves both
+    #                              player ships and enemies (the enemy's
+    #                              Ship snapshot is the same 25-tuple).
     #
     # PRESENTATION-ONLY (never serialized):
     #   arcs, arc_clock, shield_impacts
@@ -419,14 +400,11 @@ class Ship:
     #                              (loadout config — identical on both peers)
 
     def snapshot(self):
-        # Store the RAW angle (unbounded), not a wrapped value. The sim's
-        # angle accumulates forever (self.angle += turn*ROT_SPEED*dt) and the
-        # determinism oracle compares the raw angle — wrapping to [-pi, pi]
-        # would drop the number of full rotations and make the round-trip
-        # lossy (restored raw angle would differ from the original by a
-        # multiple of 2*pi). Raw is bit-identical through a round-trip, and
-        # every consumer (axes, sync_render, AI steering) is periodic or
-        # wraps its own delta, so raw is safe.
+        # Store the RAW angle (unbounded), not a wrapped value: the sim's
+        # angle accumulates forever and the determinism oracle compares it
+        # raw — wrapping would make the round-trip lossy. Raw is
+        # bit-identical through a round-trip, and every consumer (axes,
+        # sync_render, AI steering) is periodic or wraps its own delta.
         return (
             self.pos.x, self.pos.y, self.vel.x, self.vel.y, self.angle,
             self.shield_charge, self.shield_dump, self.shield_clock,
@@ -438,11 +416,11 @@ class Ship:
             tuple((w.cooldown, w.charge, w.lock_progress)
                   for w in self.weapons),
             self.id,
-            self.dead,   # 10.1: per-player death
-            self.missile_seq,   # 10.3b: per-ship missile launch counter
-            self.power_used,   # 10.3c: live power demand (sensor signature)
-            self.flame_mags,   # 10.6: per-thruster flame mags (remote exhaust)
-            self.bullet_seq,   # 10.7: per-ship gun-fire counter
+            self.dead,   # per-player death
+            self.missile_seq,   # per-ship missile launch counter
+            self.power_used,   # live power demand (sensor signature)
+            self.flame_mags,   # per-thruster flame mags (remote exhaust)
+            self.bullet_seq,   # per-ship gun-fire counter
         )
 
     def sync_render(self, alpha):
@@ -463,7 +441,7 @@ class Ship:
          missile_seq,
          power_used,
          flame_mags,
-         bullet_seq) = s   # 10.1: death; 10.3b: missile; 10.3c: power; 10.6: flames; 10.7: bullet seq
+         bullet_seq) = s
         self.pos = pygame.Vector2(px, py)
         self.vel = pygame.Vector2(vx, vy)
         self.angle = a
@@ -485,29 +463,22 @@ class Ship:
             w.charge = charge
             w.lock_progress = lock_progress
         self.id = ship_id
-        self.dead = dead   # 10.1: per-player death
-        self.missile_seq = missile_seq   # 10.3b: resync the launch counter
-        self.bullet_seq = bullet_seq   # 10.7: resync the gun-fire counter
-        self.power_used = power_used   # 10.3c: render-consistent power demand
-        # 10.6: restore the per-thruster flame mags (presentation only —
-        # the remote peer draws the remote ship's exhaust from these).
-        # _resolve_forces recomputes them every tick on the host, so this
-        # is the host's CURRENT frame's exhaust; the client feeds them to
-        # the remote stand-in before drawing.
+        self.dead = dead
+        self.missile_seq = missile_seq   # resync the launch counter
+        self.bullet_seq = bullet_seq   # resync the gun-fire counter
+        self.power_used = power_used   # render-consistent power demand
+        # Restore the per-thruster flame mags: the host's CURRENT frame's
+        # exhaust (recomputed every tick by _resolve_forces); the client
+        # feeds them to the remote stand-in before drawing.
         self.flame_mags = dict(flame_mags)
 
     def power_state(self):
-        """Bundle the ship's power presentation state into one plain dict.
-
-        10.6: the four fields that power-driven presentation reads —
-        brownout (latched flag), power_factor (0..1 allocation scale),
-        power_used (live total demand) and flame_mags (per-thruster
-        exhaust magnitudes) — in one place. A future power feature
-        (brownout zaps, flame animation, a power HUD) reads them as a
-        unit instead of reaching for four separate attributes. The dict
-        is plain data (JSON-safe) so it can ride the wire or a render
-        model. The flame_mags value is a COPY (the caller may mutate it
-        without touching the ship)."""
+        """Bundle the four fields power-driven presentation reads — brownout
+        (latched flag), power_factor (0..1 allocation scale), power_used
+        (live total demand) and flame_mags (per-thruster exhaust mags) —
+        into one plain (JSON-safe) dict that can ride the wire or a
+        render model. The flame_mags value is a COPY (the caller may
+        mutate it without touching the ship)."""
         return {
             "brownout": self.brownout,
             "power_factor": self.power_factor,
@@ -519,8 +490,8 @@ class Ship:
 
 
     def update(self, dt, inp):
-        """... Returns (shots, beams, missiles) fired this tick; the caller routes
-        them into its bullet/beam lists."""
+        """One fixed step. Returns (shots, beams, missiles) fired this tick;
+        the caller routes them into its bullet/beam lists."""
         self.prev_pos = self.pos.copy()
         self.prev_angle = self.angle
         self.dampening = inp.stop
@@ -708,9 +679,9 @@ class Ship:
         """Execution stage: tick weapon cooldowns, fire ready weapons.
 
         A weapon fires when the input is held, its cooldown has elapsed,
-        and it has power allocation. The cooldown advances only for shots
-        that actually fire, so a ship that can't fire (capped by the
-        caller, or browned out) fires the instant it can.
+        and it has power allocation. The cooldown always ticks down and
+        firing resets it to fire_cooldown, so a ship that can't fire
+        (browned out) fires the instant it can.
         """
         shots = []
         for w in self.weapons:
@@ -775,7 +746,7 @@ class Ship:
             return
         severity = 1.0 - self.power_factor
         self.arc_clock += dt
-        interval = 0.45 - 0.15 * severity   # 0.25s -> 0.10s as it deepens
+        interval = 0.45 - 0.15 * severity   # 0.45s -> 0.30s as it deepens
         if self.arc_clock >= interval:
             self.arc_clock = 0.0
             self.arcs.append(self._make_arc())
@@ -902,14 +873,12 @@ class Ship:
             if inp.missile_fire:
                 fwd, right = self.axes()
                 ox, oy = w.slot.orientation
-                # 10.3c: launch at MISSILE_LAUNCH_SPEED (not cruise). The
-                # boost ramp in Missile.update accelerates it up to
-                # MISSILE_SPEED over MISSILE_BOOST_TIME. Launching slow
-                # shrinks the ghost->buffer handback discontinuity: the
-                # missile is still ramping (slow) when the buffer's copy
-                # takes over, so the position jump (speed x interp-delay)
-                # is smaller. (Before 10.3c it launched at full cruise —
-                # the boost phase only delayed seeking, never speed.)
+                # Launch at MISSILE_LAUNCH_SPEED (not cruise); the boost ramp in
+                # Missile.update accelerates it up to MISSILE_SPEED over
+                # MISSILE_BOOST_TIME. Launching slow shrinks the
+                # ghost->buffer handback discontinuity: the missile is
+                # still ramping (slow) when the buffer's copy takes over,
+                # so the position jump (speed x interp-delay) is smaller.
                 vel = (fwd * ox + right * oy) * MISSILE_LAUNCH_SPEED
                 missiles.append(MissileShot(self.to_world(*w.slot.position),
                                             vel, self.id, t))

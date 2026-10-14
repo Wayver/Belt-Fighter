@@ -31,8 +31,8 @@ Run: cd /mnt && SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy python -m ship5.<tes
 |------|--------|--------|-------|
 | game.py | DONE | b46c276 | 3515→3126 lines (−389); all narrative markers gone; gates green |
 | __main__.py | DONE | 3e2ee20 | 1161→1126 lines; all narrative markers gone; gates green |
-| net.py | pending | | |
-| netcode.py | pending | | |
+| net.py | DONE | 19a2f35 | 1479→1458 lines; all narrative markers gone; gates green (test_determinism, net self-test 18 PASS, test_network ALL PASS) |
+| netcode.py | pending | | ARCHITECTURE.md FIRST (rule 3) |
 | ship.py | pending | | |
 | sim_thread.py | pending | | |
 | config.py | pending | | |
@@ -47,20 +47,31 @@ ALL PASS. Invariants preserved (see the "Invariants to PRESERVE" list
 below — still valid as the reference for what the trimmed comments now
 say).
 
-## NEXT: net.py (1479 lines, 318 comment lines)
+## net.py — DONE (commit 19a2f35, 2026-10-14)
 
-Approach (same as game.py):
-1. Grep for narrative markers:
-   `Session [0-9]|10\.[0-9]+[a-g]?:|7\.[0-9]+[a-c]?:|6\.[0-9]+[a-c]?:|8\.[0-9]+[a-c]?:|9\.x|5b\.`
-   (the 8.1 async-worker block at ~line 620 and the 10.10 input-echo
-   block at ~line 97 are the biggest).
-2. Condense the big blocks (the NetWorker async-worker architecture, the
-   input-echo, the hull/loadout wire mapping → 2-4 lines keeping the
-   invariant: worker owns the socket + JSON off the render thread; input
-   applied by the worker via the sink; echo = the input the host ACTUALLY
-   applied per tick).
+1479 → 1458 lines (−21). All session-history narrative removed (Session
+6.3/6.5/6.7/6.9/7.11/8.1, 10.1/10.4/10.10/10.11/10.11b/10.11d/10.12/10.13,
+the 7.8 log ref). Stale factual claims fixed while in there: "30 Hz
+snapshots" → 60 Hz (SNAPSHOT_INTERVAL=1 tick), "no threads" → NetWorker
+owns the socket, "Four message types" → all 8 T_* tags listed, "~366 KB/s"
+→ ~370 KB/s (measured: 6422 B wire × 60 Hz ≈ 376 KB/s), "7.3 KB MT state"
+verified (json.dumps = 7340 B). Gates green: test_determinism exit=0,
+net self-test 18 PASS / 0 FAIL, test_network ALL PASS (the 7.5b
+informational FAIL is the known load-flaky one).
+
+## NEXT: netcode.py (~1700+ lines) — CREATE ARCHITECTURE.md FIRST
+
+Rule 3: before touching netcode.py, create ARCHITECTURE.md extracting the
+surviving invariants (ghost clock, reconcile/rewind, render point,
+interpolation buffer, handoff rules) so the trimmed comments have a single
+current-state home. Then:
+1. Grep for narrative markers (same pattern as before).
+2. Condense the big blocks (reconcile_rewind, PredictedShip,
+   SnapshotBuffer, interp_positions) to 1-2 lines each, pointing at
+   ARCHITECTURE.md for the full contract.
 3. Sweep inline markers.
-4. Test gate: test_determinism + test_network + net self-test.
+4. Test gate: test_determinism + test_network + test_interpolation +
+   test_10_1..10_12 (the netcode tests).
 5. Commit + update this tracker.
 
 NOTE: before netcode.py (the highest-value, highest-risk file), create
@@ -80,3 +91,19 @@ the trimmed comments have a single current-state home.
 
 ## Per-file notes
 (Findings as I go: stale claims found, invariants preserved, etc.)
+
+### net.py
+- Stale claims found & fixed: "30 Hz snapshots" (now 60 Hz, per-step
+  publish), "no threads, no shared state" (NetWorker owns the socket),
+  "Four message types" (8 T_* tags now), "~366 KB/s" (measured ~376).
+- Verified claims kept: 7.3 KB MT state (7340 B json.dumps), 11-tuple
+  snapshot (indices 5/6/9/10 all correct), MAX_SPEED 520 px/s,
+  SNAPSHOT_BUFFER_MAX 24 brackets INTERP_DELAY_MAX 0.35 s at 60 Hz.
+- "pinned #5" references KEPT — they point at the durable pinned-plan
+  note (user note "Belt Fighter — Network Transport Plan"), not a
+  session.
+- Invariants preserved (condensed): worker owns socket+JSON, main thread
+  only queues/polls; drain-to-newest snapshot queue; input sink runs on
+  the worker thread (GIL-atomic ref swap, no pygame); pong reflected on
+  the worker thread to keep RTT honest; partial-frame send keeps the
+  UNSENT remainder; resync past corrupted regions.

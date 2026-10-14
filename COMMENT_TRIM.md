@@ -30,7 +30,7 @@ Run: cd /mnt && SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy python -m ship5.<tes
 | file | status | commit | notes |
 |------|--------|--------|-------|
 | game.py | DONE | b46c276 | 3515→3126 lines (−389); all narrative markers gone; gates green |
-| __main__.py | pending | | |
+| __main__.py | DONE | 3e2ee20 | 1161→1126 lines; all narrative markers gone; gates green |
 | net.py | pending | | |
 | netcode.py | pending | | |
 | ship.py | pending | | |
@@ -47,19 +47,26 @@ ALL PASS. Invariants preserved (see the "Invariants to PRESERVE" list
 below — still valid as the reference for what the trimmed comments now
 say).
 
-## NEXT: __main__.py (1161 lines, 449 comment lines)
+## NEXT: net.py (1479 lines, 318 comment lines)
 
 Approach (same as game.py):
 1. Grep for narrative markers:
    `Session [0-9]|10\.[0-9]+[a-g]?:|7\.[0-9]+[a-c]?:|6\.[0-9]+[a-c]?:|8\.[0-9]+[a-c]?:|9\.x|5b\.`
-   (the 9.x M3/M5 SimThread blocks at ~line 250 and ~1097 are the biggest).
-2. Condense the big blocks (the authoritative game-loop / SimThread
-   architecture narrative → 2-4 lines keeping the invariant: sim runs on
-   SimThread at real-time 60 Hz, render thread is a local client reading
-   the atomically-published RenderModel).
+   (the 8.1 async-worker block at ~line 620 and the 10.10 input-echo
+   block at ~line 97 are the biggest).
+2. Condense the big blocks (the NetWorker async-worker architecture, the
+   input-echo, the hull/loadout wire mapping → 2-4 lines keeping the
+   invariant: worker owns the socket + JSON off the render thread; input
+   applied by the worker via the sink; echo = the input the host ACTUALLY
+   applied per tick).
 3. Sweep inline markers.
-4. Test gate: test_determinism + test_sim_thread + test_network.
+4. Test gate: test_determinism + test_network + net self-test.
 5. Commit + update this tracker.
+
+NOTE: before netcode.py (the highest-value, highest-risk file), create
+ARCHITECTURE.md extracting the surviving invariants (ghost clock,
+reconcile/rewind, render point, interpolation buffer, handoff rules) so
+the trimmed comments have a single current-state home.
 
 **Invariants to PRESERVE in game.py (condense, don't delete):**
 - RenderModel is plain-data; render thread reads ONLY the model, never live sim state.

@@ -19,7 +19,7 @@ DESPAWN_RADIUS = 2600       # rocks farther than this from the group are culled
 SPAWN_CLEAR_RADIUS = 500    # never spawn closer than this to a player
 MAX_SPAWNS_PER_TICK = 4     # fill the field gradually, not all at once
 
-# --- power / compute (Phase 2) ---
+# --- power / compute ---
 POWER_HYSTERESIS = 0.00   # brownout latch deadband, fraction of supply
 AUTO_STOP_COMPUTE = 10.0  # compute drawn by auto-stop guidance (B)
 
@@ -136,48 +136,36 @@ MAX_FRAME_DT = 0.25  # clamp frame dt so a hiccup can't trigger a catch-up spira
 
 # --- networking: snapshot cadence + interpolation delay ---
 # The authoritative peer sends a Game.snapshot() every SNAPSHOT_INTERVAL sim
-# ticks (1 tick at the 60 Hz sim = 60 snapshots/s). The remote peer renders
-# INTERP_DELAY seconds in the PAST, interpolating between the two snapshots
-# that bracket that time — so it always has the next snapshot in hand before
-# it needs to render the current one (no rubber-banding, no extrapolation).
-#
-# 10.8: raised 10 Hz -> 30 Hz. 10.13: raised 30 Hz -> 60 Hz AND moved the
-# send to the PUBLISH (the sim thread hands the worker a fresh snapshot
-# after every step; the worker serializes + sends it immediately — there is
-# no send timer anymore). Why 60 Hz: at 30 Hz the worker's per-send jitter
-# (1-15 ms, from the 1 ms loop's recv + JSON + OS scheduling) made the
-# snapshot's age at send (delta) wander by up to a full tick, and the
-# client's reconcile (now = sim_time + L) corrected that wander every
-# snapshot — the delta-wander snap (the #2 snap source). Sending at the
-# publish makes delta ~ 0, so the client's `now = sim_time + L` is exact.
-# The whole stack reads this one knob from config (the SimThread hand-off,
-# the client's interpolation window, and the tests), so the cadence change
-# is just this constant. Bandwidth is a non-issue on a LAN (~366 KB/s at
-# 60 Hz for a steady field, ~446 KB/s worst case — 2x the 30 Hz figure);
-# the one companion change it requires is SNAPSHOT_BUFFER_MAX below (the
-# interpolation buffer must stay deep enough to bracket the render point at
-# the higher rate).
+# ticks (1 tick at the 60 Hz sim = 60 snapshots/s), sent at the PUBLISH: the
+# sim thread hands the worker a fresh snapshot after every step and the
+# worker serializes + sends it immediately (no send timer). The ~0 snapshot
+# age at send (delta) keeps the client's reconcile (now = sim_time + L)
+# exact. The remote peer renders INTERP_DELAY seconds in the PAST,
+# interpolating between the two snapshots that bracket that time — so it
+# always has the next snapshot in hand before it needs to render the current
+# one (no rubber-banding, no extrapolation). The whole stack (the SimThread
+# hand-off, the client's interpolation window, the tests) reads this one
+# knob. Bandwidth is a non-issue on a LAN (~370 KB/s steady); the companion
+# constraint is SNAPSHOT_BUFFER_MAX below (the buffer must stay deep enough
+# to bracket the render point at this rate).
 SNAPSHOT_INTERVAL = 1    # sim ticks between snapshots (1 -> 60 Hz at 60 Hz sim)
 INTERP_DELAY = 0.1       # seconds the remote render lags the sim
-NET_PORT = 7777          # default host listen port (2P host/client, Session 6.5)
+NET_PORT = 7777          # default host listen port (2P host/client)
 
-# 10.8: the client's interpolation buffer depth (max snapshots kept). The
-# render point is `newest - delay`, and the adaptive delay can grow to
+# The client's interpolation buffer depth (max snapshots kept). The render
+# point is `newest - delay`, and the adaptive delay can grow to
 # INTERP_DELAY_MAX (0.35 s) under jitter, so the buffer must hold at least
 # (INTERP_DELAY_MAX / snapshot_interval) + 1 snapshots to BRACKET that point
 # — otherwise positions_at clamps to the oldest snapshot and the remote
 # render stalls exactly when the adaptive delay is doing its job. At 60 Hz
-# (10.13, interval 0.0167 s) that is ceil(0.35/0.0167)+1 = 22; 24 leaves
-# margin. (At 30 Hz it was ceil(0.35/0.033)+1 = 12, 16 with margin; at the
-# old 10 Hz the default of 8 covered 0.70 s — 2x the max delay.)
+# that is ceil(0.35/0.0167)+1 = 22; 24 leaves margin.
 SNAPSHOT_BUFFER_MAX = 24
 
-# --- adaptive interpolation delay (Session 7.5a) ---
+# --- adaptive interpolation delay ---
 # The remote render's delay is INTERP_DELAY at rest and grows with the
 # measured snapshot-arrival jitter: delay = clamp(INTERP_DELAY + ADAPT_K *
 # EMA(jitter), INTERP_DELAY_MIN, INTERP_DELAY_MAX), smoothed to move at
-# most 1/60 s per frame (netcode.LatencyTracker). 7.5a computes the value
-# only; 7.5b re-anchors the render point to it.
+# most 1/60 s per frame (netcode.LatencyTracker).
 INTERP_DELAY_MIN = 0.1   # the delay never shrinks below the base
 INTERP_DELAY_MAX = 0.35  # hard cap on the render lag
 ADAPT_K = 2.0            # jitter gain: delay = BASE + ADAPT_K * EMA(jitter)
@@ -202,7 +190,7 @@ TARGETING_COMPUTE_PER_TARGET = 4.0 # extra compute per tracked enemy
 
 # --- homing missile ---
 MISSILE_SPEED = 460.0      # cruise: below bullet (860), way above enemy (25)
-MISSILE_LAUNCH_SPEED = 150.0  # 10.3c: muzzle speed (the boost ramp in
+MISSILE_LAUNCH_SPEED = 150.0  # muzzle speed (the boost ramp in
                               # Missile.update accelerates this up to
                               # MISSILE_SPEED over MISSILE_BOOST_TIME).
                               # Launching slow (not at cruise) shrinks the
@@ -210,22 +198,22 @@ MISSILE_LAUNCH_SPEED = 150.0  # 10.3c: muzzle speed (the boost ramp in
                               # missile is still ramping (slow) when the
                               # buffer's copy takes over, so the position
                               # jump (speed x interp-delay) is smaller.
-# 10.3h: a GENTLER, LONGER boost ramp (900/0.35 -> 500/0.62). The
-# ghost->buffer handback lands at t ~= 0.25-0.5 s after launch (carrying
-# snapshot ~50 ms + INTERP_DELAY 0.1-0.35 s + the ~100 ms pop-in freeze),
-# so the merge's offset (~ INTERP_DELAY x speed-at-handback) is set by the
-# missile's speed AT THAT MOMENT. The old ramp hit cruise (460) at t=0.35 s
-# — before the handback — so the merge absorbed a full-cruise offset
-# (46-161 px). The gentler ramp is still accelerating through the handback
-# window (speed ~300-400 at t=0.3-0.5 s), so the offset is ~25% smaller
-# (30-140 px) and the merge is a shorter, gentler ease. Cruise (MISSILE_
-# SPEED) is UNCHANGED — the missile is just as fast once up to speed; only
-# the acceleration curve is gentler (it reaches 460 at t=0.62 s, not
-# 0.35 s). MISSILE_BOOST_TIME is exactly (460-150)/500 = 0.62 s, so the
-# boost phase ends the moment cruise is reached (seeking starts at full
-# speed, as before). Both the host (bullets.Missile) and the ghost
-# (netcode.GhostMissile) read these, so the profiles stay in sync.
-MISSILE_ACCEL = 500.0      # boost ramp (10.3h: gentler, see above)
+# The boost ramp is GENTLE and LONG (500 px/s^2 over 0.62 s) on purpose:
+# the ghost->buffer handback lands at t ~= 0.13-0.38 s after launch
+# (the carrying snapshot arrives ~1 tick after the launch, the buffer copy
+# first ADVANCES one tick later, and the render point reaches it
+# INTERP_DELAY 0.1-0.35 s later), so the merge's offset
+# (~ delay x speed-at-handback) is set by the missile's speed AT THAT
+# MOMENT. A ramp that hit cruise before the handback would make the merge
+# absorb a full-cruise offset; a ramp still accelerating through the
+# handback window keeps the offset smaller and the merge a shorter,
+# gentler ease. Cruise (MISSILE_SPEED) is unaffected — the missile is
+# just as fast once up to speed.
+# MISSILE_BOOST_TIME is exactly (460-150)/500 = 0.62 s, so the boost phase
+# ends the moment cruise is reached (seeking starts at full speed). Both
+# the host (bullets.Missile) and the ghost (netcode.GhostMissile) read
+# these, so the profiles stay in sync.
+MISSILE_ACCEL = 500.0      # boost ramp (gentle, see above)
 MISSILE_BOOST_TIME = 0.62  # s of straight flight before seeking starts
 MISSILE_TURN_RATE = 3.0    # rad/s — THE evasion knob
 MISSILE_LIFE = 3.0         # range limit
@@ -235,7 +223,7 @@ MAX_MISSILES = 3
 MISSILE_LOCK_RANGE = 900.0 # matches TARGETING_RANGE
 MISSILE_COLOR = (255, 140, 60)
 
-# 10.3d: the decoupled render offset (the handback visual_offset). When the
+# The decoupled render offset (the handback visual_offset). When the
 # ghost's missile is handed back to the buffer, the buffer's copy is drawn
 # at the interpolated position (INTERP_DELAY seconds behind the ghost's
 # predicted position), which causes a visible backward jump. The fix: at
@@ -243,16 +231,16 @@ MISSILE_COLOR = (255, 140, 60)
 # to the buffer's missile rendering. Each frame, the offset decays by this
 # factor (at 60 FPS; frame-rate independent via decay^(dt*60)), so the
 # missile smoothly converges to the buffer's position without ever moving
-# backward. 0.85 halves the offset in ~4 frames and decays it to <1% in
-# ~15 frames (the user's spec: "decays to zero over a few frames").
+# backward. 0.85 halves the offset in ~5 frames and decays it to <1% in
+# ~29 frames.
 MISSILE_HANDOFF_DECAY = 0.85
 # The offset is removed when its magnitude drops below this threshold (px),
 # to avoid floating-point noise (a 0.1 px offset is invisible).
 MISSILE_HANDOFF_OFFSET_EPS = 0.5
-# 10.3f: the decoupled offset must never pull the missile BACKWARD. The
-# rendered position is buffer_pos + offset; the buffer advances forward at
-# the missile's speed while the offset decays (shrinks), pulling the
-# rendered position BACKWARD. With a plain 0.85 decay the shrinkage is
+# The decoupled offset must never pull the missile BACKWARD. The rendered
+# position is buffer_pos + offset; the buffer advances forward at the
+# missile's speed while the offset decays (shrinks), pulling the rendered
+# position BACKWARD. With a plain 0.85 decay the shrinkage is
 # 0.15*|offset|/frame = 9*INTERP_DELAY*speed px/s at handback (|offset| is
 # ~INTERP_DELAY*speed), so the net rendered velocity is
 # speed*(1 - 9*INTERP_DELAY): forward at INTERP_DELAY=0.1 but BACKWARD at
@@ -270,8 +258,7 @@ MISSILE_HANDOFF_OFFSET_EPS = 0.5
 # the missile moves at (1-cap)*speed during the merge, so 0.25 = it never
 # slows below 75% of its forward speed (a short, barely-noticeable ease);
 # higher = a longer, smoother ease (1.0 would let it freeze, >1.0 would
-# let it reverse). 0.5 was the first live-test value ("slows down a bit");
-# 0.25 keeps it snappier.
+# let it reverse).
 MISSILE_HANDOFF_MAX_SHRINK = 0.25
 
 # --- sound ---
@@ -280,7 +267,7 @@ SFX_LASER_MIN_INTERVAL = 0.12        # min s between laser blips (gun fires ~100
 # (beam needs no throttle: one discharge per charge cycle, ~1/s)
 SFX_ENEMY_LASER_MIN_INTERVAL = 0.15  # min s between enemy laser blips
 SFX_SHIELD_HIT_MIN_INTERVAL = 0.15   # min s between shield pings (3 enemies can hit ~20/s)
-SFX_VOLUMES = {           # per-sound gain 0..1 (tune by ear in S6)
+SFX_VOLUMES = {           # per-sound gain 0..1
     "laser": 0.5,
     "beam": 0.6,
     "enemy_laser": 0.25,

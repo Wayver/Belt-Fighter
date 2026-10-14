@@ -43,28 +43,25 @@ class Beam:
 class Bullet:
     def __init__(self, pos, vel, owner=0, bid=None):
         self.pos = pos
-        self.prev_pos = pos.copy()      # NEW
+        self.prev_pos = pos.copy()
         self.vel = vel
         self.life = BULLET_LIFE
         self.owner = owner
-        # 10.7: unique identity (player_index, bullet_seq) — the
-        # player-prefixed id the host assigns at fire (see Game._step).
-        # The client's ghost derives the SAME id deterministically and
-        # uses it to dedup its own predicted bullets against the
-        # buffer's copy of the same bullet (no double-draw). None for
-        # pre-10.7 snapshots / single-player (the id is presentation
-        # only — it never feeds the sim).
+        # Unique id (player_index, bullet_seq), assigned by the host at
+        # fire (Game._step). The client's ghost derives the same id and
+        # dedups its predicted bullets against the buffer's copy (no
+        # double-draw). None in single-player; presentation only — never
+        # feeds the sim.
         self.id = bid
-        # 10.7: handback state (client-only). Set True by
-        # PredictedShip.handback_bullets once the buffer's newest snapshot
-        # carries this bullet; predicted_view then hands it off to the
-        # buffer on the frame the buffer's copy ADVANCES. Always False on
-        # the host (the host never runs the ghost).
+        # Handback state (client-only): True once the buffer's newest
+        # snapshot carries this bullet (PredictedShip.handback_bullets);
+        # predicted_view then hands it to the buffer on the frame the
+        # buffer's copy ADVANCES. Always False on the host.
         self.pending = False
 
     def snapshot(self):
-        # 10.7: the id (player_index, bullet_seq) is carried too (the
-        # client's dedup key); stored as a 2-tuple (None-safe).
+        # The id (player_index, bullet_seq) is carried too — the client's
+        # dedup key; a 2-tuple (None-safe).
         return (self.pos.x, self.pos.y, self.vel.x, self.vel.y,
                 self.owner, self.life, self.id)
 
@@ -75,17 +72,17 @@ class Bullet:
         self.vel = pygame.Vector2(vx, vy)
         self.owner = owner
         self.life = life
-        self.id = bid                     # 10.7: restore the unique id
+        self.id = bid                     # restore the unique id
 
     def update(self, dt):
-        self.prev_pos = self.pos.copy()  # NEW
+        self.prev_pos = self.pos.copy()
         self.pos += self.vel * dt
         self.life -= dt
 
 class EnemyBullet:
     def __init__(self, pos, vel, owner=0):
         self.pos = pos
-        self.prev_pos = pos.copy()      # NEW
+        self.prev_pos = pos.copy()
         self.vel = vel
         self.life = ENEMY_BULLET_LIFE
         self.owner = owner
@@ -103,7 +100,7 @@ class EnemyBullet:
         self.life = life
 
     def update(self, dt):
-        self.prev_pos = self.pos.copy()  # NEW
+        self.prev_pos = self.pos.copy()
         self.pos += self.vel * dt
         self.life -= dt
 
@@ -117,17 +114,16 @@ class Missile:
         self.life = MISSILE_LIFE
         self.boost = MISSILE_BOOST_TIME
         self.dmg = MISSILE_DAMAGE
-        # 10.3b: unique identity (player_index, seq) — the player-prefixed
-        # id the host assigns at launch (see Game._step). The client uses it
-        # to dedup its own ghost missiles against the buffer's copy of the
-        # same missile (no double-draw). None for pre-10.3b snapshots.
+        # Unique id (player_index, seq), assigned by the host at launch
+        # (Game._step). The client dedups its ghost missiles against the
+        # buffer's copy (no double-draw). None in single-player.
         self.id = mid
 
     def snapshot(self):
         # target is stored as the enemy's ship id (or None); Game
         # apply_snapshot() re-wires it to the live AIEnemy object.
-        # 10.3b: the id (player_index, seq) is carried too (the client's
-        # dedup key); stored as a 2-tuple (None-safe).
+        # The id (player_index, seq) is carried too — the client's dedup
+        # key; a 2-tuple (None-safe).
         return (self.pos.x, self.pos.y, self.vel.x, self.vel.y,
                 self.owner, self.life, self.boost,
                 self.target.ship.id if self.target is not None else None,
@@ -143,7 +139,7 @@ class Missile:
         self.boost = boost
         self.target = None                # Game wires the real ref
         self._target_id = target_id
-        self.id = mid                     # 10.3b: restore the unique id
+        self.id = mid                     # restore the unique id
 
     def update(self, dt):
         self.prev_pos = self.pos.copy()

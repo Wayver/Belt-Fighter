@@ -1,4 +1,4 @@
-"""Network-impairment harness (Session 7.4).
+"""Network-impairment harness.
 
 Test infrastructure that makes "wifi" testable in CI: it wraps the loopback
 e2e's connection with a `ProxyConnection` + a relay thread that injects
@@ -20,12 +20,10 @@ Design (keeps the clean e2e checks clean):
 
 The harness is OPT-IN per test: a clean e2e (no impairment) runs the real
 `connect` / `Host` unchanged, so the clean-tuned checks (sim_time tracking,
-the 7.2 angle bounds) keep running clean. Impaired batteries run their own,
+the angle bounds) keep running clean. Impaired batteries run their own,
 impairment-appropriate checks.
 
-This is pure test infrastructure: it depends on nothing from 7.5/7.6 and is
-built FIRST so the "feel" sessions are tested against realistic conditions
-from the start.
+Pure test infrastructure — it depends on nothing but `net`'s frame codec.
 """
 import queue
 import random

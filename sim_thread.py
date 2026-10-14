@@ -1,19 +1,17 @@
-"""Session 9.x M3: the authoritative sim on its own thread.
+"""The authoritative sim on its own thread.
 
-The authoritative Game moves off the render thread onto a daemon thread
-that steps it at a real-time 60 Hz clock (a monotonic accumulator,
-mirroring the NetWorker's real-time snapshot timer — NOT tied to the
-render frame rate). The render thread becomes a LOCAL CLIENT of that
-sim: it publishes the latest local input + commands, and reads the
-published RenderModel. M3 did this for the 2P host; M5 (Session 9.x)
-unified single-player onto the same thread — SP is now the host loop
-minus the NetWorker (worker=None), so there is exactly ONE sim
+The authoritative Game runs on a daemon thread that steps it at a
+real-time 60 Hz clock (a monotonic accumulator, NOT tied to the render
+frame rate). The render thread is a LOCAL CLIENT of that sim: it
+publishes the latest local input + commands and reads the published
+RenderModel. Single-player uses the same thread with worker=None (the
+host loop minus the NetWorker), so there is exactly ONE sim
 architecture in the game.
 
 Threading model (the NetWorker hand-off patterns, everywhere):
   * All cross-thread hand-offs are single reference swaps (atomic under
-    the GIL) or a queue the consumer drains for the newest item (the
-    snapshot queue, 10.13). No locks, no shared mutable state.
+    the GIL) or a queue the consumer drains for the newest item. No
+    locks, no shared mutable state.
   * The sim thread OWNS the Game: it is the only thread that calls
     _step / reset / fire_scan / attribute writes on ships. The render
     thread never mutates the Game — it publishes input (a fresh
@@ -27,8 +25,8 @@ Threading model (the NetWorker hand-off patterns, everywhere):
 
 Per iteration (a real-time accumulator, the same hiccup policy as
 Game.update — MAX_STEPS_PER_FRAME + ACC_BACKLOG_CAP):
-  1. drain the command queue (apply T/V/G/R/F to the sim — the M3
-     event->sim-command routing; QUIT/ESC/F3 stay on the render thread);
+  1. drain the command queue (apply T/V/G/R/F to the sim; QUIT/ESC/F3
+     stay on the render thread);
   2. acc = min(acc + elapsed, ACC_BACKLOG_CAP); run <= 5 _step(STEP, inp)
      with the LATEST published local input (pinned #5: the host applies
      the latest received input each tick — the local input gets the same
@@ -37,22 +35,21 @@ Game.update — MAX_STEPS_PER_FRAME + ACC_BACKLOG_CAP):
      step_alpha is the sim's real acc/STEP), then
      latest_model = game.render_model() (atomic reference swap; the
      render thread reads it and draws with it), and
-     worker.publish_snapshot(game.sim_time, game.snapshot()) (10.13 —
-     the worker serializes + sends it the moment it lands, so the
-     snapshot's age at send is ~0 and the client's `now = sim_time + L`
-     is exact; this REPLACES the old set_latest_snapshot + the worker's
-     30 Hz timer). Publishing only on a step
-     keeps the model object STABLE between steps (the render clock
-     detects a new model by identity and advances its alpha while the
-     same model is re-read) and avoids ~94% wasted render_model() calls
-     (the thread iterates every ~1 ms but only steps 60x/sec);
-  4. stop_event.wait(WAIT) (~1 ms; bounds CPU + makes stop() prompt).
+     worker.publish_snapshot(game.sim_time, game.snapshot()) — the
+     worker serializes + sends it the moment it lands, so the snapshot's
+     age at send is ~0 and the client's `now = sim_time + L` is exact.
+     Publishing only on a step keeps the model object STABLE between
+     steps (the render clock detects a new model by identity and
+     advances its alpha while the same model is re-read) and avoids the
+     ~94% wasted render_model() calls (the thread iterates every ~1 ms
+     but only steps 60x/sec);
+  4. sleep until the next tick boundary (dynamic sleep — see _run).
 
-The render thread's interpolation alpha is NOT this thread's acc/STEP
-anymore — the render thread computes its own alpha from its own clock +
-the last two published models (see _render_alpha in __main__.py). The
-model still CARRIES `step_alpha` (the sim's acc/STEP at publish time) so
-the M1/M2b parity tests keep working unchanged.
+The render thread's interpolation alpha is NOT this thread's acc/STEP —
+the render thread computes its own alpha from its own clock + the
+published models (see _HostRenderClock in __main__.py). The model still
+CARRIES `step_alpha` (the sim's acc/STEP at publish time) so the parity
+tests keep working unchanged.
 """
 import queue
 import threading
@@ -70,8 +67,8 @@ class SimThread:
     Lifecycle:
       1. Built around a fully-constructed Game (handshake done, player
          ships set) + the host's NetWorker. The worker is None for
-         single-player (M5: SP runs this same thread with no network —
-         the sim thread then publishes the model only) and in tests.
+         single-player (SP runs this same thread with no network — the
+         sim thread then publishes the model only) and in tests.
       2. `start()` launches the thread. The first published model
          appears within ~one iteration (~1-2 ms).
       3. The render thread calls `publish_input(ShipInput)` each frame
@@ -81,10 +78,8 @@ class SimThread:
          BEFORE worker.stop() (the sim thread feeds the worker).
     """
 
-    # Sleep between iterations when idle. ~1 ms keeps the 60 Hz step
-    # clock near-exact (a 16.67 ms step is checked every ~1 ms) and
-    # makes stop() prompt, while bounding the thread's CPU — the same
-    # trade-off as NetWorker.WAIT.
+    # Unused by the run loop (it sleeps dynamically until the next tick
+    # boundary — see _run). Kept for parity with NetWorker.WAIT.
     WAIT = 0.001
 
     # The hiccup policy is the sim's own (Game.update's guards): one
@@ -112,15 +107,15 @@ class SimThread:
         # reference each iteration. None until the first publish. The
         # render thread reads this and calls game.draw(dt, model).
         self.latest_model = None
-        # 10.17: cumulative fixed steps run by the sim thread (written by
-        # the sim thread, read by the render thread's telemetry — a
-        # monotone int, so the render thread computes the per-window delta
-        # without a read/reset race). The host CSV logs the delta per
-        # telemetry line: a stable 1-per-line (60 Hz) means the sim thread
-        # steps exactly one tick per iteration (the dynamic-sleep design);
-        # 0/2+ oscillation means it is batching (the 10.11c root cause),
-        # which makes the snapshot stamps jump and is a candidate driver
-        # of the client's sawtooth snap.
+        # Cumulative fixed steps run by the sim thread (written by the
+        # sim thread, read by the render thread's telemetry — a monotone
+        # int, so the render thread computes the per-window delta without
+        # a read/reset race). The host CSV logs the delta per telemetry
+        # line: a stable 1-per-line (60 Hz) means the sim thread steps
+        # exactly one tick per iteration (the dynamic-sleep design);
+        # 0/2+ oscillation means it is batching, which makes the snapshot
+        # stamps jump and is a candidate driver of the client's sawtooth
+        # snap.
         self._steps_total = 0
         self._stop = threading.Event()
         self._thread = None
@@ -131,14 +126,13 @@ class SimThread:
         """Publish the latest local ShipInput (render thread, once per
         frame). The sim applies the LATEST published input at each step
         (pinned #5 — the same rule the host applies to the client's
-        input). Replaces the old in-loop `game.update(raw_dt, keys)`
-        input sampling."""
+        input)."""
         self._latest_input = inp
 
     def command(self, name, arg=None):
         """Enqueue one sim command (render thread). `name` is one of
         'targeting' (T), 'sensor' (V), 'scan' (G), 'reset' (R/F), or
-        'respawn' (10.1, R while the local player is dead — `arg` is the
+        'respawn' (R while the local player is dead — `arg` is the
         player index). The sim thread applies it at the top of its next
         iteration, before stepping. QUIT/ESC and F3 never come here —
         they stay on the render thread (exit + render diagnostic)."""
@@ -170,9 +164,8 @@ class SimThread:
 
         `cmd` is a (name, arg) pair (arg is None for all but 'respawn').
         Mirrors the KEYDOWN branches of Game.handle_events EXACTLY
-        (same game_over gating) — only the thread moved. `self.ship`
-        is players[0] (the host's own ship), so the mapping is
-        1:1 with the old in-loop code."""
+        (same game_over gating). `self.ship` is players[0] (the host's
+        own ship)."""
         name, arg = cmd
         g = self._game
         if name == "targeting" and not g.game_over:
@@ -186,8 +179,8 @@ class SimThread:
         elif name == "reset" and g.test_mode:
             g.reset()
         elif name == "respawn":
-            # 10.1: per-player death — respawn the local player's ship
-            # (a no-op unless it is actually dead, so a stray R is
+            # Per-player death — respawn the local player's ship (a
+            # no-op unless it is actually dead, so a stray R is
             # harmless). The world + the other player are untouched.
             g.respawn_player(arg)
 
@@ -218,42 +211,38 @@ class SimThread:
                 g._step(STEP, inp)
                 acc -= STEP
                 steps += 1
-            # 10.17: the host CSV's per-window step count (see
-            # _steps_total in __init__).
+            # The host CSV's per-window step count (see _steps_total in
+            # __init__).
             self._steps_total += steps
             # 3. publish ONLY when the sim actually stepped. Publishing a
             #    fresh model every ~1 ms iteration (even when nothing
-            #    changed) caused two problems: (a) the render clock
-            #    detects a "new model" by object identity, so a fresh
-            #    dict every ~1 ms made it re-anchor every render frame
-            #    (it never advanced its alpha between publishes), and
-            #    (b) ~94% of the render_model() calls were wasted CPU
-            #    (the model was identical to the last step's). Publishing
-            #    only on a step keeps the model object STABLE between
-            #    steps (so the render clock can advance its alpha) and
-            #    cuts the sim thread's CPU ~94%.
+            #    changed) would (a) make the render clock re-anchor every
+            #    frame (it detects a "new model" by object identity, so it
+            #    never advanced its alpha between publishes) and (b) waste
+            #    ~94% of the render_model() calls (the model was identical
+            #    to the last step's). Publishing only on a step keeps the
+            #    model object STABLE between steps (so the render clock can
+            #    advance its alpha) and cuts the sim thread's CPU ~94%.
             #
             #    Also write g.acc = acc before publishing: render_model()
             #    reads self.acc for step_alpha, but this thread uses its
             #    OWN local acc (it steps g._step directly, not
-            #    g.update()). Without this, step_alpha was always 0 and
-            #    the render clock's re-anchor (t = sim_time +
-            #    step_alpha*STEP) landed on alpha=0 every frame.
+            #    g.update()). Without this, step_alpha is always 0 and the
+            #    render clock's re-anchor (t = sim_time + step_alpha*STEP)
+            #    lands on alpha=0 every frame.
             if steps:
                 g.acc = acc
                 self.latest_model = g.render_model()
                 if self._worker is not None:
-                    # 10.13: hand the worker the fresh snapshot to send NOW
-                    # (it serializes + sends on the worker thread). The
+                    # Hand the worker the fresh snapshot to send NOW (it
+                    # serializes + sends on the worker thread). The
                     # snapshot's age at send is ~0, so the client's
-                    # `now = sim_time + L` is exact (the delta-wander snap
-                    # is gone). Replaces the old set_latest_snapshot + the
-                    # worker's 30 Hz timer.
+                    # `now = sim_time + L` is exact.
                     self._worker.publish_snapshot(g.sim_time, g.snapshot())
-                    # 10.4: send any laser beams fired this step as T_BEAM
-                    # events (drained here, on the sim thread — the only
-                    # thread that touches g._beam_events). The client draws
-                    # each immediately on receipt; one-way LAN latency is
+                    # Send any laser beams fired this step as T_BEAM events
+                    # (drained here, on the sim thread — the only thread
+                    # that touches g._beam_events). The client draws each
+                    # immediately on receipt; one-way LAN latency is
                     # imperceptible against the 0.15 s beam flash.
                     for (sx, sy, ex, ey, t, owner, lx, ly) in g._beam_events:
                         self._worker.send({"type": T_BEAM, "sim_time": t,
@@ -262,14 +251,13 @@ class SimThread:
                                            "owner": owner,
                                            "lx": lx, "ly": ly})
                     g._beam_events.clear()
-                    # 10.10: send the input the host ACTUALLY applied to
-                    # player 1 (the client's ship) on each tick stepped
-                    # this iteration, as ONE T_ECHO (the T_BEAM pattern —
+                    # Send the input the host ACTUALLY applied to player 1
+                    # (the client's ship) on each tick stepped this
+                    # iteration, as ONE T_ECHO (the T_BEAM pattern —
                     # per-tick event data that must not bloat the pruned
                     # snapshot). The client's rewind replay uses these
-                    # instead of its own sent input — the high-speed
-                    # snapback fix (in-flight input). ~60 msg/s, a few
-                    # KB/s — negligible.
+                    # instead of its own sent input (the in-flight input
+                    # snapback fix). ~60 msg/s, a few KB/s — negligible.
                     echo = g.flush_remote_input_echo()
                     if echo:
                         self._worker.send({
@@ -282,10 +270,10 @@ class SimThread:
             #    Sleeping for exactly that amount makes the thread wake
             #    up on the tick boundary, so it steps exactly 1 tick per
             #    wake-up (in steady state) instead of batching 1-7 ticks
-            #    (the old fixed 1ms sleep + OS scheduler imprecision made
-            #    the accumulator accumulate 1-7 ticks worth of time
-            #    between wake-ups — the root cause of the 10.11c bimodal
-            #    snap).
+            #    (a fixed 1 ms sleep + OS scheduler imprecision lets the
+            #    accumulator build up 1-7 ticks of time between wake-ups,
+            #    which batches the steps and makes the snapshot stamps
+            #    jump).
             sleep_time = STEP - acc
             if sleep_time > 0:
                 self._stop.wait(sleep_time)

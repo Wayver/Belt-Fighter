@@ -36,7 +36,19 @@ Run: cd /mnt && SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy python -m ship5.<tes
 | ship.py | DONE | acbba3c | 1138→1107 lines (−31); AST-verified code-identical; all markers gone; gates green |
 | sim_thread.py | DONE | f0d09f2 | 291→278 lines (−13); AST-verified code-identical; all markers gone; gates green |
 | config.py | DONE | 1ca2e23 | 293→280 lines (−13); AST-verified code-identical; all markers gone; gates green |
-| other small files | pending | | |
+| bullets.py | DONE | 94657cd | 175→171; 10.7/10.3b tags + `# NEW` markers killed; dedup-id + handback invariants condensed in place; gates green |
+| ai_enemy.py | DONE | f7a5171 | 300→299; "for now" + dated plan-note killed; _acc_smooth gameplay-state invariant kept; gates green |
+| spawning.py | DONE | 6db32b7 | 151→148; dead commented-out `spawn_enemy` + 10.1 tag killed; (unused EnemyShip import left — code change); gates green |
+| hud.py | DONE | 497e6e3 | 71→71; 10.1 tag in draw_respawn docstring killed; gates green |
+| camera.py | DONE | 247de78 | 32→32; "Session 9.x M2b" killed; plain-values/RenderModel invariant kept; gates green |
+| fog.py | DONE | 10f57f1 | 159→144; "Session 8.x" block condensed to render-cost notes; SUB-direct/half-res/cache invariants kept; test_fog_pixel green |
+| hulls.py | DONE | e738ca9 | 914→914; **stale power-budget fixed 14/24/94 → 10/20/90** (verified vs code); dangling "see notes" + truncated laser comment cleaned; gates green |
+| asteroid.py | DONE | 0c18a8b | 86→86; "Session 5b.1" killed; stable-id invariant kept; gates green |
+| sound.py | DONE | 8ee7c17 | 248→248; S2/S3 markers killed; **stale "TEMP trigger in game.py" fixed** (no such trigger — vestigial tone); test_sound green |
+| missile_telemetry.py | DONE | 558cbb1 | 122→112; "10.3b" + verbose "Why this exists" condensed; client-only + 4-event chain + CSV schema kept; gates green |
+| net_harness.py | DONE | c8ac7ef | 245→243; "Session 7.4"/"7.2"/"7.5/7.6" killed; pass-through/relay design kept; test_network ALL PASS |
+| __init__.py | DONE | 890617b | 16→16; **stale "take 3 hits" → one hit** (ENEMY_HP=1), B = auto-stop (not "retro-thrust/right thrusters"); gates green |
+| particles.py / collision.py / enemy.py / menu.py / intent.py | SKIP | | clean — no narrative markers, no stale claims (enemy.py has unimported-name legacy dead code, a code issue, left alone) |
 
 ## game.py — DONE (commit b46c276, 2026-10-13)
 
@@ -174,16 +186,28 @@ test_10_3d_handoff_offset ALL PASS (directly exercises the handoff
 constants), 3 known pre-existing FAILs unchanged (test_10_9_ghost_pose,
 test_10_11c_phase_lock, test_interpolation "bullets — vacuous").
 
-## NEXT: other small files
+## DONE: other small files (2026-10-14)
 
-Candidates (by size, excluding tests/tools): bullets.py, ai_enemy.py,
-spawning.py, hud.py, camera.py, fog.py, particles.py, hulls.py,
-collision.py, asteroid.py, enemy.py, sound.py, menu.py, intent.py,
-missile_telemetry.py, net_harness.py, __init__.py. Same recipe:
-(1) grep narrative markers, (2) condense big blocks (netcode-side
-invariants → ARCHITECTURE.md), (3) sweep inline markers, (4) test gate
-(test_determinism bit-identical + the m2/sim-thread trio + relevant
-test_10_x), (5) commit + update this tracker.
+All 17 small files processed (13 trimmed/committed, 4 skipped as clean).
+Every file AST-verified code-identical to its pre-trim version; test
+gates green after each (test_determinism bit-identical + the
+m2/sim-thread trio + the relevant test_10_x). Stale factual claims found
+and fixed: hulls.py power budget (14/24/94 → 10/20/90), sound.py "TEMP
+trigger in game.py" (no such trigger), __init__.py "take 3 hits"
+(ENEMY_HP=1) + B key (auto-stop, not retro-thrust). No netcode-side
+invariants needed moving to ARCHITECTURE.md — the small files are
+sim-side / render-side / test-infra. Full-suite re-run at the end:
+19 core tests exit=0, the 3 known pre-existing FAILs unchanged
+(test_10_9_ghost_pose, test_10_11c_phase_lock, test_interpolation
+"bullets — vacuous"), net self-test 19 PASS / 0 FAIL, test_network
+ALL PASS.
+
+**Comment-trim effort is now COMPLETE** across all game source files
+(game.py, __main__.py, net.py, netcode.py, ship.py, sim_thread.py,
+config.py + the 13 small files). Remaining candidates would be the
+test_*.py files and tools/ — NOT part of the original scope (those are
+test infrastructure, and their session tags are the tests' own
+documentation).
 
 **Invariants to PRESERVE in game.py (condense, don't delete):**
 - RenderModel is plain-data; render thread reads ONLY the model, never live sim state.
@@ -343,3 +367,130 @@ test_10_x), (5) commit + update this tracker.
   removed below EPS), handoff shrink cap (full backward-pull math +
   pop-in handling + "the cap IS the merge's visible slowdown").
 - No trailing-whitespace lines in config.py (verified by grep).
+
+### bullets.py
+- Markers killed: 10.7 (x4), 10.3b (x4), and 4 leftover `# NEW`
+  inline markers (the prev_pos interpolation field — the tag was
+  session noise, the field is normal now).
+- Invariants condensed in place (sim-side, nothing moved): the unique
+  id (player_index, bullet_seq / missile (player_index, seq)) the host
+  assigns at fire/launch, the client deriving the SAME id to dedup its
+  predicted bullets/missiles against the buffer's copy (no
+  double-draw), None in single-player, presentation-only (never feeds
+  the sim); Bullet.pending handback state (client-only, set by
+  PredictedShip.handback_bullets, handed off on the frame the buffer's
+  copy ADVANCES, always False on the host); Missile.target stored as
+  the enemy's ship id in the snapshot, Game re-wires the live ref.
+
+### ai_enemy.py
+- Markers killed: "for now" (module docstring), the dated "(Plan note
+  2026-07-20: corrected from the original 'presentation-only'
+  classification.)" narrative.
+- Invariant kept: _acc_smooth LOOKS presentation-only but is gameplay
+  state — it feeds lead_point(), which missile guidance (bullets.py)
+  and the player's laser targeting (game.py) use; if it differed
+  between peers the sims would diverge.
+- Line 33 (trailing-whitespace-only line) left alone — removing it is
+  a code change, not a comment change.
+
+### spawning.py
+- Markers killed: the dead commented-out `# old enemy` spawn_enemy
+  (3 lines), the "10.1: 2P, both players dead" tag.
+- Note: removing the dead comment orphaned the `from .enemy import
+  EnemyShip` import (now unused) — LEFT IN PLACE (removing it is a
+  code change). Candidate for a future code-cleanup pass.
+
+### hud.py
+- Marker killed: "10.1:" in draw_respawn's docstring (the per-player
+  death-screen invariant — shown to the DEAD player only, per-player
+  respawn not a full restart — kept, de-tagged).
+
+### camera.py
+- Marker killed: "(Session 9.x M2b)" in update()'s docstring.
+- Invariant kept: takes PLAIN values (pos, vel, dampening) rather than
+  a live ship so the render path can feed it from the RenderModel
+  without touching live sim state.
+
+### fog.py
+- Markers killed: the "Session 8.x render-cost optimization (the
+  host-FPS backlog item)" framing in the module docstring and the
+  "# --- Session 8.x: cached fog textures" header.
+- Invariants condensed in place: lights SUB-ed directly onto fog_surf
+  (visually identical — alpha = max(0, alpha - light_alpha),
+  sub-perceptual delta in faint overlaps, test_fog_pixel.py); base
+  light is a circle (never rotates); forward lobe rotated at half res
+  + scaled 2x (uniform, aspect preserved); point-light textures cached
+  (keyed by id(light_tex), deterministic). The "kept for API
+  compatibility" notes on blit_light/blit_light_circle/light_surf are
+  functional (not session narrative) — kept.
+
+### hulls.py
+- **Stale factual claim fixed (verified-or-kill):** the "Stock
+  power/compute budget" comment claimed idle 14 / steady 24 / max 94
+  with a breakdown containing a "5" that maps to no current part.
+  Recomputed from the actual default loadout: idle 10 (2*1 mains + 1
+  nose + 2*1 RCS + 2 gun + 1 sensor + 2 shield), steady 20 (+10
+  shield active), max 90 (steady + 2*20 + 15 + 2*5 + 5). "decays 50/s"
+  (SHIELD_DUMP_DECAY) and the priority order (RCS 1 / mains 2 /
+  reverse 3) verified correct and kept.
+- Dangling refs cleaned: "# <-- the arbitrary range; turn this"
+  (truncated) → a normal range comment; "— see notes" (no such notes)
+  dropped. "Two main engines sum to SHIP_ACCEL straight ahead; nose +
+  RCS match the old single-vector magnitudes" → "nose + RCS each apply
+  SHIP_ACCEL" (the "old single-vector" is dead history).
+- The commented-out `#PLAYER_HULLS = (DEFAULT_HULL, BLACKBIRD_HULL)`
+  line was LEFT (it's a commented-out code definition, not a comment
+  to trim; the live PLAYER_HULLS is at the bottom).
+
+### asteroid.py
+- Marker killed: "(Session 5b.1)" in the networking block.
+- Invariant kept: id assigned once from the Asteroid._next_id class
+  counter, never reused within a run — a stable identity across
+  snapshots; radius/collision_radius derived from size via ROCK_SIZES
+  (rebuilt, not stored).
+
+### sound.py
+- Markers killed: "S2: full recipe set" (module docstring), "the S2
+  recipe set" (section header), "(removed in S3)" (placeholder).
+- **Stale factual claim fixed:** "placeholder: kept for the TEMP
+  trigger in game.py (removed in S3)" — game.py has NO such trigger
+  (the only "placeholder" matches in game.py are hull placeholders);
+  the placeholder tone is a vestigial fallback (also created in the
+  no-numpy path), never referenced by any play() call. Reworded to say
+  so.
+
+### missile_telemetry.py
+- Marker killed: "10.3b" in the module docstring; the verbose
+  "Why this exists / Enable / Reading the CSV" section headers
+  condensed into a tighter docstring.
+- Invariants kept: CLIENT-SIDE ONLY (host never runs the ghost); the
+  four-event chain (FIRE → RECONCILE → HANDBACK → DEDUP); set_enabled
+  called each frame by the client loop (F3 toggles debug_net —
+  verified game.py:1204, __main__.py:817); CSV schema (t = wall clock
+  join key, sim_t where known, ids as p:s|p:s).
+
+### net_harness.py
+- Markers killed: "(Session 7.4)", "the 7.2 angle bounds", "depends on
+  nothing from 7.5/7.6 and is built FIRST so the 'feel' sessions are
+  tested...".
+- Invariants kept: pass-through during the blocking handshake, relay
+  mode after set_nonblocking (the relay IS the transport, real socket
+  idle); per-frame per-direction latency+jitter/drop/stall; OPT-IN per
+  test (clean e2e runs unchanged).
+
+### __init__.py
+- **Stale factual claims fixed:** "They take 3 hits" → "one hit"
+  (ENEMY_HP = 1; the live enemies are AIEnemy/MoteEnemy, both
+  ENEMY_HP); "B retro-thrust: fires the right thrusters to kill your
+  velocity" → "B auto-stop: commands thrusters against your velocity"
+  (ship.py _stop_demands is a guidance system that commands whichever
+  thrusters are needed, not literally the right ones).
+
+### particles.py / collision.py / enemy.py / menu.py / intent.py
+- Skipped — no session-history narrative, no stale factual claims.
+  All comments are functional (algorithm descriptions, coordinate
+  conventions, key bindings, UI layout). enemy.py references
+  unimported names (ENEMY_RADIUS, ENEMY_ROT_SPEED, ENEMY_ACCEL,
+  ENEMY_MAX_SPEED, ENEMY_FIRE_SPREAD, ENEMY_FIRE_COOLDOWN) — legacy
+  dead code (the live enemies are AIEnemy/MoteEnemy), but that's a
+  code issue, not a comment issue; left alone.

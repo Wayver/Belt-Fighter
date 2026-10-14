@@ -1,10 +1,10 @@
 """AI enemy: a Ship driven by steering, not a keyboard.
 
 Composition, not subclassing: an AIEnemy *owns* a Ship (same hull +
-loadout as the player for now) and each tick runs steering that emits a
+loadout as the player) and each tick runs steering that emits a
 ShipInput. The Ship does all the physics, power, and firing; the AI only
-decides turn/thrust/fire. This is the reusability test — the same Ship
-the keyboard drives, now driven by a brain.
+decides turn/thrust/fire — the same Ship the keyboard drives, now driven
+by a brain.
 """
 import math
 import random
@@ -66,8 +66,7 @@ class AIEnemy:
     # lead_point(), which missile guidance (bullets.py) and the player's
     # laser targeting (game.py) use to pick their aim point. If it differed
     # between peers, missiles would steer to different points and the sims
-    # would diverge. (Plan note 2026-07-20: corrected from the original
-    # "presentation-only" classification.)
+    # would diverge.
     # NOT synced: hull/loadout (identical on both peers by construction).
 
     def snapshot(self):

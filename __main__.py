@@ -20,7 +20,7 @@ import time
 
 import pygame
 
-from .config import WIDTH, HEIGHT, FPS, NET_PORT, BG, SNAPSHOT_INTERVAL
+from .config import WIDTH, HEIGHT, FPS, NET_PORT, BG, SNAPSHOT_INTERVAL, TICK
 from .fog import make_light_texture
 from .game import Game, STEP
 from .menu import Menu
@@ -871,6 +871,23 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
         est_now = game.host_time.now(now)
         if est_now is not None:
             game.ghost.record_input(est_now, inp)
+        # >>> TEMP DIAGNOSTIC #2 (advance-then-reconcile) <<<
+        # Advance the ghost to the CURRENT frame BEFORE the poll loop, so
+        # the reconcile (inside the loop) sees a current-frame pose/clock
+        # instead of the previous frame's. Mirrors predicted_view's advance
+        # (same dt/inp/enemies/clock). predicted_view's own advance later in
+        # the frame is harmless: the branch-2 clock is a pure function of
+        # real_time and steps are boundary-based, so no double-stepping.
+        # REVERT: delete this block (search "TEMP DIAGNOSTIC").
+        if game.ghost.seeded:
+            _rp = game.render_point.now()
+            if _rp is not None:
+                _pos = game.snap_buf.positions_at(_rp)
+                if _pos is not None:
+                    game.ghost.advance(
+                        dt, inp, enemies=game._ghost_enemy_proxies(_pos),
+                        real_time=now, host_time=game.host_time,
+                        rtt_ow=game._rtt_ow)
         # Poll the host: each snapshot feeds the host-time estimator (its
         # wire stamp vs the local arrival time — the estimator's
         # per-arrival jitter sample is the adaptive delay's input) and
@@ -890,6 +907,19 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
                 # snap_time (L in the past); the ghost must sit at the
                 # present, so the replay span is ~L and the replay
                 # rebuilds the prediction forward.
+                #
+                # >>> TEMP DIAGNOSTIC #2 (advance-then-reconcile) <<<
+                # `now` is back to the original snap_time + rtt_ow. The ghost
+                # was advanced to the CURRENT frame BEFORE the poll loop (see
+                # the block above it), so the reconcile here sees a
+                # current-frame pose/clock instead of the previous frame's.
+                # If the 1-frame staleness is the cause of the ~8 px snap,
+                # snap_px should drop to ~2-3 px. REVERT: search
+                # "TEMP DIAGNOSTIC" (two blocks).
+                print("[REPLAY-DIAG2] snap=%.4f ghost_sim=%.4f "
+                      "span=%.4f" % (
+                          m["sim_time"], game.ghost.sim_time,
+                          game._rtt_ow), flush=True)
                 game.push_snapshot(m["sim_time"],
                                    deserialize_snapshot(m["snap"]),
                                    now=m["sim_time"] + game._rtt_ow,

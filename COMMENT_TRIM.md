@@ -35,7 +35,7 @@ Run: cd /mnt && SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy python -m ship5.<tes
 | netcode.py | DONE | a3a2d92 | 2540→2286 lines (−254); AST-verified code-identical; all 69 markers gone; gates green |
 | ship.py | DONE | acbba3c | 1138→1107 lines (−31); AST-verified code-identical; all markers gone; gates green |
 | sim_thread.py | DONE | f0d09f2 | 291→278 lines (−13); AST-verified code-identical; all markers gone; gates green |
-| config.py | pending | | |
+| config.py | DONE | 1ca2e23 | 293→280 lines (−13); AST-verified code-identical; all markers gone; gates green |
 | other small files | pending | | |
 
 ## game.py — DONE (commit b46c276, 2026-10-13)
@@ -137,16 +137,53 @@ test_10_x spot-check matches baseline (the 3 known pre-existing FAILs
 unchanged: test_10_9_ghost_pose, test_10_11c_phase_lock,
 test_interpolation "bullets — vacuous").
 
-## NEXT: config.py
+## config.py — DONE (commit 1ca2e23, 2026-10-14)
 
-1. Grep for narrative markers (same pattern).
-2. Condense big blocks; invariants that would be lost go to
-   ARCHITECTURE.md (append a section) if they're netcode-side, else
-   stay in-file.
-3. Sweep inline markers.
-4. Test gate: test_determinism (bit-identical) + test_m2a_world /
-   test_m2b_local + test_sim_thread + spot-check test_10_x.
-5. Commit + update this tracker.
+293 → 280 lines (−13). All session-history markers killed (Phase 2,
+10.8/10.13, Session 6.5, Session 7.5a, 7.5a/7.5b, 10.3c/10.3d/10.3f/
+10.3h, "tune by ear in S6"). Stale claims fixed: MISSILE_HANDOFF_DECAY
+"halves in ~4 frames, <1% in ~15 frames" (0.85^15 = 8.7% — actually
+~5 frames to halve, ~29 to <1%); missile boost-ramp handback window
+"t ~= 0.25-0.5 s (carrying snapshot ~50 ms + ... + ~100 ms pop-in
+freeze)" (30 Hz-era numbers — at 60 Hz the carrying snapshot arrives
+~1 tick after launch, the copy first advances one tick later, and the
+render point reaches it INTERP_DELAY later → t ~= 0.13-0.38 s; speed at
+handback 217-342 px/s, offset 22-120 px — recomputed). Big blocks condensed to invariants:
+snapshot cadence (kept: send-at-publish → delta ~0 → client's
+`now = sim_time + L` exact; bandwidth ~370 KB/s steady — matches the
+net.py figure; buffer-depth companion constraint), buffer depth
+(kept: must bracket INTERP_DELAY_MAX at 60 Hz — ceil(0.35/0.0167)+1 =
+22, 24 leaves margin; dropped the 30 Hz/10 Hz history), adaptive delay
+(kept: formula + 1/60 s-per-frame smoothing, points at
+netcode.LatencyTracker), missile boost ramp (kept: handback lands at
+t ~= 0.13-0.38 s so the offset is set by speed AT THAT MOMENT; ramp
+still accelerating through the window keeps the merge smaller/gentler;
+BOOST_TIME = (460-150)/500 = 0.62 s exactly; host + ghost read the
+same knobs), handoff decay (kept: offset = ghost_pos - buffer_pos,
+decay^(dt*60), removed below EPS), handoff shrink cap (kept the full
+backward-pull math: net vel = speed*(1 - 9*INTERP_DELAY) — forward at
+0.1, BACKWARD at 0.35; cap = MAX_SHRINK * buffer's actual displacement
+→ always forward, frame-rate independent, handles pop-in freeze
+(B_disp = 0 → shrinkage = 0); 0.25 = never below 75% of forward
+speed). Invariants stayed in-file (config is the single home for these
+knobs — nothing moved to ARCHITECTURE.md). BEHAVIOR-NEUTRAL PROVEN:
+AST dump with comments + docstrings stripped is byte-identical to
+HEAD. Gates: test_determinism bit-identical (exit 0),
+test_m2a_world / test_m2b_local / test_sim_thread ALL PASS,
+test_10_3d_handoff_offset ALL PASS (directly exercises the handoff
+constants), 3 known pre-existing FAILs unchanged (test_10_9_ghost_pose,
+test_10_11c_phase_lock, test_interpolation "bullets — vacuous").
+
+## NEXT: other small files
+
+Candidates (by size, excluding tests/tools): bullets.py, ai_enemy.py,
+spawning.py, hud.py, camera.py, fog.py, particles.py, hulls.py,
+collision.py, asteroid.py, enemy.py, sound.py, menu.py, intent.py,
+missile_telemetry.py, net_harness.py, __init__.py. Same recipe:
+(1) grep narrative markers, (2) condense big blocks (netcode-side
+invariants → ARCHITECTURE.md), (3) sweep inline markers, (4) test gate
+(test_determinism bit-identical + the m2/sim-thread trio + relevant
+test_10_x), (5) commit + update this tracker.
 
 **Invariants to PRESERVE in game.py (condense, don't delete):**
 - RenderModel is plain-data; render thread reads ONLY the model, never live sim state.
@@ -261,3 +298,48 @@ test_interpolation "bullets — vacuous").
   the worker thread (GIL-atomic ref swap, no pygame); pong reflected on
   the worker thread to keep RTT honest; partial-frame send keeps the
   UNSENT remainder; resync past corrupted regions.
+
+### config.py
+- Stale claims found & fixed: MISSILE_HANDOFF_DECAY "0.85 halves the
+  offset in ~4 frames and decays it to <1% in ~15 frames" (0.85^4 =
+  52%, 0.85^15 = 8.7% — actually ~5 frames to halve, ~29 to <1%;
+  recomputed, comment corrected). "~366 KB/s at 60 Hz ... ~446 KB/s
+  worst case — 2x the 30 Hz figure" (net.py now says ~370 KB/s —
+  aligned to that figure, dropped the 30 Hz comparison). "the user's
+  spec: 'decays to zero over a few frames'" (session narrative —
+  dropped). Missile boost-ramp block "handback lands at t ~= 0.25-0.5 s
+  after launch (carrying snapshot ~50 ms + INTERP_DELAY 0.1-0.35 s +
+  the ~100 ms pop-in freeze)" (30 Hz-era numbers — at 60 Hz the
+  carrying snapshot arrives ~1 tick after the launch, the buffer copy
+  first ADVANCES one tick later, and the render point reaches it
+  INTERP_DELAY later → t ~= 0.13-0.38 s; speed at handback 217-342
+  px/s, offset 22-120 px — recomputed; the load-bearing conclusion is
+  unchanged: the boost (ends 0.62 s) is still ramping through the
+  window).
+- Verified claims kept: send-at-publish (sim thread hands the worker a
+  fresh snapshot after every step — verified sim_thread.py),
+  client's `now = sim_time + L` (verified netcode.py reconcile),
+  buffer-depth math ceil(0.35/0.0167)+1 = 22 (recomputed),
+  MISSILE_BOOST_TIME = (460-150)/500 = 0.62 s (recomputed),
+  handback window t ~= 0.13-0.38 s (carrying snapshot ~1 tick after
+  launch + the copy's first advance one tick later + INTERP_DELAY
+  0.1-0.35 s — recomputed from SNAPSHOT_INTERVAL=1; the old 0.25-0.5 s
+  was 30 Hz-era),
+  net-velocity math speed*(1 - 9*INTERP_DELAY) (recomputed: forward at
+  0.1, negative at 0.35), pop-in freeze → B_disp = 0 → shrinkage = 0
+  (verified game.py render loop), host + ghost both read the boost
+  knobs (verified bullets.py + netcode.py imports).
+- Invariants preserved (condensed, in-file — config is the single home
+  for these knobs, nothing moved to ARCHITECTURE.md): snapshot cadence
+  (send-at-publish → delta ~0 → reconcile exact; no rubber-banding /
+  no extrapolation; whole stack reads this one knob), buffer depth
+  (must bracket INTERP_DELAY_MAX at 60 Hz or positions_at clamps to
+  the oldest snapshot and the render stalls exactly when the adaptive
+  delay is doing its job), adaptive delay formula + 1/60 s-per-frame
+  smoothing (points at netcode.LatencyTracker), missile boost ramp
+  (offset set by speed AT the handback moment; ramp still
+  accelerating through the window; host/ghost profiles stay in sync),
+  handoff decay (offset = ghost_pos - buffer_pos, decay^(dt*60),
+  removed below EPS), handoff shrink cap (full backward-pull math +
+  pop-in handling + "the cap IS the merge's visible slowdown").
+- No trailing-whitespace lines in config.py (verified by grep).

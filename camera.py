@@ -12,10 +12,10 @@ class Camera:
     def update(self, dt, pos, vel, dampening):
         """Ease the camera toward the ship's look-ahead point.
 
-        Takes the target as PLAIN values (pos, vel, dampening) rather than
-        a live ship, so the render path can feed it from the RenderModel
-        (Session 9.x M2b) without touching live sim state. `pos`/`vel` are
-        (x, y) tuples or Vector2s; `dampening` is the ship's stop flag."""
+        Takes the target as PLAIN values (pos, vel, dampening) rather than a
+        live ship, so the render path can feed it from the RenderModel
+        without touching live sim state. `pos`/`vel` are (x, y) tuples or
+        Vector2s; `dampening` is the ship's stop flag."""
         pos = pygame.Vector2(pos)
         vel = pygame.Vector2(vel)
         # Dampener shift: while B is held, ease the lead down so the

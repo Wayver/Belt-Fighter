@@ -21,6 +21,39 @@ re-explaining. History (why a rule changed) lives in git, not here.
   clock and each reconcile jumped the clock forward -> a per-reconcile
   snap).
 
+## Host process topology (the sim is a SEPARATE PROCESS)
+- The host's authoritative sim runs in its OWN process (sim_process.py),
+  NOT a thread in the render process. The render thread holds the GIL
+  for its whole draw (~18-25 ms — longer than the 16.7 ms sim tick), so
+  a same-process sim thread is starved and BATCHES 2 ticks (ragged
+  17/33 ms snapshot stamps). The client's ghost clock (anchored on the
+  previous snapshot) can't anticipate a 33 ms jump, so it sits ~7 ms
+  behind the new stamp and the reconcile pulls the clock+pose forward —
+  the residual ~8 px snap tail. A separate process has no shared GIL:
+  the sim steps exactly one tick per iteration (measured: 0% batched,
+  every gap 16.7 ms, 1.00x rate) even while the render process draws.
+- The sim process is HEADLESS: SDL_VIDEODRIVER/AUDIODRIVER=dummy set
+  before pygame is imported, a 1x1 dummy display, and the Game is built
+  with None display surfaces. The sim path (_step / snapshot /
+  render_model) never touches the display surfaces — only draw() does —
+  so this is safe. draw() runs in the RENDER process on a shell Game
+  (M3).
+- The render->sim command channel is a Pipe (setup / input / command /
+  quit — small, low-rate, ordered). The sim->render model channel is a
+  BOUNDED Queue (maxsize 4) with put_nowait DROP-WHEN-FULL — NOT a Pipe.
+  A Pipe blocks the child's bridge on send() when the render process is
+  busy drawing, and a blocked bridge can't drain commands. Dropping the
+  oldest model when full is latest-wins — exactly what the render thread
+  wants (it draws the newest model, never a stale one).
+- The render loop DRAINS the model queue in the SAME thread as the draw,
+  every frame. A separate drain thread would be starved by the draw's
+  GIL hold, the queue would fill, and the sim process would block —
+  defeating the whole point.
+- The NetWorker + Connection stay in the RENDER process (a live socket
+  is not passed across the spawn boundary). The sim process hands the
+  render process the snapshot / beam / echo data; the worker sends it
+  (M4).
+
 ## Wire
 - TCP, non-blocking, 4-byte big-endian length prefix + JSON. Message
   types: join, welcome, input (carries `tag`), snap, respawn, beam,

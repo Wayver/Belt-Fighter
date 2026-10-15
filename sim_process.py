@@ -25,9 +25,10 @@ M1 sends the full render model over the pipe (the real deliverable); the
 parent reads model["sim_time"] to measure the cadence. M2 adds input +
 commands + remote input; M3 adds the shell-Game draw + sfx; M4 adds the
 network bridge: the wire traffic (snap/beam/echo) the SimThread hands to
-its worker now rides the SAME model Queue to the render process, which
-forwards it to the NetWorker (the worker serializes + sends it the moment
-it lands — exactly as the in-process sim thread did).
+its worker goes to a DEDICATED net Queue (separate from the model
+Queue), which a dedicated net-pump thread in the render process drains
+and forwards to the NetWorker (the worker serializes + sends it the
+moment it lands — exactly as the in-process sim thread did).
 
 IPC (spawn context — see plan_12 section E):
   parent -> child (Pipe, small + low-rate + ordered):
@@ -38,24 +39,31 @@ IPC (spawn context — see plan_12 section E):
                    ("input", ShipInput) |
                    ("command", name, arg) | ("remote_input", ShipInput) |
                    ("quit",)
-  child -> parent (bounded Queue, put_nowait drop-when-full):
+  child -> parent, TWO bounded Queues (put_nowait drop-when-full):
+    model Queue (render-thread traffic):
                    ("model", render_model_dict)   (60 Hz, on a step)
-                   ("snap", sim_time, snapshot)   (60 Hz, on a step — M4:
-                        the wire snapshot; the render process forwards it
-                        to worker.publish_snapshot)
-                   ("beam", msg) | ("echo", msg)  (M4: T_BEAM / T_ECHO
-                        wire messages; forwarded to worker.send)
                    ("ready",) | ("crash", traceback_text) |
                    ("done", steps, sim_time, wall, stamps)
-  The model channel is a bounded Queue, NOT a Pipe: a Pipe blocks the
-  child's bridge on send() when the parent is busy (draw holds the GIL),
-  and a blocked bridge can't drain commands. A bounded queue drops the
-  oldest items when full — latest-wins, exactly what the render thread
-  wants (it draws the newest model, never a stale one). M4 rides the wire
-  messages on the SAME queue: a dropped snapshot is a network loss the
-  client's interpolation buffer already handles (out-of-order/late
-  arrivals are dropped there too), so drop-when-full is the right
-  semantics for it as well.
+    net Queue (wire traffic — the M4 network bridge):
+                   ("snap", sim_time, snapshot)   (60 Hz, on a step)
+                   ("beam", msg) | ("echo", msg)  (T_BEAM / T_ECHO wire
+                        messages)
+  Both channels are bounded Queues, NOT Pipes: a Pipe blocks the child's
+  bridge on send() when the parent is busy (draw holds the GIL), and a
+  blocked bridge can't drain commands. A bounded queue drops the oldest
+  items when full — latest-wins, exactly what the render thread wants
+  (it draws the newest model, never a stale one). A dropped snapshot is
+  a network loss the client's interpolation buffer already handles
+  (out-of-order/late arrivals are dropped there too), so drop-when-full
+  is the right semantics for the net Queue as well.
+
+  WHY TWO QUEUES (the M4 redo): the first M4 ride the wire messages on
+  the SAME model Queue, so the render thread's per-frame drain (the same
+  thread as the draw) was in the snapshot's send path — a busy draw
+  delayed or dropped snapshots. The wire traffic now has its own Queue
+  drained by a dedicated net-pump thread (run_host's _NetPump), so the
+  render thread's draw is OUT of the send path. The model Queue is back
+  to models + lifecycle only (maxsize 4).
 
 The child is HEADLESS: sim_process_main sets SDL_VIDEODRIVER/AUDIODRIVER=
 dummy BEFORE pygame is imported (inside the function, so the PARENT —
@@ -79,16 +87,21 @@ class _Worker:
       * publish_snapshot(sim_time, snap) — once per sim step (60 Hz);
       * send(msg) — T_BEAM / T_ECHO wire messages, per stepped iteration.
 
-    M4: instead of sending to a socket, these are FORWARDED to the parent
-    (render process) over the model Queue as ("snap", sim_time, snap) /
-    ("beam", msg) / ("echo", msg). The render process routes them to the
-    NetWorker (worker.publish_snapshot / worker.send), which serializes +
-    sends them the moment they land — the in-process hand-off replaced by
-    one pipe hop (~sub-ms, plan E.3). put_nowait + drop-when-full: a
-    dropped snapshot is a network loss the client's interpolation buffer
-    already handles (it drops out-of-order/late arrivals too), so this is
-    the right semantics, and the bridge must never block (a blocked
-    bridge can't drain commands).
+    M4 (redo): instead of sending to a socket, these are FORWARDED to the
+    parent (render process) over the DEDICATED net Queue as
+    ("snap", sim_time, snap) / ("beam", msg) / ("echo", msg). A dedicated
+    net-pump thread in the render process (run_host's _NetPump) drains
+    that Queue and routes each message to the NetWorker
+    (worker.publish_snapshot / worker.send), which serializes + sends it
+    the moment it lands — the in-process hand-off replaced by one pipe
+    hop (~sub-ms, plan E.3). The net Queue is SEPARATE from the model
+    Queue so the render thread's draw is out of the snapshot's send path
+    (the first M4 rode the wire on the model Queue, and the render
+    thread's per-frame drain delayed/dropped snapshots under a busy draw).
+    put_nowait + drop-when-full: a dropped snapshot is a network loss the
+    client's interpolation buffer already handles (it drops
+    out-of-order/late arrivals too), so this is the right semantics, and
+    the bridge must never block (a blocked bridge can't drain commands).
 
     It ALSO records the sim_time of EVERY publish_snapshot (one per sim
     step) in `stamps` — the child-side snapshot-stamp cadence. This is
@@ -97,8 +110,8 @@ class _Worker:
     stream can drop models when the parent is busy, which would corrupt a
     parent-side cadence measurement)."""
 
-    def __init__(self, model_queue):
-        self._q = model_queue
+    def __init__(self, net_queue):
+        self._q = net_queue
         self.stamps = []
 
     def publish_snapshot(self, sim_time, snap):
@@ -150,32 +163,38 @@ def _build_game(seed, players, local_hull=None, local_loadout=None,
     return g
 
 
-def sim_process_main(cmd_conn, model_queue):
+def sim_process_main(cmd_conn, model_queue, net_queue):
     """The spawn target (MUST be a top-level function: spawn re-imports
     this module by name to find it). Runs the authoritative sim in this
     process.
 
-    Two channels (both from the spawn context):
+    Three channels (all from the spawn context):
       `cmd_conn`    a Pipe, parent -> child: ("setup", ...) (6-arg M3
                     hulls/loadouts/seed form, or the 3-arg M1/M2
                     seed/players form) | ("input", ShipInput) |
                     ("command", name, arg) | ("remote_input", ShipInput) |
                     ("quit",). Small, low-rate, ordered — a Pipe is fine.
       `model_queue` a bounded Queue, child -> parent: the render model
-                    (60 Hz) + the wire messages (M4: ("snap", sim_time,
-                    snap) / ("beam", msg) / ("echo", msg) — the SimThread's
-                    worker hand-off, forwarded to the render process's
-                    NetWorker) + ("ready",) / ("crash", tb) / ("done", ...).
-                    A BOUNDED queue with put_nowait: when the parent is
-                    busy (draw holds the GIL) the queue fills and the
-                    OLDEST items are dropped — latest-wins, exactly the
-                    semantics the render thread wants (it draws the
-                    newest model); a dropped snapshot is a network loss
-                    the client's interpolation buffer already handles. A
-                    Pipe would BLOCK the child's bridge on send() when
-                    the parent is busy, and a blocked bridge can't drain
-                    commands — so the model channel must be drop-on-full,
-                    not back-pressure.
+                    (60 Hz) + ("ready",) / ("crash", tb) / ("done", ...).
+                    Drained by the RENDER thread (the same thread as the
+                    draw — a locked decision).
+      `net_queue`   a bounded Queue, child -> parent: the wire messages
+                    (M4: ("snap", sim_time, snap) / ("beam", msg) /
+                    ("echo", msg) — the SimThread's worker hand-off,
+                    forwarded to the render process's NetWorker). Drained
+                    by a DEDICATED net-pump thread in the render process
+                    (run_host's _NetPump) — NOT the render thread, so the
+                    draw is out of the snapshot's send path.
+                    Both child -> parent Queues are BOUNDED with
+                    put_nowait: when the parent is busy (draw holds the
+                    GIL) a queue fills and the OLDEST items are dropped —
+                    latest-wins, exactly the semantics the render thread
+                    wants (it draws the newest model); a dropped snapshot
+                    is a network loss the client's interpolation buffer
+                    already handles. A Pipe would BLOCK the child's
+                    bridge on send() when the parent is busy, and a
+                    blocked bridge can't drain commands — so both
+                    channels must be drop-on-full, not back-pressure.
 
     Exits cleanly on ("quit",) or on cmd_conn EOF (the parent died), or
     on a crash (after sending ("crash", traceback))."""
@@ -213,7 +232,7 @@ def sim_process_main(cmd_conn, model_queue):
             # M1/M2: ("setup", seed, players) — default hulls (the tests).
             _, seed, players = msg
             game = _build_game(seed, players)
-        worker = _Worker(model_queue)
+        worker = _Worker(net_queue)
         st = SimThread(game, worker)
         st.start()
         model_queue.put(("ready",))

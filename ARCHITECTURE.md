@@ -46,23 +46,37 @@ re-explaining. History (why a rule changed) lives in git, not here.
   The command Pipe has TWO senders in the render process (the main
   thread + the worker thread), so the send side is serialized by a lock
   (two concurrent senders would interleave the Pipe's 4-byte length
-  prefixes). The sim->render model channel is a BOUNDED Queue (maxsize
-  16 — M4 grew it from 4 because the child now publishes a model + a
-  snap (+ beam/echo) per step) with put_nowait DROP-WHEN-FULL — NOT a
-  Pipe. A Pipe blocks the child's bridge on send() when the render
-  process is busy drawing, and a blocked bridge can't drain commands.
-  Dropping the oldest item when full is latest-wins — exactly what the
-  render thread wants (it draws the newest model, never a stale one); a
-  dropped snapshot is a network loss the client's interpolation buffer
-  already handles.
+  prefixes). The sim->render channels are TWO BOUNDED Queues with
+  put_nowait DROP-WHEN-FULL — NOT Pipes. A Pipe blocks the child's
+  bridge on send() when the render process is busy drawing, and a
+  blocked bridge can't drain commands. Dropping the oldest item when
+  full is latest-wins — exactly what the render thread wants (it draws
+  the newest model, never a stale one); a dropped snapshot is a network
+  loss the client's interpolation buffer already handles.
+  * the MODEL channel (maxsize 4): the render model (60 Hz) + lifecycle
+    (ready/crash/done). Drained by the RENDER thread.
+  * the NET channel (maxsize 16): the wire traffic (snap/beam/echo) the
+    SimThread hands to its worker. Drained by a DEDICATED net-pump
+    thread (run_host's _NetPump) — NOT the render thread.
 - The render loop DRAINS the model queue in the SAME thread as the draw,
   every frame. A separate drain thread would be starved by the draw's
   GIL hold, the queue would fill, and the sim process would block —
   defeating the whole point.
 - The NetWorker + Connection stay in the RENDER process (a live socket
   is not passed across the spawn boundary). The sim process hands the
-  render process the snapshot / beam / echo data; the worker sends it
-  (M4).
+  render process the snapshot / beam / echo data over the DEDICATED net
+  Queue; a dedicated net-pump thread (run_host's _NetPump) drains it and
+  routes each message to the worker, which serializes + sends it the
+  moment it lands (M4). WHY a dedicated thread: the first M4 rode the
+  wire traffic on the model Queue, so the render thread's per-frame
+  drain (the SAME thread as the draw) was in the snapshot's send path —
+  a busy draw delayed (up to a full frame) or dropped snapshots. The
+  pump drains the net Queue every ~1 ms regardless of the draw, so the
+  render thread's draw is OUT of the send path. (The pump shares the
+  render process's GIL with the draw, so under a heavy draw its sends
+  can lag by up to the GIL switch interval — far better than a full
+  frame, and the sim process itself is GIL-free, so the snapshot STAMPS
+  stay smooth either way.)
 
 ## Wire
 - TCP, non-blocking, 4-byte big-endian length prefix + JSON. Message

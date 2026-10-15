@@ -189,8 +189,9 @@ def arm_separate_process():
     ctx = multiprocessing.get_context("spawn")
     parent_conn, child_conn = ctx.Pipe()       # parent -> child commands
     model_queue = ctx.Queue(maxsize=4)         # child -> parent models
+    net_queue = ctx.Queue(maxsize=16)          # child -> parent wire (M4)
     p = ctx.Process(target=sim_process_main,
-                    args=(child_conn, model_queue))
+                    args=(child_conn, model_queue, net_queue))
     p.start()
     child_conn.close()   # the parent does not use the child end
     parent_conn.send(("setup", 1234, 2))
@@ -208,6 +209,10 @@ def arm_separate_process():
     # thread reads the newest model) then DRAW (the GIL load). Same
     # thread, every frame. The queue is bounded + drop-on-full, so a
     # busy frame just drops stale models — the child never blocks.
+    # The wire traffic (M4) rides the DEDICATED net queue, drained by a
+    # separate thread in the real run_host (_NetPump); here the render
+    # loop drains it too (the test has no pump thread — draining keeps
+    # the queue from filling and dropping, which is all arm B needs).
     frame_s = FRAME_MS / 1000.0
     t0 = time.monotonic()
     while time.monotonic() - t0 < RUN_SECONDS:
@@ -219,6 +224,11 @@ def arm_separate_process():
                 break
             if m[0] == "crash":
                 print("  [separate-process] SIM CRASHED:\n" + m[1])
+        while True:          # drain the wire queue (M4 net channel)
+            try:
+                net_queue.get_nowait()
+            except Exception:
+                break
         _gil_hold(GIL_HOLD_MS)      # draw (the GIL load)
         elapsed = time.monotonic() - ft0
         if elapsed < frame_s:
@@ -333,8 +343,9 @@ def test_m2_input_commands_remote():
     ctx = multiprocessing.get_context("spawn")
     parent_conn, child_conn = ctx.Pipe()
     model_queue = ctx.Queue(maxsize=4)
+    net_queue = ctx.Queue(maxsize=16)          # child -> parent wire (M4)
     p = ctx.Process(target=sim_process_main,
-                    args=(child_conn, model_queue))
+                    args=(child_conn, model_queue, net_queue))
     p.start()
     child_conn.close()
     parent_conn.send(("setup", 1234, 2))
@@ -521,8 +532,9 @@ def test_m3_hulls_and_sfx():
     ctx = multiprocessing.get_context("spawn")
     parent_conn, child_conn = ctx.Pipe()
     model_queue = ctx.Queue(maxsize=4)
+    net_queue = ctx.Queue(maxsize=16)          # child -> parent wire (M4)
     p = ctx.Process(target=sim_process_main,
-                    args=(child_conn, model_queue))
+                    args=(child_conn, model_queue, net_queue))
     p.start()
     child_conn.close()
     # The 6-arg setup: the host's + client's REAL hulls/loadouts + seed.

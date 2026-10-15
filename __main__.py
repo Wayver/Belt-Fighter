@@ -110,7 +110,7 @@ def _drain_sim_model(sim_model_q):
     be starved by the draw's GIL hold, the queue would fill, and the sim
     process would block).
 
-    Returns (newest_model, sfx_events, wire_msgs):
+    Returns (newest_model, sfx_events):
       * newest_model — the NEWEST model drained this call (latest-wins,
         for drawing). None if no model was drained this frame.
       * sfx_events — the CONCATENATED "sfx" list from EVERY model drained
@@ -118,18 +118,17 @@ def _drain_sim_model(sim_model_q):
         (not just the newest model's) — a stale model's sfx would
         otherwise be lost when only the newest is kept for drawing
         (plan_12 D.1).
-      * wire_msgs — the wire messages drained this call, in arrival order
-        (M4): ("snap", sim_time, snap) / ("beam", msg) / ("echo", msg).
-        The render process routes each to the NetWorker (worker.
-        publish_snapshot / worker.send) — the in-process sim-thread
-        hand-off replaced by one pipe hop (plan E.3).
+
+    The wire messages (snap/beam/echo) do NOT ride this Queue (the M4
+    redo): they go to the sim process's DEDICATED net Queue, drained by
+    the _NetPump thread (below) — the render thread's draw is out of the
+    snapshot's send path.
 
     Raises RuntimeError on a ("crash", tb) message (the sim process died —
     the caller shows a notice and returns to the menu). "ready" / "done"
     are lifecycle messages, not models; ignored here."""
     newest = None
     sfx_events = []
-    wire_msgs = []
     while True:
         try:
             m = sim_model_q.get_nowait()
@@ -139,11 +138,79 @@ def _drain_sim_model(sim_model_q):
         if kind == "model":
             newest = m[1]
             sfx_events.extend(m[1].get("sfx", ()))
-        elif kind in ("snap", "beam", "echo"):
-            wire_msgs.append(m)
         elif kind == "crash":
             raise RuntimeError("SIM CRASHED:\n" + m[1])
-    return newest, sfx_events, wire_msgs
+    return newest, sfx_events
+
+
+class _NetPump:
+    """The host's dedicated net-pump thread (plan_12 M4 redo).
+
+    The sim process's wire traffic (snap/beam/echo) arrives on its
+    DEDICATED net Queue — NOT the model Queue the render thread drains.
+    This thread drains that Queue and routes each message to the
+    NetWorker (worker.publish_snapshot / worker.send), which serializes +
+    sends it the moment it lands on the worker thread.
+
+    WHY A DEDICATED THREAD (the M4 redo): the first M4 rode the wire
+    messages on the model Queue, so the render thread's per-frame drain
+    (the SAME thread as the draw) was in the snapshot's send path — a
+    busy draw delayed (up to a full frame) or dropped snapshots. The
+    render thread's draw is now OUT of the send path: the pump drains the
+    net Queue every ~1 ms regardless of the draw. (The pump shares the
+    render process's GIL with the draw, so under a heavy draw its sends
+    can lag by up to the GIL switch interval — far better than a full
+    frame, and the sim process itself is GIL-free, so the snapshot STAMPS
+    stay smooth either way.)
+
+    The worker's input sink (the client's input -> the sim's command Pipe)
+    stays on the WORKER thread — a pump-thread reflection would add the
+    pump's wake latency to the measured RTT.
+
+    Lifetime: started after worker.start() (the pump calls worker.* — the
+    worker must be running), stopped in run_host's finally BEFORE
+    worker.stop() (the pump calls worker.publish_snapshot / worker.send —
+    thread-safe queue puts, but stop the producer before the consumer).
+    """
+
+    WAIT = 0.001   # ~1 ms idle poll (like NetWorker.WAIT)
+
+    def __init__(self, net_queue, worker):
+        self._q = net_queue
+        self._worker = worker
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        """Signal the pump to stop and join it. Idempotent."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
+
+    def _run(self):
+        while not self._stop.is_set():
+            while True:
+                try:
+                    m = self._q.get_nowait()
+                except _queue.Empty:
+                    break
+                if m[0] == "snap":
+                    # The snapshot's age at send stays ~0: the sim stamps
+                    # it at the step, the pump hands it to the worker
+                    # within ~1 ms, and the worker serializes + sends it
+                    # the moment it lands — so the client's
+                    # `now = sim_time + L` is exact.
+                    self._worker.publish_snapshot(m[1], m[2])
+                else:   # "beam" / "echo" — the msg dict is m[1]
+                    self._worker.send(m[1])
+            self._stop.wait(self.WAIT)
 
 
 def _lan_ip():
@@ -250,6 +317,8 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
     sim_proc = None
     sim_cmd = None      # the parent end of the command Pipe (render -> sim)
     sim_model_q = None  # the bounded model Queue (sim -> render)
+    sim_net_q = None    # the bounded net Queue (sim -> render, wire msgs)
+    net_pump = None     # the _NetPump thread (drains sim_net_q -> worker)
     try:
         # --- 1. wait for a client (waiting screen + timed accept) ---
         while conn is None:
@@ -301,17 +370,24 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
         # sim_process by name — sim_process_main is a top-level function).
         _sim_ctx = multiprocessing.get_context("spawn")
         sim_cmd, _sim_child_conn = _sim_ctx.Pipe()   # render -> sim
-        # The sim -> render channel. M4 rides the wire messages (snap/
-        # beam/echo) on the SAME bounded queue as the render model, so
-        # maxsize=4 (sized for models alone) is too small: the child
-        # publishes a model + a snap (+ beam/echo) per step, and a busy
-        # draw frame would drop wire messages. 16 holds ~2 steps of
-        # traffic — a dropped snapshot is a network loss the client's
-        # interpolation buffer already handles, so drop-when-full stays
-        # the right semantics (just with more headroom).
-        sim_model_q = _sim_ctx.Queue(maxsize=16)     # sim -> render
+        # The sim -> render MODEL channel: the render model (60 Hz) +
+        # lifecycle, drained by the render thread (the same thread as the
+        # draw — a locked decision). maxsize=4 holds ~1 step of models —
+        # the wire traffic no longer rides this Queue (the M4 redo: it has
+        # its own net Queue, below), so the original sizing stands.
+        sim_model_q = _sim_ctx.Queue(maxsize=4)      # sim -> render (models)
+        # The sim -> render NET channel (the M4 redo): the wire messages
+        # (snap/beam/echo) the SimThread hands to its worker. A DEDICATED
+        # bounded Queue drained by the _NetPump thread (below) — NOT the
+        # render thread — so the draw is out of the snapshot's send path.
+        # maxsize=16 holds ~2 steps of wire traffic (a model step
+        # publishes a snap + a beam/echo); a dropped snapshot is a network
+        # loss the client's interpolation buffer already handles, so
+        # drop-when-full is the right semantics.
+        sim_net_q = _sim_ctx.Queue(maxsize=16)       # sim -> render (wire)
         sim_proc = _sim_ctx.Process(target=sim_process_main,
-                                    args=(_sim_child_conn, sim_model_q))
+                                    args=(_sim_child_conn, sim_model_q,
+                                          sim_net_q))
         sim_proc.start()
         _sim_child_conn.close()   # the render process never sends to it
         # The 6-arg setup (the plan's original sketch): the host's +
@@ -346,12 +422,13 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
         # "Network Queue" pattern). The worker owns the Connection: it
         # drains the client's input off the render thread (applies it via
         # the input sink the moment it lands) and sends snapshots the
-        # moment the SIM publishes them (M4: the sim process pipes the
-        # snapshot to the render process, which forwards it to the worker
-        # — the worker serializes + sends each one immediately; there is
-        # no send timer, so the snapshot's age at send is ~0 and the
-        # client's `now = sim_time + L` is exact). start() flips the
-        # socket to non-blocking + launches the thread.
+        # moment the SIM publishes them (M4 redo: the sim process pipes
+        # the snapshot to the render process's DEDICATED net Queue, the
+        # _NetPump thread hands it to the worker, and the worker
+        # serializes + sends it immediately; there is no send timer, so
+        # the snapshot's age at send is ~0 and the client's
+        # `now = sim_time + L` is exact). start() flips the socket to
+        # non-blocking + launches the thread.
         worker = NetWorker(conn, is_host=True)
         # The client's input is applied by the WORKER thread the moment it
         # lands, NOT polled off the render thread once per frame. The
@@ -386,6 +463,12 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
             return True
         worker.set_input_sink(_client_input_sink)
         worker.start()
+        # The net pump (the M4 redo): drains the sim's DEDICATED net Queue
+        # (snap/beam/echo) and routes each to the worker. Started AFTER
+        # worker.start() (it calls worker.* — the worker must be running).
+        # Stopped in the finally BEFORE worker.stop().
+        net_pump = _NetPump(sim_net_q, worker)
+        net_pump.start()
 
         # --- 4. the game loop (the sim is the spawned process) ---
         # The sim runs in its OWN process (phase 3): the render thread is
@@ -393,9 +476,13 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
         # T/V/G/R/F commands over the command Pipe, DRAINS the model Queue
         # (latest-wins, _drain_sim_model) in the SAME thread as the draw,
         # plays the model's sfx, and draws the SHELL from the newest model.
-        # The shell Game is NEVER stepped: the render thread never mutates
-        # sim state (it only reads the piped model + its own presentation
-        # state: cam/_standins/_death_bursts/remote_beams).
+        # The wire traffic (snap/beam/echo) is NOT the render thread's job
+        # (the M4 redo): the _NetPump thread drains the sim's dedicated
+        # net Queue and routes it to the worker, so the draw is out of the
+        # snapshot's send path. The shell Game is NEVER stepped: the
+        # render thread never mutates sim state (it only reads the piped
+        # model + its own presentation state: cam/_standins/
+        # _death_bursts/remote_beams).
         # The render thread's own interpolation clock (the sim's acc/STEP
         # is no longer the render thread's — see the class docstring).
         render_clock = _HostRenderClock()
@@ -518,14 +605,14 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
             # the same thread as the draw, a locked decision), play the
             # drained sfx, and draw the shell from the newest model. `dt`
             # (clamped) drives draw() + the render clock — presentation
-            # only.
+            # only. The wire traffic (snap/beam/echo) is the _NetPump
+            # thread's job (the M4 redo) — NOT this thread's.
             _sim_cmd_send(("input", ShipInput.from_keys(keys)))
-            # Drain the model Queue (latest-wins) + collect the sfx + the
-            # wire messages. A crash message raises (the sim process died)
-            # — caught below (notice + return to the menu; the finally
-            # shuts it down).
+            # Drain the model Queue (latest-wins) + collect the sfx. A
+            # crash message raises (the sim process died) — caught below
+            # (notice + return to the menu; the finally shuts it down).
             try:
-                model, sfx_events, wire_msgs = _drain_sim_model(sim_model_q)
+                model, sfx_events = _drain_sim_model(sim_model_q)
             except RuntimeError as _sim_err:
                 _notice(screen, font, big_font, clock,
                         ["SIM CRASHED", str(_sim_err).splitlines()[0]])
@@ -533,18 +620,6 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
             _models_window += 1 if model is not None else 0
             if model is not None:
                 last_model = model
-            # M4: route the wire messages to the NetWorker (the in-process
-            # sim-thread hand-off, replaced by one pipe hop — plan E.3).
-            # The worker serializes + sends each the moment it lands on its
-            # own thread, so the snapshot's age at send stays ~0 (the
-            # client's `now = sim_time + L` is exact). A dropped snapshot
-            # (the bounded queue filled) is a network loss the client's
-            # interpolation buffer already handles.
-            for wm in wire_msgs:
-                if wm[0] == "snap":
-                    worker.publish_snapshot(wm[1], wm[2])
-                else:   # "beam" / "echo" — the msg dict is wm[1]
-                    worker.send(wm[1])
             # Play the drained sfx (plan_12 D.1): the sim process is
             # silent (sound=None), so its presentation sounds arrive as
             # the model's "sfx" list and play HERE, via the host's own
@@ -635,6 +710,14 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
         if getattr(game, "_dbg_sim_log_f", None) is not None:
             game._dbg_sim_log_f.close()
             game._dbg_sim_log_f = None
+        # Stop the net pump (join its thread) BEFORE stopping the worker — the
+        # pump calls worker.publish_snapshot / worker.send (thread-safe
+        # queue puts), so stop the producer before the consumer. stop()
+        # is idempotent + a no-op when the pump was never started
+        # (handshake failed before phase 3), so this is safe on every
+        # exit path (ESC/QUIT, disconnect, port-in-use).
+        if net_pump is not None:
+            net_pump.stop()
         # Stop the worker (join its thread) BEFORE shutting down the sim
         # process — (M4) the worker's input sink sends ("remote_input",
         # ...) over the command Pipe, and the Pipe must not be written

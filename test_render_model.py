@@ -28,6 +28,14 @@ the test proves four things:
                  DETERMINISTIC (two same-seed games produce identical
                  models at every tick).
 
+M3 (plan_12) adds the NEVER-STEPPED SHELL audit (test_m3_shell_audit):
+  5. SHELL     — a shell Game (real surfaces, both players' hulls, NEVER
+                 stepped) fed the SAME model renders PIXEL-IDENTICAL to
+                 the live stepped game (draw() reads only surfaces +
+                 model + render-side presentation state), shell.draw(dt,
+                 None) works (the pre-first-model frame), and the model
+                 carries the plain "sfx" list (D.1).
+
 The script_input pattern is copied verbatim from test_snapshot.py so the
 fire paths (bullets, lasers, missiles, stop) are exercised identically.
 """
@@ -35,13 +43,16 @@ import os
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
+import random
+
 import pygame
 
-from .config import WIDTH, HEIGHT
+from .config import WIDTH, HEIGHT, LOOK_AHEAD
 from .fog import make_light_texture
 from .game import Game, STEP
 from .ai_enemy import AIEnemy
 from .asteroid import Asteroid
+from .hulls import PLAYER_HULLS, default_loadout
 from .ship import Ship
 from .intent import ShipInput
 
@@ -255,6 +266,175 @@ def check_parity(m, g):
             len(g.particles))
 
 
+# ---------------------------------------------------------------------------
+# M3 (plan_12): the NEVER-STEPPED SHELL audit.
+#
+# The render process draws a SHELL Game: built with the real surfaces +
+# both players' hulls, then NEVER stepped (the sim runs in a separate
+# process; the shell's draw(dt, model) runs entirely from the piped
+# model). This section proves the shell is a valid draw target:
+#
+#   S1. PIXEL PARITY — a game stepped in-process and a never-stepped
+#       shell fed the SAME model render IDENTICAL pixels (draw() reads
+#       only surfaces + model + render-side presentation state — no
+#       accidental live read).
+#   S2. MODEL=NONE SMOKE — shell.draw(dt, None) falls back to
+#       self.render_model() (the shell's own construction state) without
+#       crashing: the run_host loop draws before the first piped model
+#       arrives.
+#   S3. SFX FIELD — the model carries the "sfx" list (plan_12 D.1),
+#       plain data, drained per publish.
+#
+# The pixel comparison must be EXACT, so every input to draw() is made
+# deterministic:
+#   * pygame.time.get_ticks is FROZEN — the draw path has wall-clock
+#     animations (the targeting reticle's 100 ms blink, the shield
+#     swirl/phase in ship.py). Both draws run inside the freeze.
+#   * the GLOBAL random module is RE-SEEDED before each draw — the draw
+#     path itself samples it (the flame's per-frame length jitter, the
+#     shield's flicker in ship.py). Seeding both draws identically
+#     isolates the question under test (does draw() read LIVE sim state?)
+#     from draw-side nondeterminism.
+#   * The camera is SYNCED (not eased) for both games: cam.pos = the
+#     model's camera target, cam.lead = LOOK_AHEAD — the same starting
+#     state for both, so the one update(dt, ...) call lands them in the
+#     same place.
+#   * The shell's _standins/_remote_enemies are pre-built: draw() builds
+#     them lazily from players[i].hull/components — the SAME hulls the
+#     live game's standins use (the shell is built with the identical
+#     hulls/loadouts).
+#   * The per-player shield Surfaces (Game.shields) are pre-drawn in
+#     __init__ from each player's hull — identical for both games.
+# ---------------------------------------------------------------------------
+
+TICKS_S = 300              # 5 simulated seconds of scripted input
+FROZEN_TICKS = 12345       # the frozen wall clock (inside the 100 ms blink
+                           # period: (12345 // 100) % 2 == 1)
+
+
+def _sync_cam(g, model):
+    """Put the camera at the exact state draw()'s one update(dt) call
+    produces from a cold start at the model's camera target (so the live
+    game and the shell, both starting cold, end up pixel-identical)."""
+    cpos, cvel, cdamp = model["camera"]
+    g.cam.pos = pygame.Vector2(cpos)
+    g.cam.lead = LOOK_AHEAD * (0.35 if cdamp else 1.0)
+
+
+def _grab_screen(screen):
+    """A pixel-exact grab of the screen (read the pixels, not the
+    Surface object — the grab must survive the next draw)."""
+    return pygame.image.tostring(screen, "RGBA")
+
+
+def test_m3_shell_audit(screen, font, big_font, light_tex, fog_surf,
+                        light_surf):
+    """The never-stepped shell audit (S1 + S2 + S3). Returns True when all
+    checks pass."""
+    ok = True
+    # Two DIFFERENT hulls (host + client), like the real 2P game: the
+    # hulls matter for the ship-body/shield rendering (different radii,
+    # colors, panels) and for the standin build.
+    host_hull, client_hull = PLAYER_HULLS[0], PLAYER_HULLS[1]
+
+    # --- the live game: stepped in-process (the "reference" draw) ---
+    AIEnemy._next_id = 1
+    Asteroid._next_id = 1
+    live = Game(screen, font, big_font, light_tex, fog_surf, light_surf,
+                hull=host_hull, loadout=default_loadout(host_hull),
+                seed=SEED, players=2)
+    live.set_player_ship(1, Ship(hull=client_hull,
+                                 loadout=default_loadout(client_hull)))
+
+    # --- the shell: built identically, NEVER stepped ---
+    AIEnemy._next_id = 1
+    Asteroid._next_id = 1
+    shell = Game(screen, font, big_font, light_tex, fog_surf, light_surf,
+                 hull=host_hull, loadout=default_loadout(host_hull),
+                 seed=SEED, players=2)
+    shell.set_player_ship(1, Ship(hull=client_hull,
+                                  loadout=default_loadout(client_hull)))
+    # Pre-build the presentation standins (draw() would build them lazily
+    # from the same hulls — pre-building makes the construction explicit
+    # and deterministic).
+    shell._get_standin(0)
+    shell._get_standin(1)
+    shell._get_remote_enemies()
+
+    # --- S3: the model carries the "sfx" list (plain, drained) ---
+    # The list may hold the constructor's reset event (("thruster", False)
+    # — the engine loop is off at construction) plus whatever the scripted
+    # run fired; the invariants are: present, a list, plain data, and
+    # DRAINED per publish (a second render_model() with no step in
+    # between is empty).
+    m0 = live.render_model()
+    s3_shape = ("sfx" in m0 and isinstance(m0["sfx"], list))
+    assert_plain(m0)
+    drained = ("sfx" in live.render_model()
+               and live.render_model()["sfx"] == [])
+    if not s3_shape or not drained:
+        ok = False
+        print("FAIL: S3 — 'sfx' list missing/not plain/not drained: "
+              "present=%s drained=%s first=%r"
+              % (s3_shape, drained, m0.get("sfx")))
+    else:
+        print("PASS: S3 — model carries a plain 'sfx' list, drained per "
+              "publish (first publish: %r)" % (m0["sfx"],))
+
+    # --- S1: pixel parity, EVERY tick of a scripted run ---
+    orig_ticks = pygame.time.get_ticks
+    pygame.time.get_ticks = lambda: FROZEN_TICKS
+    worst = 0
+    try:
+        for t in range(TICKS_S):
+            live._step(STEP, ShipInput.from_keys(script_input(t)))
+            model = live.render_model()
+            # Same camera start for both (see _sync_cam).
+            _sync_cam(live, model)
+            _sync_cam(shell, model)
+            random.seed(999)
+            live.draw(STEP, model)
+            px_live = _grab_screen(screen)
+            random.seed(999)
+            shell.draw(STEP, model)
+            px_shell = _grab_screen(screen)
+            if px_live != px_shell:
+                # Count the differing pixels for the report (a few
+                # antialiasing-adjacent pixels would still be a FAIL —
+                # the claim is exact parity, not approximate).
+                n_diff = sum(1 for a, b in zip(px_live, px_shell)
+                             if a != b) // 4
+                worst = max(worst, n_diff)
+                ok = False
+                print("FAIL: S1 — shell draw differs from live draw at "
+                      "tick %d (%d px differ)" % (t, n_diff))
+                break
+    finally:
+        pygame.time.get_ticks = orig_ticks
+    if ok:
+        print("PASS: S1 — never-stepped shell renders PIXEL-IDENTICAL to "
+              "the live game at every tick (%d ticks; scripted input, "
+              "2P with %s + %s hulls)"
+              % (TICKS_S, host_hull.id, client_hull.id))
+
+    # --- S2: shell.draw(dt, None) — the pre-first-model frame ---
+    # The run_host loop draws with model=None until the first piped model
+    # arrives; draw() then falls back to self.render_model() (the shell's
+    # own construction state). It must not crash (no live sim state is
+    # being stepped, so the fallback model is the static construction
+    # state — which is exactly what the pre-game frame should show).
+    try:
+        _sync_cam(shell, shell.render_model())
+        shell.draw(STEP, None)
+        print("PASS: S2 — shell.draw(dt, None) renders the shell's own "
+              "construction state (the pre-first-model frame)")
+    except Exception as e:
+        ok = False
+        print("FAIL: S2 — shell.draw(dt, None) raised %r" % (e,))
+
+    return ok
+
+
 def main():
     pygame.init()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
@@ -358,8 +538,13 @@ def main():
         ok = False
         print("FAIL: 2P — expected 2 players, got %d" % len(m2["players"]))
 
+    # --- M3: the never-stepped shell audit (plan_12) ---
+    print("\nM3: never-stepped shell Game audit (plan_12)")
+    ok &= test_m3_shell_audit(screen, font, big_font, light_tex, fog_surf,
+                              light_surf)
+
     pygame.quit()
-    print("\nRENDER MODEL (M1):", "ALL PASS" if ok else "FAILURES")
+    print("\nRENDER MODEL (M1+M3):", "ALL PASS" if ok else "FAILURES")
     raise SystemExit(0 if ok else 1)
 
 

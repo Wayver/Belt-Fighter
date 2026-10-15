@@ -645,6 +645,16 @@ class Game:
         self.acc = 0.0
         self.test_mode = test_mode
         self.sound = sound      # SoundBank or None (silent, e.g. headless)
+        # SFX event queue (plan_12 D.1). _step fires presentation sounds via
+        # _sfx/_sfx_throttled/_sfx_thruster; each call APPENDS a plain
+        # (name, *params) event here AND (if a SoundBank is attached) plays
+        # it immediately (the in-process path). render_model() DRAINS this
+        # queue into the model's "sfx" list — the presentation sound events
+        # since the last publish. In the separate-process sim (sound=None)
+        # nothing plays here; the render process plays the model's "sfx"
+        # list via its own SoundBank. Bounded: drained every publish (one
+        # per sim step), so it holds at most one step's worth of events.
+        self._sfx_events = []
         # --- networking: remote-interpolation render state ---
         # sim_time: seconds of sim advanced; the authoritative peer stamps
         # each snapshot with it, the remote peer renders behind it.
@@ -764,18 +774,38 @@ class Game:
         self.shields[i] = self._make_shield(ship)
 
     def _sfx(self, name):
-        """Play a sound if a SoundBank is attached. Pure side effect:
-        the sim never reads sound state, so determinism is untouched."""
+        """Fire a presentation sound event.
+
+        ALWAYS records (name,) in self._sfx_events (render_model drains it
+        into the model's "sfx" list — the separate-process sim is silent,
+        so the render process plays it, plan_12 D.1), and ALSO plays it
+        immediately when a SoundBank is attached (the in-process path —
+        single player + the client, where the sim and the SoundBank are
+        the same object). Pure side effect: the sim never reads sound
+        state, so determinism is untouched."""
+        self._sfx_events.append((name,))
         if self.sound:
             self.sound.play(name)
 
     def _sfx_throttled(self, name, min_interval):
-        """Throttled variant for rapid-fire weapons (see SoundBank)."""
+        """Throttled variant for rapid-fire weapons (see SoundBank).
+
+        The throttle lives in the SoundBank (wall clock), so the event is
+        recorded ONLY when the bank actually plays — the piped "sfx" list
+        carries what the ear hears, not what the sim tried to fire (~100
+        gun shots/s would flood the pipe). With no SoundBank (the
+        separate-process sim) there is no throttle, so every event is
+        recorded and the RENDER process's SoundBank applies the same
+        throttle when it plays the list — same behavior, throttled once."""
         if self.sound:
-            self.sound.play_throttled(name, min_interval)
+            if self.sound.play_throttled(name, min_interval):
+                self._sfx_events.append((name, min_interval))
+        else:
+            self._sfx_events.append((name, min_interval))
 
     def _sfx_thruster(self, on):
         """Engine loop on/off (see SoundBank.set_thruster)."""
+        self._sfx_events.append(("thruster", on))
         if self.sound:
             self.sound.set_thruster(on)
 
@@ -1038,8 +1068,25 @@ class Game:
           players       [per-ship dict, ...] — see _ship_render_pack
           game_over     bool
           protect_timer float
+          sfx           [(name, *params), ...] — the presentation sound
+                        events fired since the LAST publish (drained from
+                        self._sfx_events here): ("laser", 0.12) /
+                        ("beam",) / ("missile_launch",) / ("explosion",) /
+                        ("shield_hit", 0.15) / ("thruster", on) / ...
+                        The separate-process sim is silent (sound=None),
+                        so the render process plays this list via its own
+                        SoundBank (plan_12 D.1). In-process (SP/client)
+                        the events already played on the local bank; the
+                        list is then inert (nothing plays it twice).
         """
         ship = self.ship
+        # Drain the SFX events fired since the last publish (plan_12 D.1).
+        # render_model() is called once per sim step (the publish), so this
+        # is the "per publish" drain: the queue holds at most one step's
+        # worth of events. The list is plain data (tuples of str/float/
+        # bool) — safe to pickle over the model pipe.
+        sfx = self._sfx_events
+        self._sfx_events = []
         return {
             # --- SYNCED (the existing snapshot) ---
             "snapshot": self.snapshot(),
@@ -1091,6 +1138,8 @@ class Game:
             # --- flags ---
             "game_over": self.game_over,
             "protect_timer": self.protect_timer,
+            # --- presentation sound events since the last publish (D.1) ---
+            "sfx": sfx,
         }
 
     @staticmethod

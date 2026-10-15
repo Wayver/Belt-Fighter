@@ -4,13 +4,21 @@ Run from the repo root (the directory that CONTAINS ship5/):
 
     python -m ship5.test_sim_process
 
-Two tests:
+Three tests:
   M1 — A/B proof of the GIL fix (in-process batches, separate-process
        does not). See the arm_* functions below.
   M2 — input + commands + remote input over the command Pipe: the parent
        drives the spawned sim and verifies each control path (local input
        -> player 0, command -> targeting, remote input -> player 1) lands
        in the model. See test_m2_input_commands_remote.
+  M3 — the real 2P setup path: the 6-arg setup message (the host's +
+       client's REAL hulls/loadouts — the plan's original sketch) and the
+       model's "sfx" list (plan_12 D.1: presentation sound events since
+       the last publish). See test_m3_hulls_and_sfx.
+  M3 e2e — the REAL run_host with a fake client over loopback: the sim
+       process is spawned (6-arg setup), the shell is drawn from the
+       piped model, the host's SoundBank plays the model's sfx, and the
+       sim process is shut down cleanly on exit. See test_m3_host_e2e.
 
 WHY THIS TEST
 The residual ~8 px snap tail is host-side: the host's render thread holds
@@ -39,14 +47,20 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
 import math
+import socket
 import sys
 import time
 import threading
 import multiprocessing
 import queue as _queue
+import traceback
 
-from .config import WIDTH, HEIGHT
+import pygame   # after the SDL dummy-driver env (above); the M3 e2e's
+                # _E2EKeys reads pygame.K_* at module scope
+
+from .config import WIDTH, HEIGHT, ROT_SPEED
 from .game import Game, STEP
+from .hulls import PLAYER_HULLS, default_loadout
 from .intent import ShipInput
 from .sim_thread import SimThread
 from .sim_process import sim_process_main
@@ -453,6 +467,450 @@ def test_m2_input_commands_remote():
     return ok
 
 
+# ---------------------------------------------------------------------------
+# M3: the real 2P setup path + the model's "sfx" list (plan_12 D.1)
+# ---------------------------------------------------------------------------
+#
+# M1/M2 use the simple ("setup", seed, players) form (default hulls). A
+# REAL 2P game sends the 6-arg form — the plan's original sketch:
+#
+#   ("setup", local_hull, local_loadout, client_hull, client_loadout, seed)
+#
+# The authoritative sim needs the client's hull for correct physics
+# (mass, weapons, shield) and the render process's shell needs it for the
+# ship-body/shield render. This test proves the 6-arg path end to end:
+# the hulls LOADOUTS are picklable over the spawn Pipe, the sim builds
+# player 1 from the client's REAL hull (verified through the model — the
+# silas's turn_rate_factor 1.15 makes p1 turn 15% faster than the
+# scout's 1.0), and the model carries the drained "sfx" list.
+#
+# SFX: the sim process is silent (sound=None), so _sfx/_sfx_throttled/
+# _sfx_thruster RECORD events into the per-Game queue instead of playing
+# them; render_model() drains that queue into the model's "sfx" list.
+# The checks:
+#   * the model carries a plain "sfx" list, drained per publish (a second
+#     render_model with no step in between is empty — the sim process
+#     publishes exactly one model per step, so this is the per-publish
+#     drain the render process relies on);
+#   * thrusting fires ("thruster", True) then ("thruster", False) on
+#     release (the engine loop is level-triggered per step);
+#   * firing the gun fires ("laser", 0.12) — the throttled variant
+#     (no SoundBank in the sim -> every shot records; the RENDER
+#     process's bank applies the throttle when it plays the list).
+
+M3_TURN_S = 1.0             # how long p1's turn is held (sim time)
+M3_SETTLE_S = 0.50          # how long p0's thrust+fire is held (sim time)
+
+
+def test_m3_hulls_and_sfx():
+    """M3: the 6-arg setup (real hulls/loadouts) + the model's "sfx" list.
+    Returns True when all checks pass."""
+    ok = True
+    # Host: the scout (turn_rate_factor 1.0). Client: the silas (1.15) —
+    # a DIFFERENT turn rate, so the model's p1 turn delta proves the sim
+    # built player 1 from the client's REAL hull, not the default.
+    host_hull, client_hull = PLAYER_HULLS[0], PLAYER_HULLS[3]   # scout, silas
+    assert host_hull.turn_rate_factor == 1.0
+    assert client_hull.turn_rate_factor == 1.15
+
+    ctx = multiprocessing.get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe()
+    model_queue = ctx.Queue(maxsize=4)
+    p = ctx.Process(target=sim_process_main,
+                    args=(child_conn, model_queue))
+    p.start()
+    child_conn.close()
+    # The 6-arg setup: the host's + client's REAL hulls/loadouts + seed.
+    # The hulls/loadouts are frozen dataclasses of plain data — picklable
+    # over the spawn Pipe (the real run_host sends exactly this).
+    parent_conn.send(("setup", host_hull, default_loadout(host_hull),
+                      client_hull, default_loadout(client_hull), 1234))
+
+    # Wait for ready (the child built the Game + started the SimThread).
+    ready = False
+    t_deadline = time.monotonic() + M2_READY_TIMEOUT_S
+    while time.monotonic() < t_deadline:
+        try:
+            m = model_queue.get(timeout=0.2)
+        except _queue.Empty:
+            continue
+        if m[0] == "ready":
+            ready = True
+            break
+        elif m[0] == "crash":
+            print("  [M3] SIM CRASHED:\n" + m[1])
+            break
+    ok &= check("M3: sim process became ready (6-arg setup)", ready)
+    if not ready:
+        parent_conn.send(("quit",))
+        p.join(timeout=3.0)
+        if p.is_alive():
+            p.terminate()
+            p.join()
+        parent_conn.close()
+        return ok
+
+    # --- 1. the client's REAL hull is in the sim (through the model) ---
+    # Baseline: both ships at the spawn center, idle.
+    base = _settle_and_read(model_queue, 0.2)
+    ok &= check("M3: baseline model received", base is not None)
+    if base is None:
+        parent_conn.send(("quit",))
+        p.join(timeout=3.0)
+        if p.is_alive():
+            p.terminate()
+            p.join()
+        parent_conn.close()
+        return ok
+    base_p1_angle = base["players"][1]["angle"]
+
+    # Turn p1 (the client's ship) for M3_TURN_S. The silas's
+    # turn_rate_factor is 1.15 (the scout's is 1.0), so the same input
+    # turns p1 15% faster: dangle ~= ROT_SPEED * 1.15 * t. If the sim had
+    # built p1 from the DEFAULT hull (scout, factor 1.0), the delta would
+    # be ~13% smaller — outside the tolerance band below.
+    parent_conn.send(("remote_input", ShipInput(turn=1.0)))
+    m = _settle_and_read(model_queue, M3_TURN_S)
+    ok &= check("M3: model after remote turn", m is not None)
+    if m is not None:
+        dangle = abs(m["players"][1]["angle"] - base_p1_angle)
+        want = ROT_SPEED * client_hull.turn_rate_factor * M3_TURN_S
+        # The settle window is wall-clock; the sim steps at 60 Hz, so the
+        # actual held time is within ~3 ticks of M3_TURN_S (input pickup
+        # + drain quantization) -> dangle within ~0.2 rad of `want`.
+        # The band around the silas prediction (4.14 rad) EXCLUDES the
+        # scout prediction (3.6 rad): 0.54 rad apart, the band is 0.25.
+        lo, hi = want - 0.25, want + 0.25
+        ok &= check("M3: client's REAL hull is in the sim (silas turn "
+                    "rate, not the default scout)",
+                    lo < dangle <= hi,
+                    "dangle=%.3f rad (silas ~%.3f, scout ~%.3f)"
+                    % (dangle, want, ROT_SPEED * M3_TURN_S))
+        print("  [M3] p1 after remote turn: dangle=%.3f rad "
+              "(expected ~%.3f for the silas)" % (dangle, want))
+    parent_conn.send(("remote_input", ShipInput()))
+
+    # --- 2. the model carries the drained "sfx" list (D.1) ---
+    # Thrust p0 for M3_SETTLE_S, draining continuously (the render-loop
+    # pattern). The sim is silent (sound=None), so the engine loop's
+    # on/off + the gun's blips arrive as the model's "sfx" list.
+    sfx_seen = []
+    t_deadline = time.monotonic() + M3_SETTLE_S
+    parent_conn.send(("input", ShipInput(thrust_fwd=1.0, fire=True)))
+    while time.monotonic() < t_deadline:
+        m = _drain_newest(model_queue)
+        if m is not None:
+            sfx_seen.extend(m.get("sfx", ()))
+        time.sleep(0.01)
+    m = _drain_newest(model_queue)
+    if m is not None:
+        sfx_seen.extend(m.get("sfx", ()))
+    # Release the input; the engine loop must come back off.
+    parent_conn.send(("input", ShipInput()))
+    off_seen = []
+    t_deadline = time.monotonic() + 0.2
+    while time.monotonic() < t_deadline:
+        m = _drain_newest(model_queue)
+        if m is not None:
+            off_seen.extend(m.get("sfx", ()))
+        time.sleep(0.01)
+    m = _drain_newest(model_queue)
+    if m is not None:
+        off_seen.extend(m.get("sfx", ()))
+
+    names = [ev[0] for ev in sfx_seen]
+    ok &= check("M3: model carries a plain 'sfx' list with events",
+                bool(sfx_seen), "events=%r" % (sfx_seen[:6],))
+    ok &= check("M3: thrust fired ('thruster', True)",
+                ("thruster", True) in sfx_seen,
+                "names=%r" % sorted(set(names)))
+    ok &= check("M3: firing the gun fired ('laser', 0.12) (throttled "
+                "variant, recorded in the silent sim)",
+                any(ev[0] == "laser" and len(ev) == 2 for ev in sfx_seen),
+                "names=%r" % sorted(set(names)))
+    ok &= check("M3: releasing thrust fired ('thruster', False)",
+                ("thruster", False) in off_seen,
+                "names=%r" % sorted(set(off_seen and [e[0] for e in off_seen] or [])))
+    print("  [M3] sfx while thrusting+firing: %r" % (sfx_seen[:8],))
+    print("  [M3] sfx after release: %r" % (off_seen[:4],))
+
+    # --- 3. drained per publish: a second render_model with no step in
+    #      between is empty. The sim process publishes exactly one model
+    #      per step, so the model's "sfx" list holds at most one step's
+    #      worth of events — the render process plays every drained model's
+    #      list and never hears a sound twice.
+    # (Verified in-process, where render_model is directly callable: the
+    #  sim process's publish loop is one render_model per step.)
+    g = Game(None, None, None, None, None, None, seed=1234, players=2)
+    g._sfx("beam")
+    first = g.render_model()["sfx"]
+    second = g.render_model()["sfx"]
+    # The constructor's reset records ("thruster", False) before the
+    # "beam", so the first publish carries both; the point is the DRAIN:
+    # the second publish (no step in between) is empty.
+    ok &= check("M3: 'sfx' is drained per publish (second publish empty)",
+                ("beam",) in first and second == [],
+                "first=%r second=%r" % (first, second))
+
+    # --- shutdown ------------------------------------------------------
+    parent_conn.send(("quit",))
+    done = None
+    t_deadline = time.monotonic() + 3.0
+    while time.monotonic() < t_deadline:
+        try:
+            m = model_queue.get(timeout=0.2)
+        except _queue.Empty:
+            if not p.is_alive():
+                break
+            continue
+        if m[0] == "done":
+            done = m
+            break
+    p.join(timeout=3.0)
+    if p.is_alive():
+        p.terminate()
+        p.join()
+    parent_conn.close()
+    if done is not None:
+        _, steps, simt, wall, _stamps = done
+        print("  [M3] CHILD step report: steps=%d sim_time=%.3f wall=%.3f"
+              % (steps, simt, wall))
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# M3 e2e: the REAL run_host with a fake client over loopback
+# ---------------------------------------------------------------------------
+#
+# The pipe test above proves the sim process side (setup/hulls/sfx). This
+# proves the RENDER process side end to end: the real run_host spawns the
+# sim process (6-arg setup), drains the model queue in the render thread,
+# draws the SHELL from the piped model, plays the model's sfx, and shuts
+# the sim down cleanly on exit.
+#
+# The fake client is a REAL TCP connection: it sends the join handshake
+# (its hull crosses the wire -> the 6-arg setup) and then idle T_INPUT
+# messages (the client's input reaches the sim only in M4 — until then the
+# worker's sink applies it to the shell's remote_input, a no-op
+# placeholder). The host's OWN input is test-driven (pygame.key.get_pressed
+# is patched to hold W+SPACE) so the sim actually does something
+# (thrust + fire -> sfx events -> the host's SoundBank).
+#
+# Checks:
+#   * the host loop runs + exits cleanly (no exception, no hang);
+#   * the sim process was spawned and is GONE after exit (E.6 shutdown);
+#   * the shell was drawn from the piped model (its camera moved with the
+#     thrusting ship; its local standin's pose == the last model's p0
+#     pose — the standin is synced from the model pack inside draw());
+#   * the host's SoundBank played the model's sfx (thruster on + laser
+#     blips — the D.1 bridge, end to end);
+#   * the worker is alive: the fake client's tagged T_INPUT got a T_PONG.
+
+M3_E2E_RUN_S = 3.5          # how long the host runs before the QUIT
+
+
+class _E2EKeys:
+    """The host's held keys: W (thrust) + SPACE (fire) — the sim does
+    something (sfx) and the ship moves (camera/standin checks)."""
+    def __getitem__(self, k):
+        return 1 if k in (pygame.K_w, pygame.K_SPACE) else 0
+
+
+class _E2EMenu:
+    """Just enough of a Menu for run_host (hull/loadout)."""
+    def __init__(self, hull):
+        self.hull = hull
+        self.loadout = default_loadout(hull)
+
+
+def test_m3_host_e2e():
+    """M3 e2e: the real run_host + a fake client over loopback. Returns
+    True when all checks pass."""
+    from .net import (Connection, T_INPUT, T_PONG, serialize_hull,
+                      serialize_loadout, serialize_input)
+
+    ok = True
+    if not pygame.get_init():
+        pygame.init()
+    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    font = pygame.font.SysFont("consolas,menlo,monospace", 18)
+    big_font = pygame.font.SysFont("consolas,menlo,monospace", 40)
+    from .fog import make_light_texture
+    light_tex = make_light_texture()
+    fog_surf = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+    light_surf = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+    from .sound import SoundBank
+    sfx = SoundBank()
+    sfx.init()
+    clock = pygame.time.Clock()
+
+    host_hull, client_hull = PLAYER_HULLS[0], PLAYER_HULLS[3]   # scout, silas
+
+    # --- capture the host's (shell) Game + the spawned sim process ---
+    # Every constructed Game gets a draw() counter: _test_draw_from_model
+    # counts the frames drawn FROM A PIPED MODEL (model is not None — the
+    # pre-first-model frames pass None). The stable proof that the render
+    # loop drained the model queue and drew the shell from it (the
+    # camera/standin positions are timing-dependent — the ship coasts off
+    # the map).
+    created_games = []
+    orig_init = Game.__init__
+    def patched_init(self, *a, **k):
+        orig_init(self, *a, **k)
+        created_games.append(self)
+        orig_draw = self.draw
+        self._test_draw_from_model = 0
+        def counting_draw(dt, model=None):
+            if model is not None:
+                self._test_draw_from_model += 1
+            return orig_draw(dt, model)
+        self.draw = counting_draw
+    Game.__init__ = patched_init
+
+    created_procs = []
+    orig_get_context = multiprocessing.get_context
+    def tracking_get_context(name):
+        ctx = orig_get_context(name)
+        orig_process = ctx.Process
+        def tracking_process(*a, **k):
+            pr = orig_process(*a, **k)
+            created_procs.append(pr)
+            return pr
+        ctx.Process = tracking_process
+        return ctx
+    multiprocessing.get_context = tracking_get_context
+
+    # --- record the sfx the host's SoundBank plays (the D.1 bridge) ---
+    sfx_played = []
+    orig_play_sfx = sfx.play_sfx
+    def tracking_play_sfx(events):
+        sfx_played.extend(events)
+        return orig_play_sfx(events)
+    sfx.play_sfx = tracking_play_sfx
+
+    # --- the fake client (a real TCP connection) ---
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+
+    pongs = []
+    client_err = []
+    client_stop = threading.Event()
+    def fake_client():
+        try:
+            time.sleep(0.3)          # let the host bind + listen
+            conn = Connection(socket.create_connection(
+                ("127.0.0.1", port), timeout=5.0))
+            from .net import do_handshake_client
+            do_handshake_client(conn, serialize_hull(client_hull),
+                                serialize_loadout(default_loadout(client_hull)))
+            tag = 0
+            while not client_stop.is_set():
+                tag += 1
+                conn.send({"type": T_INPUT, "inp": serialize_input(ShipInput()),
+                           "tag": tag})
+                conn.drain_send()
+                for m in conn.poll():
+                    if m.get("type") == T_PONG:
+                        pongs.append(m.get("tag"))
+                time.sleep(0.1)
+            conn.close()
+        except Exception as e:
+            client_err.append(repr(e))
+    th_client = threading.Thread(target=fake_client, daemon=True)
+
+    # --- run the REAL run_host on a thread (the render thread) ---
+    # The PACKAGE's __main__ (a relative import — `import __main__` would
+    # give this test module, since we run via -m ship5.test_sim_process).
+    from . import __main__ as M
+    M.NET_PORT = port
+    M._lan_ip = lambda: "127.0.0.1"
+    orig_get_pressed = pygame.key.get_pressed
+    pygame.key.get_pressed = lambda: _E2EKeys()
+    host_err = []
+    def host_side():
+        try:
+            M.run_host(screen, font, big_font, clock, sfx, _E2EMenu(host_hull),
+                       None, light_tex, fog_surf, light_surf)
+        except Exception:
+            host_err.append(traceback.format_exc())
+    th_host = threading.Thread(target=host_side, daemon=True)
+
+    th_client.start()
+    th_host.start()
+    time.sleep(M3_E2E_RUN_S)
+    # Stop the host (QUIT -> handle_events returns False -> run_host
+    # returns -> the finally shuts the worker + sim process down).
+    stop = time.time() + 10.0
+    while time.time() < stop and th_host.is_alive():
+        pygame.event.post(pygame.event.Event(pygame.QUIT))
+        time.sleep(0.05)
+    th_host.join(timeout=5)
+    client_stop.set()
+    th_client.join(timeout=5)
+
+    # Restore the patches.
+    pygame.key.get_pressed = orig_get_pressed
+    Game.__init__ = orig_init
+    multiprocessing.get_context = orig_get_context
+    sfx.play_sfx = orig_play_sfx
+
+    # --- verify -----------------------------------------------------------
+    def check(label, cond, extra=""):
+        nonlocal ok
+        print(("PASS: " if cond else "FAIL: ") + label
+              + (("  " + extra) if extra else ""))
+        if not cond:
+            ok = False
+
+    check("M3e2e: no exception in the host loop", not host_err,
+          repr(host_err))
+    check("M3e2e: no exception in the fake client", not client_err,
+          repr(client_err))
+    check("M3e2e: the host loop exited (no hang)", not th_host.is_alive())
+
+    shell = next((g for g in created_games if g.local_index == 0), None)
+    check("M3e2e: the host built its (shell) Game", shell is not None)
+    if shell is not None:
+        # The stable proof that the render loop drained the model queue
+        # and drew the shell from the piped model (patched_init counts
+        # the draw() calls that received a non-None model).
+        check("M3e2e: the shell was drawn from the piped model (draw "
+              "received non-None models)",
+              shell._test_draw_from_model > 30,
+              "n=%d" % shell._test_draw_from_model)
+
+    check("M3e2e: the sim process was spawned", len(created_procs) == 1,
+          "n=%d" % len(created_procs))
+    if created_procs:
+        pr = created_procs[0]
+        check("M3e2e: the sim process is GONE after exit (E.6 shutdown)",
+              not pr.is_alive())
+
+    if shell is not None:
+        # The local standin was built + synced from the model pack inside
+        # draw() (draw() builds it lazily on the first frame and syncs
+        # its pose/presentation from the model pack every frame).
+        standin = shell._standins.get(0)
+        check("M3e2e: the shell's local standin was built + synced from "
+              "the model (draw ran)", standin is not None)
+
+    names = [ev[0] for ev in sfx_played]
+    check("M3e2e: the host's SoundBank played the model's sfx (D.1)",
+          bool(sfx_played), "n=%d names=%r" % (len(sfx_played),
+                                               sorted(set(names))))
+    check("M3e2e: the engine loop played ('thruster', True)",
+          ("thruster", True) in sfx_played)
+    check("M3e2e: the gun blips played ('laser', 0.12)",
+          any(ev[0] == "laser" and len(ev) == 2 for ev in sfx_played))
+
+    check("M3e2e: the worker is alive (the client's tagged input got a "
+          "T_PONG)", len(pongs) >= 1, "pongs=%d" % len(pongs))
+
+    return ok
+
+
 def main():
     ok = True
     # Force long GIL holds so the render-like load actually starves the
@@ -512,7 +970,17 @@ def main():
     print("\nM2: input + commands + remote input over the command Pipe")
     ok &= test_m2_input_commands_remote()
 
-    print("\nSIM PROCESS (M1+M2):", "ALL PASS" if ok else "FAILURES")
+    # M3: the real 2P setup path (6-arg hulls/loadouts) + the model's
+    # "sfx" list (D.1).
+    print("\nM3: 6-arg setup (real hulls/loadouts) + the model's 'sfx' list")
+    ok &= test_m3_hulls_and_sfx()
+
+    # M3 e2e: the REAL run_host with a fake client over loopback (spawn +
+    # 6-arg setup + drain/draw the shell + play the sfx + clean shutdown).
+    print("\nM3 e2e: the real run_host + a fake client over loopback")
+    ok &= test_m3_host_e2e()
+
+    print("\nSIM PROCESS (M1+M2+M3):", "ALL PASS" if ok else "FAILURES")
     raise SystemExit(0 if ok else 1)
 
 

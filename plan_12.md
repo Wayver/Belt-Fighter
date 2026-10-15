@@ -287,6 +287,105 @@ the physics exactly (160 = SHIP_ACCEL 320 x 0.5 s; 1.8 = ROT_SPEED 3.6 x
   The test runs in ~1.7 s (4x margin) and releases the thrust after the
   input check so p0 only coasts, never accelerates into the world.
 
+## M3 RESULT (done — shell draw + SFX bridge + setup hulls)
+
+The host window now renders the full game from the piped model on a SHELL
+Game in the render process, with SFX piped out of the silent sim process.
+All three parts landed; the M1 A/B + M2 tests still pass (no regression).
+
+### Part 1 — the never-stepped shell audit (`test_render_model.py`)
+`test_m3_shell_audit` builds a live game (stepped in-process) and a shell
+Game (real surfaces, both players' REAL hulls — scout + blackbird,
+`set_player_ship(1, ...)`, NEVER stepped), and at EVERY tick of a 300-tick
+scripted run feeds the shell the live game's model and asserts:
+- **S1 PIXEL PARITY** — `shell.draw(dt, model)` renders PIXEL-IDENTICAL to
+  `live.draw(dt, model)` (the model carries everything draw() reads — no
+  accidental live read). To make the comparison exact: `pygame.time.
+  get_ticks` is frozen (the draw path has wall-clock animations — the
+  reticle's 100 ms blink, the shield swirl), the camera is synced to the
+  model's target for both games, and the GLOBAL `random` module is
+  re-seeded before each draw (the draw path samples it — flame length
+  jitter, shield flicker in ship.py).
+- **S2** — `shell.draw(dt, None)` works (the pre-first-model frame: draw
+  falls back to the shell's own construction state).
+- **S3** — the model carries a plain `"sfx"` list, drained per publish.
+
+### Part 2 — the shell Game in `run_host` (`__main__.py`)
+Phase 3 now: builds the SHELL Game (real surfaces/fonts/textures +
+sound=sfx + both players' hulls, `set_player_ship(1, client hull)`),
+spawns the sim process (spawn context, AFTER the handshake — E.4), sends
+the 6-arg setup, waits for `("ready",)` (bounded, crash -> notice + menu).
+The game loop: `sim_cmd.send(("input", ...))` per frame, DRAINS the model
+Queue in the SAME thread as the draw (`_drain_sim_model` — latest-wins +
+concatenates every drained model's sfx), plays the sfx via the host's
+SoundBank, and draws `game.draw(dt, {**model, "step_alpha": alpha} if
+model else None)`. T/V/G/R/F route to the sim over the command Pipe
+(`_sim_command`); T_RESPAWN -> `("command", "respawn", 1)`. The finally
+shuts down in E.6 order: stop the worker, then quit the sim process
+(`("quit",)` -> close Pipe -> join(2) -> terminate). The shell's
+cam/_standins/_death_bursts/remote_beams are the render-side presentation
+state (only the render thread touches them — the split is preserved).
+
+### Part 3 — the SFX bridge (D.1)
+`Game._sfx/_sfx_throttled/_sfx_thruster` now RECORD `(name, *params)`
+events into `self._sfx_events` (and still play immediately when a
+SoundBank is attached — the in-process SP/client path is unchanged).
+`render_model()` DRAINS the queue into the model's `"sfx"` list (one
+publish per sim step -> bounded to one step's worth). The sim process is
+silent (sound=None), so its events ride the model pipe; the render
+process plays them via `SoundBank.play_sfx(events)` (new: thruster ->
+set_thruster, 2-tuple -> play_throttled, 1-tuple -> play). The throttle
+lives in the SoundBank (wall clock): the sim-side bank never saw the
+events, so the RENDER process's bank is the single place the human-rate
+throttle runs — same behavior as in-process, throttled once.
+`play_throttled` now returns True/False (played/throttled) so the
+in-process path records only what the ear hears.
+
+### The setup message (the "likely need" — taken)
+`("setup", local_hull, local_loadout, client_hull, client_loadout, seed)`
+(the plan's original sketch) is the REAL 2P form: the hulls/loadouts are
+frozen dataclasses of plain data (picklable over the spawn Pipe; no hull
+identity comparisons anywhere — only `.id` strings). The sim process
+builds player 0 from the host's fit and replaces the player-1 placeholder
+via `set_player_ship(1, Ship(hull=client_hull, ...))`. The M1/M2 simple
+form `("setup", seed, players)` is kept (default hulls, the tests).
+
+### Verification (all pass)
+- **`python -m ship5.test_sim_process`** — M1 A/B + M2 + the new M3 pipe
+  test + the new M3 e2e:
+  - M3 pipe: 6-arg setup -> ready; the client's REAL hull is in the sim
+    (p1 = silas, turn_rate_factor 1.15: dangle 4.140 rad over 1.0 s —
+    the scout's 3.600 is outside the band); the model's "sfx" list
+    carries ("thruster", True/False) + ("laser", 0.12) + ("enemy_laser",
+    0.15), drained per publish.
+  - M3 e2e (the REAL `run_host` + a fake TCP client over loopback): the
+    sim process is spawned (6-arg setup) and GONE after exit (E.6); the
+    shell's camera followed the thrusting ship + its local standin's pose
+    moved with the ship (draw ran from the piped model); the host's
+    SoundBank played the model's sfx (242 events: thruster on + laser
+    blips — the D.1 bridge end to end); the worker is alive (31 T_PONGs
+    to the client's tagged inputs).
+- **`python -m ship5.test_render_model`** — M1 (SHAPE/PARITY/PLAIN/PURE/
+  DETERMINISM/2P) + the M3 shell audit (S1/S2/S3) all pass.
+- **No regression**: test_sim_thread, test_snapshot, test_determinism,
+  test_m2b_local all pass.
+- **`test_network` (the loopback e2e)**: the HOST-side checks pass (no
+  exceptions, clean loop exit, handshake + welcome over the 6-arg setup
+  path). The CLIENT-side snapshot/ghost/render-point checks FAIL BY
+  DESIGN until M4 — the sim->render->`worker.publish_snapshot` bridge is
+  M4's job (scope guard), so no snapshots reach the client yet. M4 turns
+  this green.
+- **Display note**: this env has no X display — the window check is the
+  headless e2e (dummy SDL driver + the pixel-parity audit), which is the
+  plan's "headless or manual window check" option. A manual window run
+  (`python -m ship5`, host mode) is the remaining human-in-the-loop
+  confirmation.
+
+### Locked decisions — none changed
+Pipe commands / bounded drop-when-full Queue models / same-thread drain /
+child-side cadence / headless sim process: all untouched. No NetWorker or
+wire-protocol change (M4).
+
 ## G. Risks
 
 | Risk | Likelihood | Mitigation |

@@ -28,7 +28,11 @@ network bridge (snap/beam/echo -> the render process's NetWorker).
 
 IPC (spawn context — see plan_12 section E):
   parent -> child (Pipe, small + low-rate + ordered):
-                   ("setup", seed, players) | ("input", ShipInput) |
+                   ("setup", local_hull, local_loadout, client_hull,
+                    client_loadout, seed)   (M3: the real 2P fits; the
+                                              plan's original sketch)
+                   ("setup", seed, players)  (M1/M2: default hulls, tests)
+                   ("input", ShipInput) |
                    ("command", name, arg) | ("remote_input", ShipInput) |
                    ("quit",)
   child -> parent (bounded Queue, maxsize=4, put_nowait drop-when-full):
@@ -52,6 +56,7 @@ import os
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
+import threading
 import time
 import traceback
 
@@ -80,15 +85,27 @@ class _Worker:
         pass   # M4: forward ("beam"/"echo", msg) to the parent
 
 
-def _build_game(seed, players):
+def _build_game(seed, players, local_hull=None, local_loadout=None,
+                client_hull=None, client_loadout=None):
     """Build a headless Game. The display surfaces are None: the sim path
     never reads them (verified — all 23 uses are in draw helpers), and
     draw() is never called in the sim process (M3 draws in the render
-    process on a shell Game)."""
-    import pygame
+    process on a shell Game).
+
+    `local_hull`/`local_loadout` go into player 0 (the host's ship). For a
+    2P sim, `client_hull`/`client_loadout` replace the player-1 placeholder
+    (the client's real fit, from the join handshake) — the authoritative
+    sim needs the client's hull for correct physics (mass, weapons, shield)
+    and the render process's shell needs it for the ship-body/shield render.
+    None -> the default hull/loadout (the M1/M2 simple setup form)."""
     from .game import Game
-    return Game(None, None, None, None, None, None,
-                seed=seed, players=players)
+    from .ship import Ship
+    g = Game(None, None, None, None, None, None,
+             hull=local_hull, loadout=local_loadout,
+             seed=seed, players=players)
+    if players == 2 and client_hull is not None:
+        g.set_player_ship(1, Ship(hull=client_hull, loadout=client_loadout))
+    return g
 
 
 def sim_process_main(cmd_conn, model_queue):
@@ -97,10 +114,11 @@ def sim_process_main(cmd_conn, model_queue):
     process.
 
     Two channels (both from the spawn context):
-      `cmd_conn`    a Pipe, parent -> child: ("setup", seed, players) |
-                    ("input", ShipInput) | ("command", name, arg) |
-                    ("remote_input", ShipInput) | ("quit",). Small,
-                    low-rate, ordered — a Pipe is fine.
+      `cmd_conn`    a Pipe, parent -> child: ("setup", ...) (6-arg M3
+                    hulls/loadouts/seed form, or the 3-arg M1/M2
+                    seed/players form) | ("input", ShipInput) |
+                    ("command", name, arg) | ("remote_input", ShipInput) |
+                    ("quit",). Small, low-rate, ordered — a Pipe is fine.
       `model_queue` a Queue(maxsize=4), child -> parent: the render model
                     (60 Hz) + ("ready",) / ("crash", tb) / ("done", ...).
                     A BOUNDED queue with put_nowait: when the parent is
@@ -126,8 +144,19 @@ def sim_process_main(cmd_conn, model_queue):
         msg = cmd_conn.recv()
         if msg[0] != "setup":
             raise RuntimeError("expected setup, got %r" % (msg,))
-        _, seed, players = msg
-        game = _build_game(seed, players)
+        if len(msg) == 6:
+            # M3: ("setup", local_hull, local_loadout, client_hull,
+            #      client_loadout, seed) — the host's + client's REAL fits
+            #      (the plan's original sketch). The authoritative sim needs
+            #      the client's hull for correct physics; the render
+            #      process's shell needs it for the ship-body/shield render.
+            #      players=2 (a real 2P game).
+            _, lh, ll, ch, cl, seed = msg
+            game = _build_game(seed, 2, lh, ll, ch, cl)
+        else:
+            # M1/M2: ("setup", seed, players) — default hulls (the tests).
+            _, seed, players = msg
+            game = _build_game(seed, players)
         worker = _Worker()
         st = SimThread(game, worker)
         st.start()
@@ -143,12 +172,27 @@ def sim_process_main(cmd_conn, model_queue):
         # separate processes.
         last_model = None
         t_start = time.monotonic()
+        # Guard the command Pipe: the bridge loop recvs it, and (M4) the
+        # render process's NetWorker input sink will send ("remote_input",
+        # ...) from the WORKER thread. Two concurrent senders (or a sender
+        # racing the bridge's recv) would interleave the Pipe's 4-byte
+        # length prefixes and corrupt the stream; the lock serializes
+        # them. (M3: only the bridge loop touches the Pipe — the lock is a
+        # no-op until M4, but it is cheap and keeps the M4 change local.)
+        cmd_lock = threading.Lock()
         while True:
             # Drain everything the parent sent since last time (input /
             # command / quit). Latest input wins (the SimThread applies
             # the latest published input each step — pinned #5).
             while cmd_conn.poll():
-                m = cmd_conn.recv()
+                with cmd_lock:
+                    try:
+                        m = cmd_conn.recv()
+                    except EOFError:
+                        # The parent died (the Pipe is closed): shut down
+                        # cleanly. No "done" report — there is no parent
+                        # left to read it (the finally stops the SimThread).
+                        return
                 kind = m[0]
                 if kind == "quit":
                     st.stop()

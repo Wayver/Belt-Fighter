@@ -88,16 +88,43 @@ class SoundBank:
         For rapid-fire weapons: the sim fires ~100 shots/s but the ear
         wants ~8 blips/s. Throttle state lives here, not in Game, so the
         sim stays sound-free.
+
+        Returns True when the sound actually played, False when it was
+        throttled (or the bank is not ready / muted / unknown name). The
+        caller (Game._sfx_throttled) records the piped "sfx" event only
+        when this returns True, so the render process's copy of the
+        throttle hears exactly what the local bank heard.
         """
         if not self.ready or self.muted:
-            return
+            return False
         now = pygame.time.get_ticks()
         if now - self._last_play.get(name, -10**9) < min_interval * 1000.0:
-            return
+            return False
         self._last_play[name] = now
         snd = self._sounds.get(name)
         if snd is not None:
             snd.play()
+            return True
+        return False
+
+    def play_sfx(self, events):
+        """Play a piped "sfx" list (plan_12 D.1): the presentation sound
+        events the (silent, separate-process) sim fired since its last
+        publish. Each event is (name, *params): ("laser", 0.12) ->
+        play_throttled, ("beam",) -> play, ("thruster", on) ->
+        set_thruster. The throttle is applied HERE (the render process's
+        bank) — the sim-side bank never saw these events, so this is the
+        single place the human-rate throttle runs. Order is preserved
+        (events are in fire order). Unknown names are ignored
+        (forward-compat, like play())."""
+        for ev in events:
+            name = ev[0]
+            if name == "thruster":
+                self.set_thruster(bool(ev[1]))
+            elif len(ev) >= 2:
+                self.play_throttled(name, ev[1])
+            else:
+                self.play(name)
 
     def set_thruster(self, on):
         """Engine loop on/off. Self-heals if another sound stole the

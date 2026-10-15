@@ -252,6 +252,41 @@ cadence the client's ghost clock needs.
   drains the queue, so a `get_nowait` loop that exits on an empty queue
   races past it.
 
+## M2 RESULT (done — input + commands + remote input over the pipe)
+
+`sim_process.py` gains ONE handler: `("remote_input", ShipInput)` ->
+`game.remote_input = m[1]` (a reference swap — exactly what the in-process
+`game.set_remote_input` does; `_step` reads `game.remote_input` each tick
+and applies it to player 1). `test_sim_process.py` gains a SECOND test
+(`test_m2_input_commands_remote`; the M1 A/B is untouched): spawn the sim,
+send `("setup", 1234, 2)`, wait for `("ready",)`, then drive it over the
+command Pipe and verify each control path lands in the model:
+
+| Control path | Message sent | Verified in the model |
+|---|---|---|
+| LOCAL input -> player 0 | `("input", ShipInput(thrust_fwd=1.0))` | p0 pos 41 px off center, vel 160 px/s |
+| command -> sim | `("command", "targeting")` | p0 `targeting_on` False -> True |
+| REMOTE input -> player 1 | `("remote_input", ShipInput(turn=1.0))` | p1 angle changed 1.8 rad |
+
+All three pass; the M1 A/B still passes (no regression). The values match
+the physics exactly (160 = SHIP_ACCEL 320 x 0.5 s; 1.8 = ROT_SPEED 3.6 x
+0.5 s) and are deterministic across runs.
+
+### Two test-design gotchas (both in the TEST, not the sim — no redesign)
+- **The test must DRAIN the model queue continuously while an input is
+  held (the render-loop pattern), not sleep-then-drain.** The model channel
+  is a bounded Queue(maxsize=4) with drop-when-full: if the parent stops
+  draining, the queue fills and the child's newer models are DROPPED, so a
+  sleep-then-drain only ever sees stale pre-input models. `_settle_and_read`
+  drains every ~10 ms for the settle duration and returns the newest.
+- **The test must finish well under ~8 s.** With `("setup", seed, 2)` both
+  ships sit at the spawn center (the real 2P game repositions player 1 via
+  `set_player_ship` after the handshake; the test doesn't), and the
+  seed-1234 world kills a stationary center ship at ~8 s. A dead ship is
+  FROZEN (`_step` skips it), so any input sent after the death does nothing.
+  The test runs in ~1.7 s (4x margin) and releases the thrust after the
+  input check so p0 only coasts, never accelerates into the world.
+
 ## G. Risks
 
 | Risk | Likelihood | Mitigation |

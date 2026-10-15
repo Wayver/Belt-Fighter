@@ -1,8 +1,16 @@
-"""Session 12 M1: the separate-process sim — A/B proof of the GIL fix.
+"""Session 12: the separate-process sim.
 
 Run from the repo root (the directory that CONTAINS ship5/):
 
     python -m ship5.test_sim_process
+
+Two tests:
+  M1 — A/B proof of the GIL fix (in-process batches, separate-process
+       does not). See the arm_* functions below.
+  M2 — input + commands + remote input over the command Pipe: the parent
+       drives the spawned sim and verifies each control path (local input
+       -> player 0, command -> targeting, remote input -> player 1) lands
+       in the model. See test_m2_input_commands_remote.
 
 WHY THIS TEST
 The residual ~8 px snap tail is host-side: the host's render thread holds
@@ -30,12 +38,16 @@ import os
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
+import math
 import sys
 import time
 import threading
 import multiprocessing
+import queue as _queue
 
+from .config import WIDTH, HEIGHT
 from .game import Game, STEP
+from .intent import ShipInput
 from .sim_thread import SimThread
 from .sim_process import sim_process_main
 
@@ -225,6 +237,222 @@ def arm_separate_process():
     return []
 
 
+# ---------------------------------------------------------------------------
+# M2: input + commands + remote input over the command Pipe
+# ---------------------------------------------------------------------------
+#
+# The M1 A/B test above proves the sim STEPS smoothly in its own process.
+# M2 proves the CONTROL path: the parent can drive the sim over the command
+# Pipe — local input (player 0), commands (targeting), and the client's
+# remote input (player 1) — and each shows up in the model the parent reads
+# from the model Queue. This is the exact contract M4's NetWorker bridge
+# relies on; here the test sends the messages directly (no network).
+#
+#   ("input", ShipInput)         -> st.publish_input  -> player 0
+#   ("command", name, arg)       -> st.command        -> e.g. targeting
+#   ("remote_input", ShipInput)  -> game.remote_input -> player 1
+#
+# The model is read by DRAINING the model Queue to the newest (latest-wins,
+# exactly what the render loop does). No GIL load is applied here — that was
+# M1's A/B; M2 only checks that the messages take effect.
+
+M2_SETTLE_S = 0.50          # how long each input/command is held (sim time)
+M2_READY_TIMEOUT_S = 10.0   # spawn + pygame import + Game build budget
+
+
+def _drain_newest(model_queue):
+    """One non-blocking drain of the model Queue to the NEWEST model
+    (latest-wins — the render loop's read pattern). Returns the newest model
+    dict read this drain, or None if the queue was empty. A crash message
+    aborts with a raised error. "ready" / "done" are not models; ignored."""
+    newest = None
+    while True:
+        try:
+            m = model_queue.get_nowait()
+        except _queue.Empty:
+            break
+        if m[0] == "model":
+            newest = m[1]
+        elif m[0] == "crash":
+            raise RuntimeError("SIM CRASHED:\n" + m[1])
+    return newest
+
+
+def _settle_and_read(model_queue, duration):
+    """Hold the sim for `duration` seconds while DRAINING the model Queue
+    continuously (every ~10 ms), then return the NEWEST model seen.
+
+    This mirrors the render loop EXACTLY: it drains the queue every frame
+    and keeps the newest. Draining continuously is load-bearing — the model
+    channel is a BOUNDED queue (maxsize=4) with drop-when-full, so if the
+    parent stopped draining (e.g. slept) the queue would fill and the child's
+    newer models would be DROPPED, and the parent would only ever see stale
+    pre-input models. The render loop never has this problem because it
+    drains every frame; this test must do the same."""
+    newest = None
+    t_deadline = time.monotonic() + duration
+    while time.monotonic() < t_deadline:
+        m = _drain_newest(model_queue)
+        if m is not None:
+            newest = m
+        time.sleep(0.01)
+    # Final drain so we capture the very newest model before returning.
+    m = _drain_newest(model_queue)
+    if m is not None:
+        newest = m
+    return newest
+
+
+def _ship_pos_dist(pos, center):
+    return math.hypot(pos[0] - center[0], pos[1] - center[1])
+
+
+def test_m2_input_commands_remote():
+    """M2: spawn the sim, drive it over the command Pipe, and verify each
+    control path lands in the model. Returns True when all checks pass."""
+    ok = True
+    ctx = multiprocessing.get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe()
+    model_queue = ctx.Queue(maxsize=4)
+    p = ctx.Process(target=sim_process_main,
+                    args=(child_conn, model_queue))
+    p.start()
+    child_conn.close()
+    parent_conn.send(("setup", 1234, 2))
+
+    # Wait for ready (the child built the Game + started the SimThread).
+    ready = False
+    t_deadline = time.monotonic() + M2_READY_TIMEOUT_S
+    while time.monotonic() < t_deadline:
+        try:
+            m = model_queue.get(timeout=0.2)
+        except _queue.Empty:
+            continue
+        if m[0] == "ready":
+            ready = True
+            break
+        elif m[0] == "crash":
+            print("  [M2] SIM CRASHED:\n" + m[1])
+            break
+    ok &= check("M2: sim process became ready", ready)
+    if not ready:
+        parent_conn.send(("quit",))
+        p.join(timeout=3.0)
+        if p.is_alive():
+            p.terminate()
+            p.join()
+        parent_conn.close()
+        return ok
+
+    # Baseline: with no input, both ships sit at the spawn center. Grab a
+    # model to confirm the sim is stepping and record the center. Keep this
+    # SHORT: the seed-1234 world kills a stationary center ship at ~8 s, so
+    # the whole test must finish well before then (it takes ~2 s).
+    center = (WIDTH / 2.0, HEIGHT / 2.0)
+    base = _settle_and_read(model_queue, 0.2)
+    ok &= check("M2: baseline model received", base is not None)
+    if base is None:
+        parent_conn.send(("quit",))
+        p.join(timeout=3.0)
+        if p.is_alive():
+            p.terminate()
+            p.join()
+        parent_conn.close()
+        return ok
+    base_p0 = base["players"][0]
+    base_p1 = base["players"][1]
+    print("  [M2] baseline p0 pos=%s vel=%s angle=%.3f targeting=%s"
+          % (tuple(round(v, 2) for v in base_p0["pos"]),
+             tuple(round(v, 2) for v in base_p0["vel"]),
+             base_p0["angle"], base_p0["targeting_on"]))
+    print("  [M2] baseline p1 pos=%s angle=%.3f"
+          % (tuple(round(v, 2) for v in base_p1["pos"]), base_p1["angle"]))
+
+    # --- 1. LOCAL input drives player 0 -------------------------------
+    # Hold forward thrust for M2_SETTLE_S while draining (the render-loop
+    # pattern); the sim applies the LATEST published input each tick
+    # (pinned #5), so p0 accelerates away from center.
+    parent_conn.send(("input", ShipInput(thrust_fwd=1.0)))
+    m = _settle_and_read(model_queue, M2_SETTLE_S)
+    ok &= check("M2: model after local input", m is not None)
+    if m is not None:
+        p0 = m["players"][0]
+        moved = _ship_pos_dist(p0["pos"], center)
+        speed = math.hypot(p0["vel"][0], p0["vel"][1])
+        # SHIP_ACCEL=320 px/s^2 for ~0.5 s -> ~160 px/s, ~40 px from center.
+        ok &= check("M2: LOCAL input moved player 0 (pos off center)",
+                    moved > 5.0, "dist=%.1f px" % moved)
+        ok &= check("M2: LOCAL input gave player 0 velocity",
+                    speed > 20.0, "speed=%.1f px/s" % speed)
+        print("  [M2] p0 after thrust: pos=%s vel=%s (dist=%.1f px)"
+              % (tuple(round(v, 2) for v in p0["pos"]),
+                 tuple(round(v, 2) for v in p0["vel"]), moved))
+    # Release the thrust (the player lets go of W): the input persists in
+    # the sim until replaced, so without this p0 would keep accelerating to
+    # max speed through the later phases and could fly into an asteroid.
+    # Now it only coasts at ~160 px/s for the rest of the ~1 s test.
+    parent_conn.send(("input", ShipInput()))
+
+    # --- 2. A COMMAND is applied by the sim ---------------------------
+    # "targeting" flips player 0's targeting_on (SimThread._apply_command
+    # toggles g.ship.targeting_on). Baseline is False, so it must become
+    # True.
+    parent_conn.send(("command", "targeting"))
+    m = _settle_and_read(model_queue, M2_SETTLE_S)
+    ok &= check("M2: model after command", m is not None)
+    if m is not None:
+        p0 = m["players"][0]
+        ok &= check("M2: COMMAND flipped player 0 targeting_on",
+                    p0["targeting_on"] is True,
+                    "targeting_on=%s" % p0["targeting_on"])
+        print("  [M2] p0 after 'targeting': targeting_on=%s"
+              % p0["targeting_on"])
+
+    # --- 3. REMOTE input drives player 1 ------------------------------
+    # The client's input path: ("remote_input", ShipInput) -> the sim sets
+    # game.remote_input (a reference swap, exactly what the in-process
+    # game.set_remote_input does); _step applies it to player 1. Hold a
+    # turn for M2_SETTLE_S; p1's angle must change from its baseline.
+    parent_conn.send(("remote_input", ShipInput(turn=1.0)))
+    m = _settle_and_read(model_queue, M2_SETTLE_S)
+    ok &= check("M2: model after remote input", m is not None)
+    if m is not None:
+        p1 = m["players"][1]
+        dangle = abs(p1["angle"] - base_p1["angle"])
+        # ROT_SPEED=3.6 rad/s * turn_rate_factor(1.0) for ~0.5 s -> ~1.8 rad.
+        ok &= check("M2: REMOTE input turned player 1 (angle changed)",
+                    dangle > 0.3, "dangle=%.3f rad" % dangle)
+        print("  [M2] p1 after remote turn: angle=%.3f (d=%.3f rad)"
+              % (p1["angle"], dangle))
+
+    # --- shutdown ------------------------------------------------------
+    parent_conn.send(("quit",))
+    # Blocking get for the done report (the child's put(done) only
+    # completes once the parent drains the queue — see M1's note).
+    done = None
+    t_deadline = time.monotonic() + 3.0
+    while time.monotonic() < t_deadline:
+        try:
+            m = model_queue.get(timeout=0.2)
+        except _queue.Empty:
+            if not p.is_alive():
+                break
+            continue
+        if m[0] == "done":
+            done = m
+            break
+    p.join(timeout=3.0)
+    if p.is_alive():
+        p.terminate()
+        p.join()
+    parent_conn.close()
+    if done is not None:
+        _, steps, simt, wall, _stamps = done
+        print("  [M2] CHILD step report: steps=%d sim_time=%.3f wall=%.3f"
+              % (steps, simt, wall))
+    return ok
+
+
 def main():
     ok = True
     # Force long GIL holds so the render-like load actually starves the
@@ -276,7 +504,15 @@ def main():
     finally:
         sys.setswitchinterval(old_switch)
 
-    print("\nSIM PROCESS (M1):", "ALL PASS" if ok else "FAILURES")
+    print("\nM1:", "ALL PASS" if ok else "FAILURES")
+
+    # M2: input + commands + remote input over the command Pipe. Runs
+    # WITHOUT the GIL load (that was M1's A/B) — it only checks that the
+    # control messages take effect in the model.
+    print("\nM2: input + commands + remote input over the command Pipe")
+    ok &= test_m2_input_commands_remote()
+
+    print("\nSIM PROCESS (M1+M2):", "ALL PASS" if ok else "FAILURES")
     raise SystemExit(0 if ok else 1)
 
 

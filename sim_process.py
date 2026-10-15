@@ -29,7 +29,8 @@ network bridge (snap/beam/echo -> the render process's NetWorker).
 IPC (spawn context — see plan_12 section E):
   parent -> child (Pipe, small + low-rate + ordered):
                    ("setup", seed, players) | ("input", ShipInput) |
-                   ("command", name, arg) | ("quit",)
+                   ("command", name, arg) | ("remote_input", ShipInput) |
+                   ("quit",)
   child -> parent (bounded Queue, maxsize=4, put_nowait drop-when-full):
                    ("model", render_model_dict)   (60 Hz, on a step)
                    ("ready",) | ("crash", traceback_text) |
@@ -98,7 +99,8 @@ def sim_process_main(cmd_conn, model_queue):
     Two channels (both from the spawn context):
       `cmd_conn`    a Pipe, parent -> child: ("setup", seed, players) |
                     ("input", ShipInput) | ("command", name, arg) |
-                    ("quit",). Small, low-rate, ordered — a Pipe is fine.
+                    ("remote_input", ShipInput) | ("quit",). Small,
+                    low-rate, ordered — a Pipe is fine.
       `model_queue` a Queue(maxsize=4), child -> parent: the render model
                     (60 Hz) + ("ready",) / ("crash", tb) / ("done", ...).
                     A BOUNDED queue with put_nowait: when the parent is
@@ -164,6 +166,16 @@ def sim_process_main(cmd_conn, model_queue):
                     st.publish_input(m[1])
                 elif kind == "command":
                     st.command(m[1], m[2] if len(m) > 2 else None)
+                elif kind == "remote_input":
+                    # The CLIENT's input (M4: the render process's NetWorker
+                    # input sink sends it; M2: the test sends it directly).
+                    # A reference swap — exactly what the in-process
+                    # game.set_remote_input does: _step reads
+                    # game.remote_input each tick and applies it to player 1.
+                    # ShipInput is a plain dataclass the sim only READS
+                    # (the world-cap replace() builds a new object), so the
+                    # swap is safe across the process boundary.
+                    game.remote_input = m[1]
             # Publish the newest model (only when it changed — the
             # SimThread publishes on a step, so the model object is
             # stable between steps). put_nowait + drop-when-full: the

@@ -518,13 +518,19 @@ processes with separate queues).
   (S1/S2/S3) all pass.
 - **No regression**: test_sim_thread, test_snapshot, test_determinism,
   test_m2b_local all pass.
-- **F3 telemetry — PENDING RE-CAPTURE**: the original M4's two-machine
-  capture (client `newest_stamp` delta 99.1% one-tick; `snap_px` p95
-  0.000, >=3 px tail 0.29%) was measured with the wire riding the model
-  Queue. The redo moves the send path to the pump thread, so the
-  two-machine F3 capture (`tools/dbg_f3_capture2.py`) should be
-  re-run to confirm the snap tail stays at ~0 with the new routing.
-  (The headless e2e above covers the same paths over loopback.)
+- **F3 telemetry — RE-CAPTURED (the redo holds the original M4's
+  quality)**: the two-machine capture (`tools/dbg_f3_capture2.py` — host
+  in a separate process, the real 2-machine topology; client in the
+  parent) was re-run with the wire on the dedicated net Queue + pump
+  thread. The client's `newest_stamp` delta (the end-to-end snapshot SEND
+  cadence: sim process -> net Queue -> _NetPump -> NetWorker -> socket)
+  is unchanged from the original M4: mean 16.83 ms, **99.0% one-tick
+  (17 ms)**, 1.0% two-tick, **0 above 40 ms** (max 33.4 ms). `snap_px`:
+  median **0.000**, p95 **0.000**, max 8.67, **>=3 px tail 4/696
+  (0.57%)** (original M4: 2/697 = 0.29% — the same ~0 tail, the small
+  difference is run-to-run variance, not a routing regression). The host
+  `steps` column (render-thread MODEL-DRAIN cadence, presentation only —
+  the wire no longer rides the model Queue) is reported for context.
 - **Manual (two machines)**: the remaining human-in-the-loop
   confirmation (host + client on two machines — the client's "syncing to
   authoritative sim" clears, both ships move, beams/explosions/SFX on

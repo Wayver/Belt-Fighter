@@ -45,16 +45,15 @@ IPC (spawn context — see plan_12 section E):
   oldest models when full — latest-wins, exactly what the render thread
   wants (it draws the newest model, never a stale one).
 
-The child is HEADLESS: SDL_VIDEODRIVER/AUDIODRIVER=dummy are set BEFORE
-pygame is imported, and a 1x1 dummy display is created (Game.__init__
-builds shield Surfaces; Ship uses pygame.Vector2). The sim path
-(_step / snapshot / render_model) never touches the display surfaces —
-only draw() does — so a Game with None surfaces is safe here.
+The child is HEADLESS: sim_process_main sets SDL_VIDEODRIVER/AUDIODRIVER=
+dummy BEFORE pygame is imported (inside the function, so the PARENT —
+which imports this module for sim_process_main — keeps its real video
+driver), and a 1x1 dummy display is created (Game.__init__ builds shield
+Surfaces; Ship uses pygame.Vector2). The sim path (_step / snapshot /
+render_model) never touches the display surfaces — only draw() does — so
+a Game with None surfaces is safe here.
 """
 import os
-# Headless: MUST be set before pygame is first imported in this process.
-os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
-os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
 import threading
 import time
@@ -132,6 +131,15 @@ def sim_process_main(cmd_conn, model_queue):
 
     Exits cleanly on ("quit",) or on cmd_conn EOF (the parent died), or
     on a crash (after sending ("crash", traceback))."""
+    # Headless: MUST be set before pygame is first imported in THIS
+    # process. Set here (the child-only entry point), NOT at module
+    # level: the render process imports this module (for sim_process_main)
+    # and a module-level setdefault would force the DUMMY video driver on
+    # the parent too — the host window would init headless (the game runs,
+    # but there is no window). SDL reads the driver at pygame.init() time,
+    # so setting it here (before the import below) is safe.
+    os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+    os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
     import pygame
     pygame.init()
     pygame.display.set_mode((1, 1))   # dummy display for Surfaces/Vector2

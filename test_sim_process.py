@@ -769,9 +769,18 @@ def test_m3_host_e2e():
         created_games.append(self)
         orig_draw = self.draw
         self._test_draw_from_model = 0
+        # Regression gate for the "berserk host" bug: after the first
+        # model arrives, the host must NEVER draw None (a None draw falls
+        # through to draw() building a model from the never-stepped SHELL
+        # — frozen at spawn — so the host flickers between the live world
+        # and the spawn world on every 0-model frame). Pre-first-model
+        # None draws are expected (the shell's construction state).
+        self._test_draw_none_after_model = 0
         def counting_draw(dt, model=None):
             if model is not None:
                 self._test_draw_from_model += 1
+            elif self._test_draw_from_model > 0:
+                self._test_draw_none_after_model += 1
             return orig_draw(dt, model)
         self.draw = counting_draw
     Game.__init__ = patched_init
@@ -914,6 +923,16 @@ def test_m3_host_e2e():
               "received non-None models)",
               shell._test_draw_from_model > 30,
               "n=%d" % shell._test_draw_from_model)
+        # Regression gate for the "berserk host" bug: after the first model
+        # arrives, the host must never draw None (a None draw falls through
+        # to draw() building a model from the never-stepped SHELL — frozen
+        # at spawn — so the host flickers between the live world and the
+        # spawn world on every 0-model frame). Pre-first-model None draws
+        # are expected (the shell's construction state).
+        check("M3e2e: the host never drew the frozen shell after the first "
+              "model (no None draws post-model)",
+              shell._test_draw_none_after_model == 0,
+              "n=%d" % shell._test_draw_none_after_model)
 
     check("M3e2e: the sim process was spawned", len(created_procs) == 1,
           "n=%d" % len(created_procs))

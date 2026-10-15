@@ -399,6 +399,17 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
         # The render thread's own interpolation clock (the sim's acc/STEP
         # is no longer the render thread's — see the class docstring).
         render_clock = _HostRenderClock()
+        # The newest model the render thread has (PERSISTENT — mirrors the
+        # in-process path's sim_thread.latest_model). The drain returns the
+        # newest model drained THIS frame, or None on a frame where the sim
+        # published nothing new (the render thread wakes less often than the
+        # sim's 60 Hz whenever the draw is slower than 60 FPS). Drawing `None`
+        # would fall through to draw() building a model from the never-stepped
+        # SHELL (frozen at spawn) — the host would flicker between the live
+        # world and the spawn world on every 0-model frame (the "berserk"
+        # glitch). So we keep the last model and always draw the freshest
+        # world we have.
+        last_model = None
         # Host-side frame-rate telemetry (F3-toggled). The send moved to
         # the worker, so the telemetry runs on its OWN real-time timer in
         # the main loop (it measures the host's FRAME rate — a
@@ -520,6 +531,8 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
                         ["SIM CRASHED", str(_sim_err).splitlines()[0]])
                 return
             _models_window += 1 if model is not None else 0
+            if model is not None:
+                last_model = model
             # M4: route the wire messages to the NetWorker (the in-process
             # sim-thread hand-off, replaced by one pipe hop — plan E.3).
             # The worker serializes + sends each the moment it lands on its
@@ -539,8 +552,10 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
             if sfx_events:
                 sfx.play_sfx(sfx_events)
             # Compute the render thread's own interpolation alpha from
-            # the newest piped model (see _HostRenderClock).
-            alpha = render_clock.advance(dt, model)
+            # the newest model we have (see _HostRenderClock). last_model
+            # (not the per-frame drain) so a 0-model frame still advances
+            # the clock off the freshest world, not the frozen shell.
+            alpha = render_clock.advance(dt, last_model)
             # The per-frame sim-clock diagnostic (F3-toggled, additive)
             # reads the published model + the render thread's alpha. One
             # line per frame: t (wall clock), raw_dt (real frame time),
@@ -555,7 +570,7 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
                     game._dbg_sim_log_f = f
                 f.write("%.3f,%.4f,%.4f,%.4f,%.4f\n" % (
                     time.time(), raw_dt, dt,
-                    model["sim_time"] if model else 0.0, alpha))
+                    last_model["sim_time"] if last_model else 0.0, alpha))
             # Host-side frame-rate telemetry (F3-toggled), on its OWN real-time
             # timer (the send moved to the worker, so it no longer rides
             # the send). One line per 100 ms, mirroring the client's
@@ -591,16 +606,26 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
                     _models_window = 0
                     f.write("%.3f,%.4f,%.1f,%.4f,%d,%d,%d\n" % (
                         time.time(),
-                        model["sim_time"] if model else 0.0,
+                        last_model["sim_time"] if last_model else 0.0,
                         fps, dt_max, hic, n, steps))
                     f.flush()
-            # Draw the PUBLISHED model (draw(dt, model) — the model is built by
-            # the sim thread, not here), with the render thread's OWN
+            # Draw the newest model we have (draw(dt, model) — the model is built by
+            # the sim process, not here), with the render thread's OWN
             # interpolation alpha (the sim's acc/STEP is no longer the
             # render thread's — see the _HostRenderClock docstring). The
             # model still carries the sim's step_alpha (the parity tests
             # read it); draw() uses the render thread's instead.
-            game.draw(dt, {**model, "step_alpha": alpha} if model else None)
+            #
+            # last_model (PERSISTENT), not the per-frame drain: on a frame
+            # where the drain returned None (the sim published nothing new
+            # since the last frame — common when the draw is slower than
+            # 60 FPS), we still draw the freshest world we have. Drawing
+            # None would fall through to draw() building a model from the
+            # never-stepped SHELL (frozen at spawn) — the host would
+            # flicker between the live world and the spawn world on every
+            # 0-model frame (the "berserk" glitch). Mirrors the in-process
+            # path's persistent sim_thread.latest_model.
+            game.draw(dt, {**last_model, "step_alpha": alpha} if last_model else None)
             pygame.display.flip()
     finally:
         if getattr(game, "_dbg_log_f", None) is not None:

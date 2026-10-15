@@ -18,6 +18,7 @@ import os
 import queue as _queue
 import socket
 import sys
+import threading
 import time
 
 import pygame
@@ -109,20 +110,26 @@ def _drain_sim_model(sim_model_q):
     be starved by the draw's GIL hold, the queue would fill, and the sim
     process would block).
 
-    Returns (newest_model, sfx_events):
+    Returns (newest_model, sfx_events, wire_msgs):
       * newest_model — the NEWEST model drained this call (latest-wins,
-        for drawing). None if the queue was empty this frame.
+        for drawing). None if no model was drained this frame.
       * sfx_events — the CONCATENATED "sfx" list from EVERY model drained
         this call, in arrival order. The render process plays ALL of them
         (not just the newest model's) — a stale model's sfx would
         otherwise be lost when only the newest is kept for drawing
         (plan_12 D.1).
+      * wire_msgs — the wire messages drained this call, in arrival order
+        (M4): ("snap", sim_time, snap) / ("beam", msg) / ("echo", msg).
+        The render process routes each to the NetWorker (worker.
+        publish_snapshot / worker.send) — the in-process sim-thread
+        hand-off replaced by one pipe hop (plan E.3).
 
     Raises RuntimeError on a ("crash", tb) message (the sim process died —
     the caller shows a notice and returns to the menu). "ready" / "done"
     are lifecycle messages, not models; ignored here."""
     newest = None
     sfx_events = []
+    wire_msgs = []
     while True:
         try:
             m = sim_model_q.get_nowait()
@@ -132,9 +139,11 @@ def _drain_sim_model(sim_model_q):
         if kind == "model":
             newest = m[1]
             sfx_events.extend(m[1].get("sfx", ()))
+        elif kind in ("snap", "beam", "echo"):
+            wire_msgs.append(m)
         elif kind == "crash":
             raise RuntimeError("SIM CRASHED:\n" + m[1])
-    return newest, sfx_events
+    return newest, sfx_events, wire_msgs
 
 
 def _lan_ip():
@@ -292,7 +301,15 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
         # sim_process by name — sim_process_main is a top-level function).
         _sim_ctx = multiprocessing.get_context("spawn")
         sim_cmd, _sim_child_conn = _sim_ctx.Pipe()   # render -> sim
-        sim_model_q = _sim_ctx.Queue(maxsize=4)      # sim -> render
+        # The sim -> render channel. M4 rides the wire messages (snap/
+        # beam/echo) on the SAME bounded queue as the render model, so
+        # maxsize=4 (sized for models alone) is too small: the child
+        # publishes a model + a snap (+ beam/echo) per step, and a busy
+        # draw frame would drop wire messages. 16 holds ~2 steps of
+        # traffic — a dropped snapshot is a network loss the client's
+        # interpolation buffer already handles, so drop-when-full stays
+        # the right semantics (just with more headroom).
+        sim_model_q = _sim_ctx.Queue(maxsize=16)     # sim -> render
         sim_proc = _sim_ctx.Process(target=sim_process_main,
                                     args=(_sim_child_conn, sim_model_q))
         sim_proc.start()
@@ -339,20 +356,31 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
         # The client's input is applied by the WORKER thread the moment it
         # lands, NOT polled off the render thread once per frame. The
         # worker drains the socket every ~1 ms, so the input reaches the
-        # sim within ~1 ms. M4 moves the apply to the sim process: the
-        # sink sends ("remote_input", ShipInput) over the command Pipe
-        # (the sim process swaps game.remote_input — exactly what the
-        # in-process game.set_remote_input did). Until M4 the sink applies
-        # it to the SHELL's remote_input, which the sim never reads — a
-        # no-op placeholder (the client's ship idles; a live network
-        # client is M4's job). The sink ALSO reflects the T_PONG here
-        # (worker thread, ~1 ms) — worker.send() is a thread-safe queue
-        # put — because a render-thread reflection would add a full frame
-        # (~21 ms) to the measured RTT and inflate the client's
-        # one-way-latency estimate. The sink returns True (consumed) so
-        # the T_INPUT is not also queued for the main thread.
+        # sim within ~1 ms. M4: the sink sends ("remote_input", ShipInput)
+        # over the command Pipe (the sim process swaps game.remote_input —
+        # exactly what the in-process game.set_remote_input did; _step
+        # reads it each tick and applies it to player 1). The sink ALSO
+        # reflects the T_PONG here (worker thread, ~1 ms) — worker.send()
+        # is a thread-safe queue put — because a render-thread reflection
+        # would add a full frame (~21 ms) to the measured RTT and inflate
+        # the client's one-way-latency estimate. The sink returns True
+        # (consumed) so the T_INPUT is not also queued for the main thread.
+        #
+        # SEND-SIDE LOCK: the command Pipe has TWO senders in this process
+        # — the main (render) thread (input/command/quit) and the WORKER
+        # thread (this sink's remote_input). A Pipe's send is a 4-byte
+        # length prefix + payload; two concurrent senders would interleave
+        # them and corrupt the stream. The lock serializes the sends.
+        # (The sim process's own cmd_lock guards its RECV side; this
+        # guards the SEND side — the two live in different processes.)
+        _sim_cmd_lock = threading.Lock()
+
+        def _sim_cmd_send(msg):
+            with _sim_cmd_lock:
+                sim_cmd.send(msg)
+
         def _client_input_sink(m):
-            game.set_remote_input(deserialize_input(m["inp"]))
+            _sim_cmd_send(("remote_input", deserialize_input(m["inp"])))
             if "tag" in m:
                 worker.send({"type": T_PONG, "tag": m["tag"]})
             return True
@@ -407,9 +435,11 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
         game._dbg_sim_log_f = None
         # T/V/G/R/F -> the sim process (the command Pipe). The sim process
         # applies the command at the top of its next iteration (the pipe
-        # analog of the in-process sim_thread.command queue).
+        # analog of the in-process sim_thread.command queue). Sends go
+        # through _sim_cmd_send (the send-side lock — the worker thread's
+        # input sink sends on the same Pipe; see the lock's comment).
         def _sim_command(name, arg=None):
-            sim_cmd.send(("command", name, arg))
+            _sim_cmd_send(("command", name, arg))
         # Models drained since the last telemetry line (the host CSV's
         # `steps` column — the snapshot cadence as seen by the render
         # thread; the child-side per-step stamps are the authoritative
@@ -439,12 +469,12 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
                 return
             keys = pygame.key.get_pressed()
             # Poll the client. The client's input is applied by the WORKER thread
-            # the moment it lands (worker.set_input_sink, above — a
-            # reference swap on game.remote_input, race-free because the
-            # sim thread only READS it); the worker drains the socket
-            # every ~1 ms, so the input reaches the sim within ~1 ms.
-            # T_INPUT is consumed by the sink (not re-queued), so it
-            # never reaches this poll.
+            # the moment it lands (worker.set_input_sink, above — the
+            # sink sends ("remote_input", ...) over the command Pipe; the
+            # sim process swaps game.remote_input, which _step only READS
+            # each tick); the worker drains the socket every ~1 ms, so
+            # the input reaches the sim within ~1 ms. T_INPUT is consumed
+            # by the sink (not re-queued), so it never reaches this poll.
             for m in worker.poll():
                 if m.get("type") == T_INPUT:
                     # UNREACHABLE in the current wiring — the sink
@@ -463,7 +493,7 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
                     # The client's dead player asks to respawn. The
                     # client is player 1; the sim process applies it (a
                     # no-op unless that ship is actually dead).
-                    sim_cmd.send(("command", "respawn", 1))
+                    _sim_cmd_send(("command", "respawn", 1))
             # The worker owns the socket now — read worker.closed (the worker
             # mirrors conn.closed) and never touch conn.* here. The
             # worker also does the drain_send() (off the render thread).
@@ -478,17 +508,30 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
             # drained sfx, and draw the shell from the newest model. `dt`
             # (clamped) drives draw() + the render clock — presentation
             # only.
-            sim_cmd.send(("input", ShipInput.from_keys(keys)))
-            # Drain the model Queue (latest-wins) + collect the sfx. A
-            # crash message raises (the sim process died) — caught below
-            # (notice + return to the menu; the finally shuts it down).
+            _sim_cmd_send(("input", ShipInput.from_keys(keys)))
+            # Drain the model Queue (latest-wins) + collect the sfx + the
+            # wire messages. A crash message raises (the sim process died)
+            # — caught below (notice + return to the menu; the finally
+            # shuts it down).
             try:
-                model, sfx_events = _drain_sim_model(sim_model_q)
+                model, sfx_events, wire_msgs = _drain_sim_model(sim_model_q)
             except RuntimeError as _sim_err:
                 _notice(screen, font, big_font, clock,
                         ["SIM CRASHED", str(_sim_err).splitlines()[0]])
                 return
             _models_window += 1 if model is not None else 0
+            # M4: route the wire messages to the NetWorker (the in-process
+            # sim-thread hand-off, replaced by one pipe hop — plan E.3).
+            # The worker serializes + sends each the moment it lands on its
+            # own thread, so the snapshot's age at send stays ~0 (the
+            # client's `now = sim_time + L` is exact). A dropped snapshot
+            # (the bounded queue filled) is a network loss the client's
+            # interpolation buffer already handles.
+            for wm in wire_msgs:
+                if wm[0] == "snap":
+                    worker.publish_snapshot(wm[1], wm[2])
+                else:   # "beam" / "echo" — the msg dict is wm[1]
+                    worker.send(wm[1])
             # Play the drained sfx (plan_12 D.1): the sim process is
             # silent (sound=None), so its presentation sounds arrive as
             # the model's "sfx" list and play HERE, via the host's own

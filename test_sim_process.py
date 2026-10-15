@@ -19,6 +19,11 @@ Three tests:
        process is spawned (6-arg setup), the shell is drawn from the
        piped model, the host's SoundBank plays the model's sfx, and the
        sim process is shut down cleanly on exit. See test_m3_host_e2e.
+  M4 — the network bridge (in the M3 e2e): the fake client drives its
+       ship with REAL input (a constant turn) and the test verifies the
+       client -> worker -> command Pipe -> sim -> model path (player 1
+       turns in the host's models) AND the sim -> render -> worker ->
+       client wire bridge (snapshots + input echoes reach the client).
 
 WHY THIS TEST
 The residual ~8 px snap tail is host-side: the host's render thread holds
@@ -689,12 +694,13 @@ def test_m3_hulls_and_sfx():
 # the sim down cleanly on exit.
 #
 # The fake client is a REAL TCP connection: it sends the join handshake
-# (its hull crosses the wire -> the 6-arg setup) and then idle T_INPUT
-# messages (the client's input reaches the sim only in M4 — until then the
-# worker's sink applies it to the shell's remote_input, a no-op
-# placeholder). The host's OWN input is test-driven (pygame.key.get_pressed
-# is patched to hold W+SPACE) so the sim actually does something
-# (thrust + fire -> sfx events -> the host's SoundBank).
+# (its hull crosses the wire -> the 6-arg setup) and then T_INPUT messages
+# carrying a REAL turn (M4: the client's input reaches the sim — the
+# worker's sink forwards it as ("remote_input", ...) over the command
+# Pipe, and the sim applies it to player 1). The host's OWN input is
+# test-driven (pygame.key.get_pressed is patched to hold W+SPACE) so the
+# sim actually does something (thrust + fire -> sfx events -> the host's
+# SoundBank).
 #
 # Checks:
 #   * the host loop runs + exits cleanly (no exception, no hang);
@@ -704,7 +710,10 @@ def test_m3_hulls_and_sfx():
 #     pose — the standin is synced from the model pack inside draw());
 #   * the host's SoundBank played the model's sfx (thruster on + laser
 #     blips — the D.1 bridge, end to end);
-#   * the worker is alive: the fake client's tagged T_INPUT got a T_PONG.
+#   * the worker is alive: the fake client's tagged T_INPUT got a T_PONG;
+#   * M4: the client's REAL input reached the sim (player 1's angle
+#     changed in the host's models) and the wire bridge delivered
+#     snapshots + input echoes to the client.
 
 M3_E2E_RUN_S = 3.5          # how long the host runs before the QUIT
 
@@ -788,6 +797,21 @@ def test_m3_host_e2e():
         return orig_play_sfx(events)
     sfx.play_sfx = tracking_play_sfx
 
+    # --- capture the host's models (M4: verify the client's input reaches
+    #     the sim — player 1's angle must change as the fake client turns)
+    #     + the wire messages the fake client receives (snap/beam/echo —
+    #     the sim->render->worker->client bridge). ---
+    from . import __main__ as M
+    host_models = []
+    orig_drain = M._drain_sim_model
+    def tracking_drain(q):
+        res = orig_drain(q)
+        model = res[0]
+        if model is not None:
+            host_models.append(model)
+        return res
+    M._drain_sim_model = tracking_drain
+
     # --- the fake client (a real TCP connection) ---
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind(("127.0.0.1", 0))
@@ -795,6 +819,7 @@ def test_m3_host_e2e():
     s.close()
 
     pongs = []
+    wire_seen = []          # wire messages the client received (M4 bridge)
     client_err = []
     client_stop = threading.Event()
     def fake_client():
@@ -806,14 +831,22 @@ def test_m3_host_e2e():
             do_handshake_client(conn, serialize_hull(client_hull),
                                 serialize_loadout(default_loadout(client_hull)))
             tag = 0
+            # M4: drive the client's ship with REAL input (a constant turn)
+            # instead of the M3 idle no-op. The host's worker sink sends it
+            # to the sim process as ("remote_input", ...); the sim applies
+            # it to player 1, so p1's angle must change (verified against
+            # the host's models below).
+            turn_inp = serialize_input(ShipInput(turn=1.0))
             while not client_stop.is_set():
                 tag += 1
-                conn.send({"type": T_INPUT, "inp": serialize_input(ShipInput()),
-                           "tag": tag})
+                conn.send({"type": T_INPUT, "inp": turn_inp, "tag": tag})
                 conn.drain_send()
                 for m in conn.poll():
-                    if m.get("type") == T_PONG:
+                    t = m.get("type")
+                    if t == T_PONG:
                         pongs.append(m.get("tag"))
+                    elif t in ("snap", "beam", "echo"):
+                        wire_seen.append(t)
                 time.sleep(0.1)
             conn.close()
         except Exception as e:
@@ -855,6 +888,7 @@ def test_m3_host_e2e():
     Game.__init__ = orig_init
     multiprocessing.get_context = orig_get_context
     sfx.play_sfx = orig_play_sfx
+    M._drain_sim_model = orig_drain
 
     # --- verify -----------------------------------------------------------
     def check(label, cond, extra=""):
@@ -907,6 +941,44 @@ def test_m3_host_e2e():
 
     check("M3e2e: the worker is alive (the client's tagged input got a "
           "T_PONG)", len(pongs) >= 1, "pongs=%d" % len(pongs))
+
+    # --- M4: the client's REAL input reaches the sim (player 1 responds) ---
+    # The fake client sends a constant turn (ShipInput(turn=1.0)) every
+    # 100 ms. The host's worker sink forwards it to the sim process as
+    # ("remote_input", ...); the sim applies it to player 1 each tick, so
+    # p1's angle must change across the run (verified against the host's
+    # OWN models — the same data the host draws from). This is the M4
+    # upgrade of the M3 e2e (whose fake client sent idle input as a no-op
+    # placeholder): it proves the client -> worker -> Pipe -> sim -> model
+    # path end to end, the way the M2 pipe test does in-process.
+    if host_models:
+        a0 = host_models[0]["players"][1]["angle"]
+        a1 = host_models[-1]["players"][1]["angle"]
+        # The ship's angle is UNBOUNDED (it accumulates forever — see
+        # Ship.snapshot), so the TOTAL turn is the raw difference, NOT a
+        # wrapped delta (a wrapped delta would lose the full rotations —
+        # the client held turn=1.0 for the whole run, ~2 rotations).
+        d = abs(a1 - a0)
+        check("M4: the client's input reached the sim (player 1 turned "
+              "in the host's models)", d > 0.5,
+              "dangle=%.3f rad over %d models" % (d, len(host_models)))
+        print("  [M4] p1 angle: %.3f -> %.3f (d=%.3f rad, %d models)"
+              % (a0, a1, d, len(host_models)))
+    else:
+        check("M4: the client's input reached the sim (player 1 turned "
+              "in the host's models)", False, "no host models captured")
+
+    # --- M4: the wire bridge delivered snapshots (sim -> render -> worker
+    #     -> client). The fake client records every snap/beam/echo it
+    #     receives; snapshots must arrive (the client's ghost seeds from
+    #     them) and echoes must flow (the host applied the client's input
+    #     each tick and echoed it back — the input path, end to end). ---
+    wire_kinds = set(wire_seen)
+    check("M4: the client received snapshots over the wire (bridge)",
+          "snap" in wire_kinds, "kinds=%r n=%d"
+          % (sorted(wire_kinds), len(wire_seen)))
+    check("M4: the client received input echoes over the wire",
+          "echo" in wire_kinds, "kinds=%r" % sorted(wire_kinds))
 
     return ok
 
@@ -976,11 +1048,14 @@ def main():
     ok &= test_m3_hulls_and_sfx()
 
     # M3 e2e: the REAL run_host with a fake client over loopback (spawn +
-    # 6-arg setup + drain/draw the shell + play the sfx + clean shutdown).
-    print("\nM3 e2e: the real run_host + a fake client over loopback")
+    # 6-arg setup + drain/draw the shell + play the sfx + clean shutdown),
+    # now including the M4 network-bridge checks (the client's REAL input
+    # reaches the sim; snapshots + echoes reach the client over the wire).
+    print("\nM3 e2e: the real run_host + a fake client over loopback "
+          "(+ M4 network bridge)")
     ok &= test_m3_host_e2e()
 
-    print("\nSIM PROCESS (M1+M2+M3):", "ALL PASS" if ok else "FAILURES")
+    print("\nSIM PROCESS (M1+M2+M3+M4):", "ALL PASS" if ok else "FAILURES")
     raise SystemExit(0 if ok else 1)
 
 

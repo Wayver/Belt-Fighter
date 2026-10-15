@@ -386,6 +386,136 @@ Pipe commands / bounded drop-when-full Queue models / same-thread drain /
 child-side cadence / headless sim process: all untouched. No NetWorker or
 wire-protocol change (M4).
 
+## M4 RESULT (done — full 2P end-to-end over the network bridge)
+
+The sim's wire traffic now rides the model Queue to the render process,
+which forwards it to the NetWorker. Full 2P plays end to end: the client's
+"syncing to authoritative sim" clears, its input reaches the sim, and
+snapshots/beams/echoes flow. `test_network` is GREEN (it failed by design
+in M3 — no snapshots reached the client).
+
+### Part 1 — sim -> render wire messages (`sim_process.py`)
+`_Worker` (the SimThread's worker stub) now takes the model Queue and
+forwards: `publish_snapshot(sim_time, snap)` -> `("snap", sim_time, snap)`
+(still recording the child-side stamp), `send(msg)` -> `("beam", msg)` /
+`("echo", msg)` by `msg["type"]`. All via `put_nowait` (drop-when-full —
+a dropped snapshot is a network loss the client's interpolation buffer
+already handles). The `SimThread` call sites are UNCHANGED (verified:
+`publish_snapshot` per step, `_beam_events` drain -> T_BEAM,
+`flush_remote_input_echo()` -> T_ECHO).
+
+### Part 2 — render drain routes the wire messages (`__main__.py`)
+`_drain_sim_model` now returns `(newest_model, sfx_events, wire_msgs)`;
+the game loop routes each: `("snap", t, snap)` ->
+`worker.publish_snapshot(t, snap)` (thread-safe put; the worker
+serializes + sends on its own thread the moment it lands — age at send
+~0), `("beam"/"echo", msg)` -> `worker.send(msg)`. The in-process
+sim-thread hand-off is replaced by one pipe hop (E.3). The model Queue
+grew maxsize 4 -> 16: the child now publishes a model + a snap (+
+beam/echo) per step, so 4 (sized for models alone) would drop wire
+messages on a busy draw frame. Drop-when-full semantics unchanged.
+
+### Part 3 — worker input sink -> sim (`__main__.py`)
+`_client_input_sink` (worker thread) now sends
+`("remote_input", deserialize_input(m["inp"]))` over the command Pipe
+instead of the no-op `game.set_remote_input`. The T_PONG reflection STAYS
+in the sink (worker thread, ~1 ms — a render-thread reflection would add
+a full frame to the measured RTT). SEND-SIDE LOCK: the command Pipe now
+has TWO senders in the render process (the main thread's input/command/
+quit + the worker thread's remote_input); `_sim_cmd_lock` serializes them
+(two concurrent senders would interleave the Pipe's 4-byte length
+prefixes). The sim process's `cmd_lock` guards its RECV side (M3,
+unchanged). Shutdown ordering (E.6) already correct: the finally stops
+the worker BEFORE quitting the sim (the sink writes the Pipe, which must
+not be written after the sim is gone).
+
+### Part 4 — lifecycle
+`ready`/`crash` were already handled (M3). `game_over` needs NO new
+message: in 2P the flag is never set (only single player sets it —
+`game.py` per-player death), and the client reads it from the snapshot
+tuples (index 7) it already receives. Verified: no client-side
+game_over handling exists beyond the snapshot field.
+
+### test_network: host-side checks re-pointed to the wire
+Three checks read the host's LIVE Game state — but since M3 the host's
+Game is a never-stepped SHELL (the authoritative sim is in the separate
+process), so those reads were stale (frozen at spawn / sim_time 0).
+Re-pointed to the WIRE (the client's buffer — the correct M4 way to
+verify host-authoritative state):
+- 7.1 "client sim_time tracks the host's sim clock": host.sim_time ->
+  `client.snap_buf.newest_time()` (the newest snapshot stamp — the same
+  stamps the estimator fits).
+- "host's player 1 (client's ship) moved" (CORE): host.players[1].pos ->
+  the newest snapshot's ships[1] (the client's ship, matched by index).
+- 7.2 "newest snapshot enemy angle is fresh vs host": the host's LIVE
+  final angle is no longer measurable from the client (the newest
+  snapshot IS the host's final state — the sim publishes every step), so
+  it became a wire-based sanity check (every newest-snapshot enemy angle
+  is finite; the in-span check still catches off-arc garbage).
+
+### test_network: the leaked-QUIT fix (the alternating "Game built" failure)
+The 2nd and 4th runs failed "Game built" (both peers, no exceptions, both
+loops exited) — a DETERMINISTIC alternating pattern, not flakiness. Root
+cause: the stop loop posts a QUIT every 50 ms while a thread is
+is_alive(), but the threads spend their shutdown in `finally` blocks
+(not polling events) — and M4's host finally includes the sim-process
+shutdown (quit + join(timeout=2)), a longer window than M3's worker-only
+stop. The unpolled QUITs accumulate in the GLOBAL pygame event queue
+(all 5 runs share one display); the next run's thread picks them up on
+its first `pygame.event.get()` and returns before building a Game. Runs
+that fail exit fast (no sim spawned -> short finally -> no leak), which
+is why it alternates. Measured: 39-40 leaked QUITs after each run. Fix:
+`pygame.event.clear()` at the start of each run (test-harness artifact —
+5 game loops sharing one global event queue; real peers are separate
+processes with separate queues).
+
+### Verification (all pass)
+- **`python -m ship5.test_network`** — GREEN (exit 0). All 5 runs
+  (clean + 40ms jitter + snap loss + 100ms stall + 7.5b jitter) ALL
+  PASS: the client's snapshot/ghost/render-point checks that failed by
+  design in M3 now pass (ghost seeded, >=2 snapshots, render point,
+  buffer ships/enemies/bullets, ghost fires, player 1 moved 1.5-2.8k px).
+- **`python -m ship5.test_sim_process`** — M1 A/B + M2 + M3 pipe + the
+  UPDATED M3 e2e (M4): the fake client now drives its ship with REAL
+  input (a constant turn) and the test verifies (a) the client's input
+  reached the sim (player 1 turned 12.1 rad in the host's models — the
+  client -> worker -> Pipe -> sim -> model path) and (b) the wire bridge
+  delivered snapshots + input echoes to the client (353 snap/echo
+  messages).
+- **`python -m ship5.test_render_model`** — M1 parity + M3 shell audit
+  (S1/S2/S3) all pass.
+- **No regression**: test_sim_thread, test_snapshot, test_determinism,
+  test_m2b_local all pass.
+- **F3 telemetry** (`tools/dbg_f3_capture2.py` — host in a separate
+  process, the real 2-machine topology; client in the parent):
+  - client `newest_stamp` delta: mean 16.8 ms, **99.1% one-tick (17 ms)**,
+    0.9% two-tick, 0 above 40 ms (pre-fix: 12.5% 33 ms jumps, 90% of
+    which caused big snaps).
+  - `snap_px`: median **0.000**, p95 **0.000**, max 8.7, **>=3 px tail
+    2/697 (0.29%)** (pre-fix: 364/3080 = 11.8%, p95 7.2 px).
+  - host per-iteration steps == 1.0: the AUTHORITATIVE measure is the
+    child-side stamp cadence (M1: 180/180 gaps exactly 16.7 ms, 0%
+    batched, 1.00x) + the client-side newest_stamp delta (99.1% 17 ms).
+    The host_debug.csv `steps` column (render-thread model-drain count)
+    reflects the RENDER loop's frame rate, not the sim's step rate — in
+    this headless env the draw is slow (~35 FPS) so the drain picks up
+    2 models per frame; that is the beat-frequency artifact M1 warned
+    about, not sim batching.
+- **Manual (two machines)**: the remaining human-in-the-loop
+  confirmation (host + client on two machines — the client's "syncing to
+  authoritative sim" clears, both ships move, beams/explosions/SFX on
+  both sides). The headless e2e (test_network + the F3 capture) covers
+  the same paths over loopback.
+
+### Locked decisions — none changed
+Pipe commands / bounded drop-when-full Queue models (now maxsize 16 —
+an extension of the locked channel, not a redesign) / same-thread drain /
+child-side cadence / headless sim process: all untouched. No wire-protocol
+or client-side change (the T_SNAP/T_BEAM/T_ECHO/T_INPUT shapes are
+unchanged — M4 only moved WHO sends them: from the in-process sim thread
+to the sim process, via the pipe). No NetWorker change (publish_snapshot
+/ send are the same thread-safe puts the in-process sim thread used).
+
 ## G. Risks
 
 | Risk | Likelihood | Mitigation |

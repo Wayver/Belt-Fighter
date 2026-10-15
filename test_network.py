@@ -103,7 +103,7 @@ import time
 import pygame
 
 from .config import (WIDTH, HEIGHT, FPS, INTERP_DELAY, INTERP_DELAY_MIN,
-                     INTERP_DELAY_MAX, ROT_SPEED)
+                     INTERP_DELAY_MAX)
 from .fog import make_light_texture
 from .game import Game, STEP
 from .hulls import PLAYER_HULLS, default_loadout
@@ -283,6 +283,19 @@ def run(res, impairment=None, label="clean", run_s=3.5):
         except Exception as e:
             errors.append("client: %r" % e)
 
+    # Drain any QUIT (or other) events LEFT IN THE GLOBAL pygame event
+    # queue by the PREVIOUS run. The stop loop posts a QUIT every 50 ms
+    # while a thread is is_alive(), but the threads spend their shutdown
+    # in `finally` blocks (not polling events) — and M4's host finally
+    # includes the sim-process shutdown (quit + join(timeout=2)), a longer
+    # window than M3's worker-only stop. During that window the stop loop
+    # keeps posting QUITs that no thread polls, so they accumulate in the
+    # GLOBAL queue (all 5 runs share one display/event queue). The next
+    # run's thread would pick them up on its first pygame.event.get() and
+    # return before building a Game (the alternating "Game built" failure).
+    # Draining here makes each run start from a clean queue.
+    pygame.event.clear()
+
     # Start the host first and give it a moment to bind+listen before the
     # client connects (avoids a connection-refused race on loopback).
     th_host = threading.Thread(target=host_side, daemon=True)
@@ -362,15 +375,24 @@ def run(res, impairment=None, label="clean", run_s=3.5):
         # the two loops run under thread contention, so the host may
         # simulate slower than real time, and the estimator's rate term
         # must follow that (a wall-clock clock would drift away).
-        if host is not None:
-            d = abs(client.sim_time - host.sim_time)
+        #
+        # M4: the host's authoritative sim runs in a SEPARATE PROCESS —
+        # the host's Game here is a never-stepped SHELL (its sim_time is
+        # frozen at 0), so the host's sim clock is read from the WIRE:
+        # the newest snapshot stamp the client received (the same stamps
+        # the estimator fits). The check becomes "the client's estimate
+        # tracks the host's ACTUAL published clock" — the same intent as
+        # 7.1, read end to end.
+        host_sim_time = client.snap_buf.newest_time()
+        if host_sim_time is not None:
+            d = abs(client.sim_time - host_sim_time)
             # CLEAN-TUNED: the 0.25 s bound is for a clean loopback. Under
             # impairment the estimator lags (added latency/loss), so this is
             # informational, not a regression signal.
             check("client sim_time tracks the host's sim clock (7.1)",
                   d < 0.25,
-                  "client=%.3f host=%.3f (d=%.3f s)"
-                  % (client.sim_time, host.sim_time, d),
+                  "client=%.3f host(wire)=%.3f (d=%.3f s)"
+                  % (client.sim_time, host_sim_time, d),
                   core=False)
         d = client.ghost.ship.pos.distance_to(
             pygame.Vector2(WIDTH / 2, HEIGHT / 2))
@@ -566,37 +588,29 @@ def run(res, impairment=None, label="clean", run_s=3.5):
                         if ti <= render_t <= tj:
                             s_prev, s_curr = si, sj
                             break
-                # (1) freshness of the newest snapshot's angles
-                if host is not None:
-                    live = {e.ship.id: e for e in host.enemies}
-                    worst = None
+                # (1) sanity of the newest snapshot's enemy angles.
+                # M4: the host's authoritative sim runs in a SEPARATE
+                # PROCESS — the host's Game here is a never-stepped SHELL
+                # (its enemies' angles are frozen at spawn, sim_time=0), so
+                # "fresh vs the host's LIVE final angle" is no longer
+                # measurable from the client. The newest snapshot IS the
+                # host's final authoritative state (the sim publishes a
+                # snapshot every step; the last one is the final state), so
+                # the check becomes a wire-based SANITY check: every enemy
+                # in the newest snapshot carries a FINITE angle (a
+                # dropped/garbage angle — NaN/inf — would fail). The
+                # in-span check (2) below still catches a garbage angle that
+                # is finite but off-arc.
+                if client is not None:
+                    bad = 0
+                    n_ang = 0
                     for _tag, es in sN[1]:
-                        e = live.get(es[2])
-                        if e is None:
-                            continue
-                        d = _wda(es[0][4], e.ship.angle)
-                        if worst is None or d > worst:
-                            worst = d
-                    # Exact bound: the host stepped (host.sim_time - tN)
-                    # after the newest snapshot; the AI steers by feeding
-                    # the ship a full turn input, so the ship rotates at
-                    # ROT_SPEED (3.6 rad/s — the AI's max turn rate), and
-                    # the angle can have moved at most that much. (Under
-                    # thread contention the host may run several ticks
-                    # past the last snapshot before the QUIT is processed,
-                    # so a fixed constant is flaky.)
-                    gap = max(0.0, host.sim_time - tN)
-                    bound = ROT_SPEED * gap + 1e-3
-                    # CLEAN-TUNED: the exact bound assumes the host stepped
-                    # only (host.sim_time - tN) past the newest snapshot.
-                    # Under impairment the newest ARRIVED snapshot can be
-                    # older (loss/stall), so the gap widens and this is
-                    # informational, not a regression signal.
-                    check("newest snapshot enemy angle is fresh vs host (7.2)",
-                          worst is not None and worst < bound,
-                          "worst d=%.4f rad (bound %.4f, gap %.3f s)"
-                          % (worst if worst is not None else -1,
-                             bound, gap),
+                        n_ang += 1
+                        if not math.isfinite(es[0][4]):
+                            bad += 1
+                    check("newest snapshot enemy angles are finite (7.2)",
+                          n_ang > 0 and bad == 0,
+                          "n=%d bad=%d" % (n_ang, bad),
                           core=False)
                 # (2) the buffer angle lies on the bracketing arc
                 prev_ang = {es[2]: es[0][4] for _tag, es in s_prev[1]}
@@ -619,9 +633,18 @@ def run(res, impairment=None, label="clean", run_s=3.5):
                       checked > 0 and in_span,
                       "checked %d enemies" % checked)
 
-    if host is not None:
-        d = host.players[1].pos.distance_to(
-            pygame.Vector2(WIDTH / 2, HEIGHT / 2))
+    # M4: the host's authoritative sim runs in a SEPARATE PROCESS — the
+    # host's Game here is a never-stepped SHELL (its players[1].pos is
+    # frozen at spawn), so "the host applied the client's input" is read
+    # from the WIRE: the newest snapshot's ships[1] (the client's ship,
+    # player 1) position. The client sent W (thrust) every frame; the host
+    # applied it to player 1; the snapshot carried player 1's moved
+    # position; the client's buffer has it. Same intent as before, read
+    # end to end (the shell's players[1].pos would be 0 px — stale).
+    if client is not None and client.snap_buf._snaps:
+        _tN, _sN = client.snap_buf._snaps[-1]
+        _p1 = _sN[0][1]   # ships[1] = the client's ship (player 1)
+        d = math.hypot(_p1[0] - WIDTH / 2, _p1[1] - HEIGHT / 2)
         check("host's player 1 (client's ship) moved (input applied)",
               d > 50.0, "moved %.1f px from spawn" % d)
 

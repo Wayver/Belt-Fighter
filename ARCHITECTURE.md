@@ -39,12 +39,22 @@ re-explaining. History (why a rule changed) lives in git, not here.
   so this is safe. draw() runs in the RENDER process on a shell Game
   (M3).
 - The render->sim command channel is a Pipe (setup / input / command /
-  quit — small, low-rate, ordered). The sim->render model channel is a
-  BOUNDED Queue (maxsize 4) with put_nowait DROP-WHEN-FULL — NOT a Pipe.
-  A Pipe blocks the child's bridge on send() when the render process is
-  busy drawing, and a blocked bridge can't drain commands. Dropping the
-  oldest model when full is latest-wins — exactly what the render thread
-  wants (it draws the newest model, never a stale one).
+  remote_input / quit — small, low-rate, ordered). `remote_input` (M4)
+  carries the CLIENT's input: the worker's input sink (worker thread)
+  sends it the moment a T_INPUT lands, and the sim process swaps
+  `game.remote_input` (the in-process `set_remote_input` reference swap).
+  The command Pipe has TWO senders in the render process (the main
+  thread + the worker thread), so the send side is serialized by a lock
+  (two concurrent senders would interleave the Pipe's 4-byte length
+  prefixes). The sim->render model channel is a BOUNDED Queue (maxsize
+  16 — M4 grew it from 4 because the child now publishes a model + a
+  snap (+ beam/echo) per step) with put_nowait DROP-WHEN-FULL — NOT a
+  Pipe. A Pipe blocks the child's bridge on send() when the render
+  process is busy drawing, and a blocked bridge can't drain commands.
+  Dropping the oldest item when full is latest-wins — exactly what the
+  render thread wants (it draws the newest model, never a stale one); a
+  dropped snapshot is a network loss the client's interpolation buffer
+  already handles.
 - The render loop DRAINS the model queue in the SAME thread as the draw,
   every frame. A separate drain thread would be starved by the draw's
   GIL hold, the queue would fill, and the sim process would block —

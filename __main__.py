@@ -1188,20 +1188,23 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
                         game._snap_log_f.flush()
                 if game.host_time.record(now, m["sim_time"]):
                     game.latency.update(game.host_time.last_jitter)
-                # Reconcile at the ghost's OWN current clock (advanced to
-                # this frame before the poll loop, see the block above):
-                # the reconcile corrects the pose to the snapshot and
-                # replays from the ghost's real time, WITHOUT jumping the
-                # clock to snap_time + rtt_ow (that anchor sat ~3 ms ahead
-                # of the raw clock, so every reconcile jumped the clock
-                # forward -> a ~1.5 px snap). The replay span is
-                # ghost.sim_time - snap_time (~one-way latency — sub-tick
-                # on a LAN, so n=0 in steady state and the render lerp
-                # rebuilds the prediction; the replay fires when the span
-                # is >= 1 tick, e.g. after a hiccup).
+                # Reconcile at the ghost's clock anchored on THIS snapshot's
+                # FRESH anchor — not the once-per-frame game.ghost.sim_time
+                # (advanced before the poll loop, anchored on the PREVIOUS
+                # frame's newest snapshot). record() above just moved the
+                # anchor to this snapshot, and its local_time is exactly
+                # `now`, so host_time.now(now) == m["sim_time"] and the
+                # reconcile span is rtt_ow (positive, sub-tick) for EVERY
+                # snapshot in the burst. The old code passed the frozen
+                # pre-poll clock: in a double-arrival frame the second
+                # snapshot's stamp (16.7 ms ahead) landed AHEAD of that
+                # frozen clock -> negative span -> no replay -> the clock
+                # jumped forward to the stamp -> the ~8.67 px snap. Using
+                # the fresh anchor keeps the span positive on every
+                # reconcile, so the clock never jumps.
                 game.push_snapshot(m["sim_time"],
                                    deserialize_snapshot(m["snap"]),
-                                   now=game.ghost.sim_time,
+                                   now=game.host_time.now(now) + game._rtt_ow,
                                    real_time=now,
                                    rate=game.host_time.rate)
             elif m.get("type") == T_BEAM:

@@ -26,19 +26,28 @@ parent reads model["sim_time"] to measure the cadence. M2 adds input +
 commands + remote input; M3 adds the shell-Game draw + sfx; M4 adds the
 network bridge: the wire traffic (snap/beam/echo) the SimThread hands to
 its worker goes to a DEDICATED net Queue (separate from the model
-Queue), which a dedicated net-pump thread in the render process drains
-and forwards to the NetWorker (the worker serializes + sends it the
-moment it lands — exactly as the in-process sim thread did).
+Queue). plan_13 (Phase 1): that net Queue is drained by the host's
+dedicated NET process (net_process.py) — NOT the render process — and the
+client's input arrives on a DEDICATED remote_input Pipe (net -> sim)
+instead of the command Pipe.
 
-IPC (spawn context — see plan_12 section E):
+IPC (spawn context — see plan_12 section E + plan_13 section 2):
   parent -> child (Pipe, small + low-rate + ordered):
                    ("setup", local_hull, local_loadout, client_hull,
                     client_loadout, seed)   (M3: the real 2P fits; the
                                               plan's original sketch)
                    ("setup", seed, players)  (M1/M2: default hulls, tests)
                    ("input", ShipInput) |
-                   ("command", name, arg) | ("remote_input", ShipInput) |
-                   ("quit",)
+                   ("command", name, arg) | ("quit",)
+  net -> child (Pipe, small + low-rate + ordered — plan_13 Phase 1):
+                   ("remote_input", ShipInput)   (the client's input; the
+                                                  net process forwards it
+                                                  the moment it lands off
+                                                  the socket)
+                   ("command", name, arg)        (e.g. ("command",
+                                                  "respawn", 1) — the net
+                                                  process forwards the
+                                                  client's T_RESPAWN)
   child -> parent, TWO bounded Queues (put_nowait drop-when-full):
     model Queue (render-thread traffic):
                    ("model", render_model_dict)   (60 Hz, on a step)
@@ -57,13 +66,13 @@ IPC (spawn context — see plan_12 section E):
   (out-of-order/late arrivals are dropped there too), so drop-when-full
   is the right semantics for the net Queue as well.
 
-  WHY TWO QUEUES (the M4 redo): the first M4 ride the wire messages on
-  the SAME model Queue, so the render thread's per-frame drain (the same
-  thread as the draw) was in the snapshot's send path — a busy draw
-  delayed or dropped snapshots. The wire traffic now has its own Queue
-  drained by a dedicated net-pump thread (run_host's _NetPump), so the
-  render thread's draw is OUT of the send path. The model Queue is back
-  to models + lifecycle only (maxsize 4).
+  WHY TWO QUEUES: the wire messages (snap/beam/echo) ride a DEDICATED net
+  Queue, NOT the model Queue the render thread drains — so the render
+  thread's draw is OUT of the snapshot's send path. plan_13 (Phase 1):
+  the net Queue is drained by the host's dedicated NET process
+  (net_process.py), which serializes + sends each message the moment it
+  lands (the render process never touches it). The model Queue is models
+  + lifecycle only (maxsize 4).
 
 The child is HEADLESS: sim_process_main sets SDL_VIDEODRIVER/AUDIODRIVER=
 dummy BEFORE pygame is imported (inside the function, so the PARENT —
@@ -87,21 +96,18 @@ class _Worker:
       * publish_snapshot(sim_time, snap) — once per sim step (60 Hz);
       * send(msg) — T_BEAM / T_ECHO wire messages, per stepped iteration.
 
-    M4 (redo): instead of sending to a socket, these are FORWARDED to the
-    parent (render process) over the DEDICATED net Queue as
-    ("snap", sim_time, snap) / ("beam", msg) / ("echo", msg). A dedicated
-    net-pump thread in the render process (run_host's _NetPump) drains
-    that Queue and routes each message to the NetWorker
-    (worker.publish_snapshot / worker.send), which serializes + sends it
-    the moment it lands — the in-process hand-off replaced by one pipe
-    hop (~sub-ms, plan E.3). The net Queue is SEPARATE from the model
-    Queue so the render thread's draw is out of the snapshot's send path
-    (the first M4 rode the wire on the model Queue, and the render
-    thread's per-frame drain delayed/dropped snapshots under a busy draw).
-    put_nowait + drop-when-full: a dropped snapshot is a network loss the
-    client's interpolation buffer already handles (it drops
-    out-of-order/late arrivals too), so this is the right semantics, and
-    the bridge must never block (a blocked bridge can't drain commands).
+    plan_13 (Phase 1): instead of sending to a socket, these are FORWARDED
+    over the DEDICATED net Queue as ("snap", sim_time, snap) / ("beam",
+    msg) / ("echo", msg). The host's dedicated NET process (net_process.py)
+    drains that Queue and serializes + sends each message the moment it
+    lands — the in-process hand-off replaced by one pipe hop (~sub-ms).
+    The net Queue is SEPARATE from the model Queue so the render thread's
+    draw is out of the snapshot's send path (the net process, not the
+    render thread, drains it). put_nowait + drop-when-full: a dropped
+    snapshot is a network loss the client's interpolation buffer already
+    handles (it drops out-of-order/late arrivals too), so this is the
+    right semantics, and the bridge must never block (a blocked bridge
+    can't drain commands).
 
     It ALSO records the sim_time of EVERY publish_snapshot (one per sim
     step) in `stamps` — the child-side snapshot-stamp cadence. This is
@@ -163,41 +169,52 @@ def _build_game(seed, players, local_hull=None, local_loadout=None,
     return g
 
 
-def sim_process_main(cmd_conn, model_queue, net_queue):
+def sim_process_main(cmd_conn, model_queue, net_queue, remote_input_conn):
     """The spawn target (MUST be a top-level function: spawn re-imports
     this module by name to find it). Runs the authoritative sim in this
     process.
 
-    Three channels (all from the spawn context):
+    Four channels (all from the spawn context):
       `cmd_conn`    a Pipe, parent -> child: ("setup", ...) (6-arg M3
                     hulls/loadouts/seed form, or the 3-arg M1/M2
                     seed/players form) | ("input", ShipInput) |
-                    ("command", name, arg) | ("remote_input", ShipInput) |
-                    ("quit",). Small, low-rate, ordered — a Pipe is fine.
+                    ("command", name, arg) | ("quit",). Small, low-rate,
+                    ordered — a Pipe is fine. (plan_13: the client's
+                    input NO LONGER rides this Pipe — it arrives on
+                    `remote_input_conn`.)
       `model_queue` a bounded Queue, child -> parent: the render model
                     (60 Hz) + ("ready",) / ("crash", tb) / ("done", ...).
                     Drained by the RENDER thread (the same thread as the
                     draw — a locked decision).
       `net_queue`   a bounded Queue, child -> parent: the wire messages
-                    (M4: ("snap", sim_time, snap) / ("beam", msg) /
-                    ("echo", msg) — the SimThread's worker hand-off,
-                    forwarded to the render process's NetWorker). Drained
-                    by a DEDICATED net-pump thread in the render process
-                    (run_host's _NetPump) — NOT the render thread, so the
+                    (("snap", sim_time, snap) / ("beam", msg) /
+                    ("echo", msg) — the SimThread's worker hand-off).
+                    Drained by the host's dedicated NET process
+                    (net_process.py) — NOT the render thread, so the
                     draw is out of the snapshot's send path.
                     Both child -> parent Queues are BOUNDED with
-                    put_nowait: when the parent is busy (draw holds the
-                    GIL) a queue fills and the OLDEST items are dropped —
-                    latest-wins, exactly the semantics the render thread
-                    wants (it draws the newest model); a dropped snapshot
-                    is a network loss the client's interpolation buffer
-                    already handles. A Pipe would BLOCK the child's
-                    bridge on send() when the parent is busy, and a
-                    blocked bridge can't drain commands — so both
-                    channels must be drop-on-full, not back-pressure.
+                    put_nowait: when the drain is busy a queue fills and
+                    the OLDEST items are dropped — latest-wins, exactly
+                    the semantics the render thread wants (it draws the
+                    newest model); a dropped snapshot is a network loss
+                    the client's interpolation buffer already handles. A
+                    Pipe would BLOCK the child's bridge on send() when
+                    the drain is busy, and a blocked bridge can't drain
+                    commands — so both channels must be drop-on-full,
+                    not back-pressure.
+      `remote_input_conn` a Pipe, net -> child (plan_13 Phase 1): the
+                    client's input (("remote_input", ShipInput)) +
+                    forwarded commands (("command", name, arg), e.g.
+                    ("command", "respawn", 1) — the net process forwards
+                    the client's T_RESPAWN here). The bridge loop drains
+                    it each iteration (a poll()), exactly like cmd_conn.
+                    An EOF on it (the net process died) is treated like a
+                    cmd_conn EOF (the render process died) — shut down
+                    cleanly.
 
-    Exits cleanly on ("quit",) or on cmd_conn EOF (the parent died), or
-    on a crash (after sending ("crash", traceback))."""
+    Exits cleanly on ("quit",) or on a cmd_conn / remote_input_conn EOF
+    (the render / net process died), or on a crash (after sending
+    ("crash", traceback))."""
     # Headless: MUST be set before pygame is first imported in THIS
     # process. Set here (the child-only entry point), NOT at module
     # level: the render process imports this module (for sim_process_main)
@@ -249,12 +266,37 @@ def sim_process_main(cmd_conn, model_queue, net_queue):
         t_start = time.monotonic()
         # Guard the command Pipe's recv: the bridge loop is the only thread
         # in THIS process that touches the Pipe (the SimThread never does).
-        # The lock is cheap insurance against a future second reader; the
-        # SEND side is guarded in the render process (run_host's
-        # _sim_cmd_lock — the main thread and the worker's input sink both
-        # send on the Pipe, and two concurrent senders would interleave the
-        # Pipe's 4-byte length prefixes and corrupt the stream).
+        # The lock is cheap insurance against a future second reader.
+        # (plan_13: the SEND side has a single sender now — the render
+        # thread; the worker's input sink is gone, the net process forwards
+        # the client's input on the remote_input Pipe.)
         cmd_lock = threading.Lock()
+
+        def _handle_cmd(m):
+            """Apply one command-Pipe message. Returns True on ("quit",)
+            (the caller returns after the "done" report)."""
+            kind = m[0]
+            if kind == "quit":
+                st.stop()
+                # M1 diagnostic: report the child's OWN step count +
+                # sim clock + the per-step snapshot stamps so the
+                # parent can verify the sim ran at 1x real time with a
+                # smooth cadence (child-side — immune to queue
+                # backpressure, which would corrupt a parent-side
+                # model-stream measurement).
+                model_queue.put(("done", st._steps_total, game.sim_time,
+                                 time.monotonic() - t_start,
+                                 worker.stamps))
+                return True
+            elif kind == "input":
+                st.publish_input(m[1])
+            elif kind == "command":
+                st.command(m[1], m[2] if len(m) > 2 else None)
+            # ("remote_input", ...) no longer rides the command Pipe
+            # (plan_13): the client's input arrives on the remote_input
+            # Pipe (net -> sim) and is handled in the loop below.
+            return False
+
         while True:
             # Drain everything the parent sent since last time (input /
             # command / quit). Latest input wins (the SimThread applies
@@ -268,33 +310,32 @@ def sim_process_main(cmd_conn, model_queue, net_queue):
                         # cleanly. No "done" report — there is no parent
                         # left to read it (the finally stops the SimThread).
                         return
-                kind = m[0]
-                if kind == "quit":
-                    st.stop()
-                    # M1 diagnostic: report the child's OWN step count +
-                    # sim clock + the per-step snapshot stamps so the
-                    # parent can verify the sim ran at 1x real time with a
-                    # smooth cadence (child-side — immune to queue
-                    # backpressure, which would corrupt a parent-side
-                    # model-stream measurement).
-                    model_queue.put(("done", st._steps_total, game.sim_time,
-                                     time.monotonic() - t_start,
-                                     worker.stamps))
+                if _handle_cmd(m):
                     return
-                elif kind == "input":
-                    st.publish_input(m[1])
+            # Drain the net process's remote_input Pipe (plan_13 Phase 1):
+            # the client's input (("remote_input", ShipInput)) + forwarded
+            # commands (("command", name, arg), e.g. ("command", "respawn",
+            # 1) — the net process forwards the client's T_RESPAWN here).
+            # remote_input is a reference swap — exactly what the
+            # in-process game.set_remote_input does: _step reads
+            # game.remote_input each tick and applies it to player 1.
+            # ShipInput is a plain dataclass the sim only READS (the
+            # world-cap replace() builds a new object), so the swap is safe
+            # across the process boundary.
+            while remote_input_conn.poll():
+                try:
+                    m = remote_input_conn.recv()
+                except EOFError:
+                    # The net process died (the Pipe is closed): shut down
+                    # cleanly, like a cmd_conn EOF. No "done" report — the
+                    # render process is still alive and notices the net
+                    # process's exit on its own status Pipe.
+                    return
+                kind = m[0]
+                if kind == "remote_input":
+                    game.remote_input = m[1]
                 elif kind == "command":
                     st.command(m[1], m[2] if len(m) > 2 else None)
-                elif kind == "remote_input":
-                    # The CLIENT's input (M4: the render process's NetWorker
-                    # input sink sends it; M2: the test sends it directly).
-                    # A reference swap — exactly what the in-process
-                    # game.set_remote_input does: _step reads
-                    # game.remote_input each tick and applies it to player 1.
-                    # ShipInput is a plain dataclass the sim only READS
-                    # (the world-cap replace() builds a new object), so the
-                    # swap is safe across the process boundary.
-                    game.remote_input = m[1]
             # Publish the newest model (only when it changed — the
             # SimThread publishes on a step, so the model object is
             # stable between steps). put_nowait + drop-when-full: the

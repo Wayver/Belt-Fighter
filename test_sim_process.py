@@ -21,9 +21,10 @@ Three tests:
        sim process is shut down cleanly on exit. See test_m3_host_e2e.
   M4 — the network bridge (in the M3 e2e): the fake client drives its
        ship with REAL input (a constant turn) and the test verifies the
-       client -> worker -> command Pipe -> sim -> model path (player 1
-       turns in the host's models) AND the sim -> render -> worker ->
-       client wire bridge (snapshots + input echoes reach the client).
+       client -> net process -> remote_input Pipe -> sim -> model path
+       (player 1 turns in the host's models) AND the sim -> net process
+       -> client wire bridge (snapshots + input echoes reach the client;
+       plan_13: the NET process owns the socket + the send).
 
 WHY THIS TEST
 The residual ~8 px snap tail is host-side: the host's render thread holds
@@ -190,8 +191,16 @@ def arm_separate_process():
     parent_conn, child_conn = ctx.Pipe()       # parent -> child commands
     model_queue = ctx.Queue(maxsize=4)         # child -> parent models
     net_queue = ctx.Queue(maxsize=16)          # child -> parent wire (M4)
+    # plan_13: the remote_input Pipe (net -> sim). The test has no net
+    # process, so the parent HOLDS the net end (ri_net_end) for the whole
+    # run and never sends on it (the M1 arm has no client input). Keeping
+    # it open is load-bearing: the sim's bridge loop treats an EOF on the
+    # remote_input Pipe (the net process died) as a clean shutdown, so
+    # closing it early would kill the sim. It is closed at the end, after
+    # the sim has exited.
+    ri_sim_end, ri_net_end = ctx.Pipe()
     p = ctx.Process(target=sim_process_main,
-                    args=(child_conn, model_queue, net_queue))
+                    args=(child_conn, model_queue, net_queue, ri_sim_end))
     p.start()
     child_conn.close()   # the parent does not use the child end
     parent_conn.send(("setup", 1234, 2))
@@ -209,10 +218,10 @@ def arm_separate_process():
     # thread reads the newest model) then DRAW (the GIL load). Same
     # thread, every frame. The queue is bounded + drop-on-full, so a
     # busy frame just drops stale models — the child never blocks.
-    # The wire traffic (M4) rides the DEDICATED net queue, drained by a
-    # separate thread in the real run_host (_NetPump); here the render
-    # loop drains it too (the test has no pump thread — draining keeps
-    # the queue from filling and dropping, which is all arm B needs).
+    # The wire traffic (M4) rides the DEDICATED net queue, drained by the
+    # NET process in the real run_host (plan_13); here the render loop
+    # drains it too (the test has no net process — draining keeps the
+    # queue from filling and dropping, which is all arm B needs).
     frame_s = FRAME_MS / 1000.0
     t0 = time.monotonic()
     while time.monotonic() - t0 < RUN_SECONDS:
@@ -257,6 +266,8 @@ def arm_separate_process():
         p.terminate()
         p.join()
     parent_conn.close()
+    ri_sim_end.close()
+    ri_net_end.close()   # the sim has exited; release the net end
     if done is not None:
         _, steps, simt, wall, stamps = done
         print("  [separate-process] CHILD step report: steps=%d sim_time=%.3f "
@@ -344,8 +355,13 @@ def test_m2_input_commands_remote():
     parent_conn, child_conn = ctx.Pipe()
     model_queue = ctx.Queue(maxsize=4)
     net_queue = ctx.Queue(maxsize=16)          # child -> parent wire (M4)
+    # plan_13: the remote_input Pipe (net -> sim). The test plays the net
+    # process's role: it sends the client's input + the respawn command on
+    # the net end (ri_net_end), and the sim applies them (player 1 turns;
+    # the respawn command is a no-op unless the ship is dead).
+    ri_sim_end, ri_net_end = ctx.Pipe()
     p = ctx.Process(target=sim_process_main,
-                    args=(child_conn, model_queue, net_queue))
+                    args=(child_conn, model_queue, net_queue, ri_sim_end))
     p.start()
     child_conn.close()
     parent_conn.send(("setup", 1234, 2))
@@ -372,6 +388,7 @@ def test_m2_input_commands_remote():
             p.terminate()
             p.join()
         parent_conn.close()
+        ri_sim_end.close()
         return ok
 
     # Baseline: with no input, both ships sit at the spawn center. Grab a
@@ -388,6 +405,7 @@ def test_m2_input_commands_remote():
             p.terminate()
             p.join()
         parent_conn.close()
+        ri_sim_end.close()
         return ok
     base_p0 = base["players"][0]
     base_p1 = base["players"][1]
@@ -439,11 +457,14 @@ def test_m2_input_commands_remote():
               % p0["targeting_on"])
 
     # --- 3. REMOTE input drives player 1 ------------------------------
-    # The client's input path: ("remote_input", ShipInput) -> the sim sets
-    # game.remote_input (a reference swap, exactly what the in-process
-    # game.set_remote_input does); _step applies it to player 1. Hold a
-    # turn for M2_SETTLE_S; p1's angle must change from its baseline.
-    parent_conn.send(("remote_input", ShipInput(turn=1.0)))
+    # The client's input path (plan_13): the NET process forwards the
+    # client's input on the remote_input Pipe as ("remote_input",
+    # ShipInput); the sim sets game.remote_input (a reference swap,
+    # exactly what the in-process game.set_remote_input does); _step
+    # applies it to player 1. Here the test plays the net process's role
+    # (sends on the net end of the Pipe). Hold a turn for M2_SETTLE_S;
+    # p1's angle must change from its baseline.
+    ri_net_end.send(("remote_input", ShipInput(turn=1.0)))
     m = _settle_and_read(model_queue, M2_SETTLE_S)
     ok &= check("M2: model after remote input", m is not None)
     if m is not None:
@@ -454,6 +475,30 @@ def test_m2_input_commands_remote():
                     dangle > 0.3, "dangle=%.3f rad" % dangle)
         print("  [M2] p1 after remote turn: angle=%.3f (d=%.3f rad)"
               % (p1["angle"], dangle))
+    # Release the turn (the client lets go of the turn key): the input
+    # persists in the sim until replaced, so without this p1 would keep
+    # spinning through the respawn phase.
+    ri_net_end.send(("remote_input", ShipInput()))
+
+    # --- 4. a COMMAND rides the remote_input Pipe (respawn) -----------
+    # The net process has no direct command channel to the sim (only the
+    # remote_input Pipe), so it forwards the client's T_RESPAWN here as
+    # ("command", "respawn", 1). The sim applies it via st.command (the
+    # same path as a render-process command). It is a NO-OP unless the
+    # ship is dead (respawn_player returns early), so the check is that
+    # the sim stays healthy + keeps stepping after the command (no crash,
+    # a fresh model arrives, p1 is still alive).
+    ri_net_end.send(("command", "respawn", 1))
+    m = _settle_and_read(model_queue, 0.2)
+    ok &= check("M2: model after respawn command (sim healthy)",
+                m is not None)
+    if m is not None:
+        p1 = m["players"][1]
+        ok &= check("M2: respawn command (no-op on a live ship) left p1 "
+                    "alive + stepping", not p1["dead"],
+                    "dead=%s" % p1["dead"])
+        print("  [M2] p1 after respawn command: dead=%s pos=%s"
+              % (p1["dead"], tuple(round(v, 2) for v in p1["pos"])))
 
     # --- shutdown ------------------------------------------------------
     parent_conn.send(("quit",))
@@ -476,6 +521,7 @@ def test_m2_input_commands_remote():
         p.terminate()
         p.join()
     parent_conn.close()
+    ri_sim_end.close()
     if done is not None:
         _, steps, simt, wall, _stamps = done
         print("  [M2] CHILD step report: steps=%d sim_time=%.3f wall=%.3f"
@@ -533,8 +579,11 @@ def test_m3_hulls_and_sfx():
     parent_conn, child_conn = ctx.Pipe()
     model_queue = ctx.Queue(maxsize=4)
     net_queue = ctx.Queue(maxsize=16)          # child -> parent wire (M4)
+    # plan_13: the remote_input Pipe (net -> sim). The test plays the net
+    # process's role (sends the client's input on the net end).
+    ri_sim_end, ri_net_end = ctx.Pipe()
     p = ctx.Process(target=sim_process_main,
-                    args=(child_conn, model_queue, net_queue))
+                    args=(child_conn, model_queue, net_queue, ri_sim_end))
     p.start()
     child_conn.close()
     # The 6-arg setup: the host's + client's REAL hulls/loadouts + seed.
@@ -565,6 +614,7 @@ def test_m3_hulls_and_sfx():
             p.terminate()
             p.join()
         parent_conn.close()
+        ri_sim_end.close()
         return ok
 
     # --- 1. the client's REAL hull is in the sim (through the model) ---
@@ -578,6 +628,7 @@ def test_m3_hulls_and_sfx():
             p.terminate()
             p.join()
         parent_conn.close()
+        ri_sim_end.close()
         return ok
     base_p1_angle = base["players"][1]["angle"]
 
@@ -585,8 +636,10 @@ def test_m3_hulls_and_sfx():
     # turn_rate_factor is 1.15 (the scout's is 1.0), so the same input
     # turns p1 15% faster: dangle ~= ROT_SPEED * 1.15 * t. If the sim had
     # built p1 from the DEFAULT hull (scout, factor 1.0), the delta would
-    # be ~13% smaller — outside the tolerance band below.
-    parent_conn.send(("remote_input", ShipInput(turn=1.0)))
+    # be ~13% smaller — outside the tolerance band below. (plan_13: the
+    # client's input rides the remote_input Pipe — the test plays the net
+    # process's role and sends on the net end.)
+    ri_net_end.send(("remote_input", ShipInput(turn=1.0)))
     m = _settle_and_read(model_queue, M3_TURN_S)
     ok &= check("M3: model after remote turn", m is not None)
     if m is not None:
@@ -605,7 +658,7 @@ def test_m3_hulls_and_sfx():
                     % (dangle, want, ROT_SPEED * M3_TURN_S))
         print("  [M3] p1 after remote turn: dangle=%.3f rad "
               "(expected ~%.3f for the silas)" % (dangle, want))
-    parent_conn.send(("remote_input", ShipInput()))
+    ri_net_end.send(("remote_input", ShipInput()))
 
     # --- 2. the model carries the drained "sfx" list (D.1) ---
     # Thrust p0 for M3_SETTLE_S, draining continuously (the render-loop
@@ -688,6 +741,7 @@ def test_m3_hulls_and_sfx():
         p.terminate()
         p.join()
     parent_conn.close()
+    ri_sim_end.close()
     if done is not None:
         _, steps, simt, wall, _stamps = done
         print("  [M3] CHILD step report: steps=%d sim_time=%.3f wall=%.3f"
@@ -701,28 +755,31 @@ def test_m3_hulls_and_sfx():
 #
 # The pipe test above proves the sim process side (setup/hulls/sfx). This
 # proves the RENDER process side end to end: the real run_host spawns the
-# sim process (6-arg setup), drains the model queue in the render thread,
-# draws the SHELL from the piped model, plays the model's sfx, and shuts
-# the sim down cleanly on exit.
+# NET process (owns the socket + snapshot send + client input, plan_13)
+# and the sim process (6-arg setup), drains the model queue in the render
+# thread, draws the SHELL from the piped model, plays the model's sfx,
+# and shuts both processes down cleanly on exit.
 #
 # The fake client is a REAL TCP connection: it sends the join handshake
 # (its hull crosses the wire -> the 6-arg setup) and then T_INPUT messages
-# carrying a REAL turn (M4: the client's input reaches the sim — the
-# worker's sink forwards it as ("remote_input", ...) over the command
-# Pipe, and the sim applies it to player 1). The host's OWN input is
+# carrying a REAL turn (M4: the client's input reaches the sim — the NET
+# process forwards it as ("remote_input", ...) over the remote_input Pipe,
+# and the sim applies it to player 1). The host's OWN input is
 # test-driven (pygame.key.get_pressed is patched to hold W+SPACE) so the
 # sim actually does something (thrust + fire -> sfx events -> the host's
 # SoundBank).
 #
 # Checks:
 #   * the host loop runs + exits cleanly (no exception, no hang);
-#   * the sim process was spawned and is GONE after exit (E.6 shutdown);
+#   * the net + sim processes were spawned and are BOTH GONE after exit
+#     (the finally stops the net process first, then the sim);
 #   * the shell was drawn from the piped model (its camera moved with the
 #     thrusting ship; its local standin's pose == the last model's p0
 #     pose — the standin is synced from the model pack inside draw());
 #   * the host's SoundBank played the model's sfx (thruster on + laser
 #     blips — the D.1 bridge, end to end);
-#   * the worker is alive: the fake client's tagged T_INPUT got a T_PONG;
+#   * the net process is alive: the fake client's tagged T_INPUT got a
+#     T_PONG (reflected in the net process, ~1 ms);
 #   * M4: the client's REAL input reached the sim (player 1's angle
 #     changed in the host's models) and the wire bridge delivered
 #     snapshots + input echoes to the client.
@@ -799,14 +856,22 @@ def test_m3_host_e2e():
 
     created_procs = []
     orig_get_context = multiprocessing.get_context
+    _spawn_ctx = orig_get_context("spawn")
+    orig_process = _spawn_ctx.Process   # the real Process (restored on exit)
     def tracking_get_context(name):
         ctx = orig_get_context(name)
-        orig_process = ctx.Process
+        # get_context("spawn") returns the SAME cached context object on
+        # every call, so wrap ctx.Process only ONCE (an idempotent guard) —
+        # otherwise the second call double-wraps and the same Process is
+        # appended twice (the tracking would see 3 procs for 2 real spawns).
+        if getattr(ctx, "_test_tracking", False):
+            return ctx
         def tracking_process(*a, **k):
             pr = orig_process(*a, **k)
             created_procs.append(pr)
             return pr
         ctx.Process = tracking_process
+        ctx._test_tracking = True
         return ctx
     multiprocessing.get_context = tracking_get_context
 
@@ -821,7 +886,8 @@ def test_m3_host_e2e():
     # --- capture the host's models (M4: verify the client's input reaches
     #     the sim — player 1's angle must change as the fake client turns)
     #     + the wire messages the fake client receives (snap/beam/echo —
-    #     the sim->render->worker->client bridge). ---
+    #     the sim->net->client bridge, plan_13: the NET process drains the
+    #     sim's net Queue and sends it to the socket). ---
     from . import __main__ as M
     host_models = []
     orig_drain = M._drain_sim_model
@@ -853,10 +919,11 @@ def test_m3_host_e2e():
                                 serialize_loadout(default_loadout(client_hull)))
             tag = 0
             # M4: drive the client's ship with REAL input (a constant turn)
-            # instead of the M3 idle no-op. The host's worker sink sends it
-            # to the sim process as ("remote_input", ...); the sim applies
-            # it to player 1, so p1's angle must change (verified against
-            # the host's models below).
+            # instead of the M3 idle no-op. The host's NET process
+            # (plan_13) forwards it to the sim process as
+            # ("remote_input", ...) on the remote_input Pipe; the sim
+            # applies it to player 1, so p1's angle must change (verified
+            # against the host's models below).
             turn_inp = serialize_input(ShipInput(turn=1.0))
             while not client_stop.is_set():
                 tag += 1
@@ -895,7 +962,7 @@ def test_m3_host_e2e():
     th_host.start()
     time.sleep(M3_E2E_RUN_S)
     # Stop the host (QUIT -> handle_events returns False -> run_host
-    # returns -> the finally shuts the worker + sim process down).
+    # returns -> the finally shuts the net + sim processes down).
     stop = time.time() + 10.0
     while time.time() < stop and th_host.is_alive():
         pygame.event.post(pygame.event.Event(pygame.QUIT))
@@ -908,6 +975,13 @@ def test_m3_host_e2e():
     pygame.key.get_pressed = orig_get_pressed
     Game.__init__ = orig_init
     multiprocessing.get_context = orig_get_context
+    # Restore the shared spawn context's Process (it is a cached singleton
+    # that outlives this test) + clear the tracking sentinel.
+    _spawn_ctx.Process = orig_process
+    try:
+        del _spawn_ctx._test_tracking
+    except AttributeError:
+        pass
     sfx.play_sfx = orig_play_sfx
     M._drain_sim_model = orig_drain
 
@@ -946,12 +1020,15 @@ def test_m3_host_e2e():
               shell._test_draw_none_after_model == 0,
               "n=%d" % shell._test_draw_none_after_model)
 
-    check("M3e2e: the sim process was spawned", len(created_procs) == 1,
-          "n=%d" % len(created_procs))
-    if created_procs:
-        pr = created_procs[0]
-        check("M3e2e: the sim process is GONE after exit (E.6 shutdown)",
-              not pr.is_alive())
+    # plan_13: run_host now spawns TWO children — the NET process (owns the
+    # socket + snapshot send + client input) and the SIM process (the
+    # authoritative Game). Both must be gone after exit (the finally stops
+    # the net process first, then the sim).
+    check("M3e2e: the net + sim processes were spawned",
+          len(created_procs) == 2, "n=%d" % len(created_procs))
+    check("M3e2e: BOTH the net + sim processes are GONE after exit "
+          "(shutdown)", all(not pr.is_alive() for pr in created_procs),
+          "alive=%r" % [pr.is_alive() for pr in created_procs])
 
     if shell is not None:
         # The local standin was built + synced from the model pack inside
@@ -970,18 +1047,19 @@ def test_m3_host_e2e():
     check("M3e2e: the gun blips played ('laser', 0.12)",
           any(ev[0] == "laser" and len(ev) == 2 for ev in sfx_played))
 
-    check("M3e2e: the worker is alive (the client's tagged input got a "
+    check("M3e2e: the net process is alive (the client's tagged input got a "
           "T_PONG)", len(pongs) >= 1, "pongs=%d" % len(pongs))
 
     # --- M4: the client's REAL input reaches the sim (player 1 responds) ---
     # The fake client sends a constant turn (ShipInput(turn=1.0)) every
-    # 100 ms. The host's worker sink forwards it to the sim process as
-    # ("remote_input", ...); the sim applies it to player 1 each tick, so
-    # p1's angle must change across the run (verified against the host's
-    # OWN models — the same data the host draws from). This is the M4
-    # upgrade of the M3 e2e (whose fake client sent idle input as a no-op
-    # placeholder): it proves the client -> worker -> Pipe -> sim -> model
-    # path end to end, the way the M2 pipe test does in-process.
+    # 100 ms. The host's NET process forwards it to the sim process as
+    # ("remote_input", ...) on the remote_input Pipe; the sim applies it
+    # to player 1 each tick, so p1's angle must change across the run
+    # (verified against the host's OWN models — the same data the host
+    # draws from). This is the M4 upgrade of the M3 e2e (whose fake
+    # client sent idle input as a no-op placeholder): it proves the
+    # client -> net process -> Pipe -> sim -> model path end to end, the
+    # way the M2 pipe test does in-process.
     if host_models:
         a0 = host_models[0]["players"][1]["angle"]
         a1 = host_models[-1]["players"][1]["angle"]
@@ -999,11 +1077,12 @@ def test_m3_host_e2e():
         check("M4: the client's input reached the sim (player 1 turned "
               "in the host's models)", False, "no host models captured")
 
-    # --- M4: the wire bridge delivered snapshots (sim -> render -> worker
-    #     -> client). The fake client records every snap/beam/echo it
-    #     receives; snapshots must arrive (the client's ghost seeds from
-    #     them) and echoes must flow (the host applied the client's input
-    #     each tick and echoed it back — the input path, end to end). ---
+    # --- M4: the wire bridge delivered snapshots (sim -> net process ->
+    #     client, plan_13). The fake client records every snap/beam/echo
+    #     it receives; snapshots must arrive (the client's ghost seeds
+    #     from them) and echoes must flow (the host applied the client's
+    #     input each tick and echoed it back — the input path, end to
+    #     end). ---
     wire_kinds = set(wire_seen)
     check("M4: the client received snapshots over the wire (bridge)",
           "snap" in wire_kinds, "kinds=%r n=%d"

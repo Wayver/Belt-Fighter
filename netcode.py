@@ -73,6 +73,7 @@ from .config import (INTERP_DELAY, INTERP_DELAY_MIN, INTERP_DELAY_MAX,
 from .ship import Ship
 from .bullets import Bullet
 from . import missile_telemetry as _mtel
+from . import bullet_telemetry as _btel
 
 # The ghost's beam visuals age out at the host's beam ttl, so the
 # client's local beams fade on the same clock as the host's.
@@ -1684,6 +1685,13 @@ class PredictedShip:
         # the newest snapshot — predicted_view hands it off to the buffer
         # once that copy has ADVANCED (the wait-until-advancing rule,
         # reused from the missile handoff).
+        # The ghost's gun cooldown (the ballistic weapon's). Read before the
+        # fire loop so the FIRE telemetry can record the pre-fire value.
+        _g_cd = 0.0
+        for _w in s.weapons:
+            if _w.comp.bullet_speed > 0:
+                _g_cd = _w.cooldown
+                break
         for shot in shots:
             if len(self.local_bullets) < MAX_BULLETS:
                 seq_before = s.bullet_seq
@@ -1705,6 +1713,18 @@ class PredictedShip:
                 b = Bullet(shot.pos, shot.vel, owner=shot.owner, bid=bid)
                 b.pending = False   # handback state (client-only)
                 self.local_bullets.append(b)
+                # TELEMETRY (Phase 0, plan_14): a ghost Bullet was CREATED.
+                # f_cap_before = the local-draw count BEFORE this append
+                # (the ghost cap's input — it stays tiny because bullets are
+                # handed off ~INTERP_DELAY after firing, so the ghost cap
+                # almost never binds while the host's WORLD cap does).
+                # f_guard is always 0 here (a guard hit skips the append).
+                _btel.log("FIRE", f_bid=_btel.fmt_ids([bid]),
+                          f_seq_before=seq_before,
+                          f_seq_after=s.bullet_seq, f_guard=0,
+                          f_local_ids=_btel.fmt_ids(
+                              (tuple(b.id) for b in self.local_bullets)),
+                          f_cap_before=len(self.local_bullets) - 1)
         # Keep the ghost's own laser discharges as presentation entries
         # [local_start, end, age, ttl]. The muzzle is the HULL-LOCAL offset
         # (beam.local_start), NOT the frozen world-space point (beam.start)
@@ -2048,6 +2068,15 @@ class PredictedShip:
                       tuple(b.id) for b in self.local_bullets),
                   h_culled=_mtel.fmt_ids(pending),
                   h_jump="")
+        # TELEMETRY (Phase 0, plan_14): the bullet handback decision in the
+        # bullet lifecycle file (h_host_bseq = the snapshot's authoritative
+        # bullet_seq; h_culled = the ids just marked pending).
+        _btel.log("HANDBACK", h_host_bseq=host_seq,
+                  h_buf_bids=_btel.fmt_ids(sorted(ids)) if ids else "",
+                  h_before=_btel.fmt_ids(before),
+                  h_after=_btel.fmt_ids(
+                      tuple(b.id) for b in self.local_bullets),
+                  h_culled=_btel.fmt_ids(pending))
         return {}
 
     def advance(self, dt, inp, enemies=None, real_time=None,

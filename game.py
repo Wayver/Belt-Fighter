@@ -44,6 +44,7 @@ from .hud import draw_hud, draw_game_over, draw_respawn
 from .camera import Camera
 from .netcode import SnapshotBuffer, PredictedShip, BEAM_TTL
 from . import missile_telemetry as _mtel
+from . import bullet_telemetry as _btel
 from .config import (INTERP_DELAY, SNAPSHOT_INTERVAL, ROCK_FILL, ROCK_EDGE,
                     ENEMY_FILL, ENEMY_EDGE, ENEMY_FLAME,
                     SHIP_COLOR, SHIP_EDGE,
@@ -2189,6 +2190,18 @@ class Game:
             _seq_before = self.ghost.ship.missile_seq
             _local_before = [tuple(m.id) for m in self.ghost.local_missiles
                              if m.id is not None]
+            # Ghost's bullet_seq BEFORE the rewind replay (the replay
+            # re-runs the fire tick and can bump it again) — the Phase 0
+            # drift measurement (plan_14). The host's authoritative
+            # bullet_seq is local_s[24]; the gap (ghost - host) is the
+            # seq drift the cap causes. The ghost's PREDICTED gun cooldown
+            # (pre-reconcile) is captured too — the secondary drift signal
+            # (the host's at-snapshot cooldown is local_s[18][gun][0]).
+            _bseq_before = self.ghost.ship.bullet_seq
+            _gun_idx = next((i for i, w in enumerate(self.ghost.ship.weapons)
+                             if w.comp.bullet_speed > 0), None)
+            _g_cd_pred = (self.ghost.ship.weapons[_gun_idx].cooldown
+                          if _gun_idx is not None else 0.0)
             self.ghost.reconcile_rewind(
                 local_s, sim_time, sim_time if now is None else now,
                 enemies=enemies, real_time=real_time, rate=rate)
@@ -2219,6 +2232,32 @@ class Game:
                       r_local_after=_mtel.fmt_ids(
                           tuple(m.id) for m in self.ghost.local_missiles
                           if m.id is not None))
+            # TELEMETRY (Phase 0, plan_14): the BULLET fire-drift row. The
+            # host's authoritative bullet_seq is local_s[24]; the ghost's is
+            # _bseq_before (pre-replay) / .ship.bullet_seq (post-replay). The
+            # PRIMARY drift signal is the seq gap (ghost - host): a monotonic
+            # counter, so a growing gap = the ghost fired shots the host
+            # didn't (its cap didn't bind while the host's did). The SECONDARY
+            # signal is the gun cooldown at the snapshot's time: the host's
+            # is local_s[18][gun][0] (at snap_time); the ghost's PREDICTED
+            # value (_g_cd_pred, captured pre-reconcile) is the ghost's
+            # estimate of the same instant. The gun is the weapon with
+            # bullet_speed>0 (same loadout on both peers, so the index
+            # matches).
+            _host_cd = (local_s[18][_gun_idx][0]
+                        if _gun_idx is not None else 0.0)
+            _btel.log("RECONCILE", sim_t=sim_time, r_snap_t=sim_time,
+                      r_snap_bseq=local_s[24],
+                      r_gseq_before=_bseq_before,
+                      r_gseq_after=self.ghost.ship.bullet_seq,
+                      r_glocal_ids=_btel.fmt_ids(
+                          tuple(b.id) for b in self.ghost.local_bullets
+                          if b.id is not None),
+                      r_buf_bids=_btel.fmt_ids(
+                          tuple(b[6]) for b in snap[2]
+                          if b[6] is not None),
+                      r_gcd="%.4f" % _g_cd_pred,
+                      r_host_cd="%.4f" % _host_cd)
             # Hand the ghost's OWN missiles back to the BUFFER. Two conditions:
             # (a) seq < the snapshot's authoritative missile_seq (ship
             # field 21), and (b) the buffer's NEWEST snapshot actually
@@ -2570,6 +2609,14 @@ class Game:
         # sustained flight logs a handful of transition rows, not 60 Hz.
         _buf_drawn = []
         _buf_skipped = []
+        # Bullet-only DEDUP trackers (Phase 0, plan_14): a double-draw is a
+        # ghost bullet whose id has NO counterpart in the buffer (the ghost
+        # fired a shot the host's cap suppressed, so its id drifted from the
+        # host's — the buffer draws the host's version under a different id,
+        # and the ghost draws its own). The analyzer flags ghost bullets not
+        # in (buf_bdrawn ∪ buf_bskipped).
+        _buf_bdrawn = []
+        _buf_bskipped = []
         for (x, y, vx, vy, kind, owner, boost, mid) in pos['bullets']:
             if kind == 'missile' and mid is not None \
                     and tuple(mid) in local_missile_ids:
@@ -2589,8 +2636,10 @@ class Game:
                 _bid_t = tuple(mid)
                 if _bid_t in local_bullet_ids:
                     _buf_skipped.append(_bid_t)
+                    _buf_bskipped.append(_bid_t)
                     continue   # drawn from the ghost (predicted) instead
                 _buf_drawn.append(_bid_t)
+                _buf_bdrawn.append(_bid_t)
                 if _bid_t[0] == self.local_index:
                     x += vx * _bdelay
                     y += vy * _bdelay
@@ -2616,6 +2665,12 @@ class Game:
             _mtel.log_dedup(self.sim_time,
                             local_missile_ids | local_bullet_ids,
                             _buf_drawn, _buf_skipped)
+            # TELEMETRY (Phase 0, plan_14): the BULLET-only DEDUP row
+            # (ghost in-flight bullet ids vs the buffer's drawn/skipped
+            # bullet ids). A ghost id absent from both is a double-draw
+            # candidate (the ghost fired a shot the host's cap suppressed).
+            _btel.log_dedup(self.sim_time, local_bullet_ids,
+                            _buf_bdrawn, _buf_bskipped)
         # Remote ships: every player EXCEPT the local one, from the buffer by
         # index (ships matched by index; the local ship is the ghost,
         # drawn below). Each is drawn as its REAL hull at the

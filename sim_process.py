@@ -119,9 +119,44 @@ class _Worker:
     def __init__(self, net_queue):
         self._q = net_queue
         self.stamps = []
+        # Per-publish snap log (F3 telemetry, plan_13 follow-up): one row
+        # per snapshot PUBLISH — (wall, mono, sim_time, seq, drops).
+        # `wall`/`mono` are the publish time (the moment the sim stamped
+        # the snapshot), `seq` is the 1-based publish count, `drops` is
+        # the RUNNING count of snaps lost to a full net Queue. The mono
+        # deltas are the authoritative "did the sim batch?" signal (a
+        # descheduled sim process or a slow step shows up here, not in
+        # sim_time — which is always a clean multiple of 16.7 ms); the
+        # drops deltas are the "was the net process too slow to drain?"
+        # signal. Written by the sim process (its own machine) — the
+        # render process toggles it via ("command", "snap_log", path).
+        self._snap_log_f = None
+        self._snap_seq = 0
+        self._snap_drops = 0
+
+    def set_snap_log(self, path):
+        """Open (path) or close (None) the per-publish snap log. Called
+        from the bridge loop on ("command", "snap_log", path) — the
+        render process's F3 edge. The file lives where the render
+        process's CSVs land (the path is absolute, the repo root)."""
+        if path is None:
+            if self._snap_log_f is not None:
+                self._snap_log_f.close()
+                self._snap_log_f = None
+            return
+        if self._snap_log_f is None:
+            self._snap_log_f = open(path, "w", newline="")
+            self._snap_log_f.write("wall,mono,sim_time,seq,drops\n")
 
     def publish_snapshot(self, sim_time, snap):
         self.stamps.append(sim_time)   # child-side cadence measurement
+        if self._snap_log_f is not None:
+            self._snap_seq += 1
+            self._snap_log_f.write("%.3f,%.3f,%.4f,%d,%d\n" % (
+                time.time(), time.monotonic(), sim_time,
+                self._snap_seq, self._snap_drops))
+            if self._snap_seq % 60 == 0:   # ~1 s of rows: bound the buffer
+                self._snap_log_f.flush()
         self._put(("snap", sim_time, snap))
 
     def send(self, msg):
@@ -143,7 +178,12 @@ class _Worker:
             # handles; a dropped beam/echo is a missed 0.15 s flash / one
             # echoed input — both degrade gracefully (the client holds the
             # last echoed input, like a dropped echo today).
-            pass
+            if item[0] == "snap":
+                # Count the drop (the snap log's `drops` column): a
+                # rising drops count means the NET process was too slow
+                # to drain the queue — the 33 ms client gaps are then
+                # net-process backpressure, not sim batching.
+                self._snap_drops += 1
 
 
 def _build_game(seed, players, local_hull=None, local_loadout=None,
@@ -231,6 +271,7 @@ def sim_process_main(cmd_conn, model_queue, net_queue, remote_input_conn):
     from .sim_thread import SimThread
 
     st = None
+    worker = None
     try:
         # --- setup (blocking: the parent sends it right after spawn) ---
         msg = cmd_conn.recv()
@@ -291,7 +332,17 @@ def sim_process_main(cmd_conn, model_queue, net_queue, remote_input_conn):
             elif kind == "input":
                 st.publish_input(m[1])
             elif kind == "command":
-                st.command(m[1], m[2] if len(m) > 2 else None)
+                name = m[1]
+                arg = m[2] if len(m) > 2 else None
+                if name == "snap_log":
+                    # F3 telemetry: open/close the per-publish snap log
+                    # (the render process's F3 edge sends the path, or
+                    # None to close). NOT a sim command — it configures
+                    # the worker's logging, so it is handled here, not
+                    # routed to st.command.
+                    worker.set_snap_log(arg)
+                else:
+                    st.command(name, arg)
             # ("remote_input", ...) no longer rides the command Pipe
             # (plan_13): the client's input arrives on the remote_input
             # Pipe (net -> sim) and is handled in the loop below.
@@ -368,6 +419,11 @@ def sim_process_main(cmd_conn, model_queue, net_queue, remote_input_conn):
         if st is not None:
             try:
                 st.stop()
+            except Exception:
+                pass
+        if worker is not None:
+            try:
+                worker.set_snap_log(None)   # flush + close the snap log
             except Exception:
                 pass
         pygame.quit()

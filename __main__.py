@@ -461,6 +461,9 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
         # last_telem_time anchors it (0.0 -> the first line is immediate).
         last_telem_time = 0.0
         TELEMETRY_PERIOD = SNAPSHOT_INTERVAL * STEP   # 0.0167 s (60 Hz)
+        # The F3 edge state for the per-snapshot cadence logs (the sim +
+        # net processes' CSVs — see the F3-edge block in the loop).
+        snap_log_on = False
         # Host-side frame-rate telemetry (F3-toggled, mirrors the client's
         # columns). The client's CSV can't tell a WIRE stall (host sent
         # smoothly, packets queued + released in a burst) from a HOST frame
@@ -521,6 +524,32 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
             # False/False for a 2P host, matching the sim's gating).
             if not game.handle_events(_sim_command):
                 return
+            # F3 edge: toggle the per-snapshot cadence logs (plan_13
+            # follow-up). The SIM + NET processes each write their own
+            # CSV (sim_snap_debug.csv / net_snap_debug.csv — both on the
+            # host's machine, where those processes run); the render
+            # process only tells them the path (or None to close). The
+            # paths are absolute (the repo root — the same dir as the
+            # render's own CSVs). The client writes client_snap_debug.csv
+            # on its own machine (run_client's F3 edge). Correlating the
+            # three by sim_time localizes a 33 ms client gap to the sim
+            # (batching), the net process (bursty send / queue drops), or
+            # the wire + client receive.
+            if game.debug_net != snap_log_on:
+                snap_log_on = game.debug_net
+                _sim_cmd_send(("command", "snap_log",
+                               os.path.join(os.path.dirname(
+                                   os.path.abspath(__file__)),
+                                   "sim_snap_debug.csv")
+                               if snap_log_on else None))
+                try:
+                    net_status.send(("snap_log",
+                                     os.path.join(os.path.dirname(
+                                         os.path.abspath(__file__)),
+                                         "net_snap_debug.csv")
+                                     if snap_log_on else None))
+                except Exception:
+                    pass
             keys = pygame.key.get_pressed()
             # Poll the NET process's status Pipe (non-blocking). The
             # client's input + the T_PONG + the T_RESPAWN are all handled
@@ -978,6 +1007,19 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
         os.path.dirname(os.path.abspath(__file__)), "ghost_clock.csv")
     game._ghost_clock_f = None
     game._ghost_clock_sink = None
+    # Per-receive snap log (F3 telemetry, plan_13 follow-up): one row per
+    # snapshot RECEIVED off the wire — (wall, mono, sim_time, seq). The
+    # wall deltas are the "is the client receive smooth?" signal (the
+    # client's NetWorker thread + the wire, as seen from the client).
+    # Written by the client process (its own machine — the 4090). Correlate
+    # with the host's sim_snap_debug.csv + net_snap_debug.csv by sim_time
+    # to localize a 33 ms gap: sim batching (sim CSV), net-process burst
+    # (net CSV), or wire + client receive (this CSV + the cross-machine
+    # wall-clock latency).
+    game._snap_log_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "client_snap_debug.csv")
+    game._snap_log_f = None
+    game._snap_seq = 0
     # Per-frame frame-rate telemetry. The net_debug CSV is written once per
     # reconcile (10 Hz), so it can't see individual frames — the
     # render-point drift could be a low frame rate OR occasional hiccup
@@ -1058,6 +1100,13 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
             game._ghost_clock_f.close()
             game._ghost_clock_f = None
             PredictedShip.diag_sink = None
+        # Per-receive snap log (F3 edge, like the ghost_clock log above).
+        if game.debug_net and game._snap_log_f is None:
+            game._snap_log_f = open(game._snap_log_path, "w", newline="")
+            game._snap_log_f.write("wall,mono,sim_time,seq\n")
+        elif not game.debug_net and game._snap_log_f is not None:
+            game._snap_log_f.close()
+            game._snap_log_f = None
         now = pygame.time.get_ticks() / 1000.0
         # Route T/V/G/R/F through the client command
         # sink (T/V/G -> the ghost; R/F -> the client's existing behavior).
@@ -1130,6 +1179,13 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
         # render thread (the JSON decode no longer happens here).
         for m in worker.poll():
             if m.get("type") == T_SNAP:
+                if game._snap_log_f is not None:
+                    game._snap_seq += 1
+                    game._snap_log_f.write("%.3f,%.3f,%.4f,%d\n" % (
+                        time.time(), time.monotonic(), m["sim_time"],
+                        game._snap_seq))
+                    if game._snap_seq % 60 == 0:   # ~1 s: bound the buffer
+                        game._snap_log_f.flush()
                 if game.host_time.record(now, m["sim_time"]):
                     game.latency.update(game.host_time.last_jitter)
                 # Reconcile at the ghost's OWN current clock (advanced to
@@ -1250,6 +1306,11 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
         game._ghost_clock_f.close()
         game._ghost_clock_f = None
     PredictedShip.diag_sink = None
+    # Close the per-receive snap log on every exit path (like the
+    # ghost_clock log above).
+    if getattr(game, "_snap_log_f", None) is not None:
+        game._snap_log_f.close()
+        game._snap_log_f = None
     # Flush + close the missile telemetry CSV on every exit path.
     missile_telemetry.close()
     # Stop the worker (join its thread) BEFORE closing the

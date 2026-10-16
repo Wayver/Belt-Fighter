@@ -108,6 +108,27 @@ def net_process_main(status_conn, net_queue, remote_input_conn,
         except (OSError, EOFError, ConnectionError, BrokenPipeError):
             return False
 
+    # Per-send snap log (F3 telemetry, plan_13 follow-up): one row per
+    # snapshot SENT to the socket — (wall, mono, sim_time, seq). The wall
+    # deltas are the "is the net process sending smoothly, or bursty?"
+    # signal (a descheduled net process shows up here, not in sim_time).
+    # Written by the net process (its own machine — the host's Mac). The
+    # render process toggles it with ("snap_log", path) on the status Pipe
+    # (the F3 edge).
+    snap_log_f = None
+    snap_seq = 0
+
+    def _snap_log(path):
+        nonlocal snap_log_f
+        if path is None:
+            if snap_log_f is not None:
+                snap_log_f.close()
+                snap_log_f = None
+            return
+        if snap_log_f is None:
+            snap_log_f = open(path, "w", newline="")
+            snap_log_f.write("wall,mono,sim_time,seq\n")
+
     conn = None
     try:
         # --- 1. listen + accept + handshake (the socket is owned HERE) ---
@@ -121,6 +142,8 @@ def net_process_main(status_conn, net_queue, remote_input_conn,
                 if m[0] == "quit":
                     host.close()
                     return
+                elif m[0] == "snap_log":
+                    _snap_log(m[1])
             conn, _addr = host.accept_one(timeout=0.25)
             if conn is None:
                 continue
@@ -148,6 +171,8 @@ def net_process_main(status_conn, net_queue, remote_input_conn,
                 m = status_conn.recv()
                 if m[0] == "quit":
                     break
+                elif m[0] == "snap_log":
+                    _snap_log(m[1])
             # SEND side: drain the sim's net Queue -> the socket. The sim
             # publishes a snap (+ beam/echo) per step; the net process sends
             # each the moment it lands, so the snapshot's age at send is ~0
@@ -164,6 +189,12 @@ def net_process_main(status_conn, net_queue, remote_input_conn,
                 if kind == "snap":
                     conn.send({"type": T_SNAP, "sim_time": m[1],
                                "snap": serialize_snapshot(m[2])})
+                    if snap_log_f is not None:
+                        snap_seq += 1
+                        snap_log_f.write("%.3f,%.3f,%.4f,%d\n" % (
+                            time.time(), time.monotonic(), m[1], snap_seq))
+                        if snap_seq % 60 == 0:   # ~1 s of rows: bound buffer
+                            snap_log_f.flush()
                 else:   # "beam" / "echo" — the msg dict is m[1]
                     conn.send(m[1])
             conn.drain_send()
@@ -201,6 +232,11 @@ def net_process_main(status_conn, net_queue, remote_input_conn,
             pass
         raise
     finally:
+        if snap_log_f is not None:
+            try:
+                snap_log_f.close()
+            except Exception:
+                pass
         if conn is not None:
             try:
                 conn.close()

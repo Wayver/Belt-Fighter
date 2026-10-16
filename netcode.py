@@ -2398,8 +2398,30 @@ class PredictedShip:
         # (max_speed * dt, with dt ~ TICK at 60 FPS) — the jump is spread
         # over 2 frames.
         self._smooth_dead = _dead
-        max_speed = MAX_SPEED * self._ship.hull.max_speed_factor
-        pos_cap = max_speed * dt
+        # The cap is the ship's ACTUAL speed (not max speed) * dt — 1 tick
+        # of motion at the ship's CURRENT speed. Using max speed was the
+        # bug: the cap (max_speed * dt) is higher than the render pose's
+        # per-frame advance (actual_speed * TICK) when actual_speed <
+        # max_speed, so on a burst frame the 2-tick jump (2 *
+        # actual_speed * TICK) is less than the cap (max_speed * dt) and
+        # the cap does NOT bind — the smoothed pose moves the full 2-tick
+        # jump in one frame (the lurch persists). The cap only bound when
+        # actual_speed > max_speed/2, so the shudder was unsmoothed below
+        # half of max speed. Using the ACTUAL speed makes the cap match
+        # the render pose's per-frame advance in steady state (zero lag)
+        # and cap the 2-tick jump on burst frames (smooth), at ALL
+        # speeds.
+        #
+        # The ship's actual speed is self._ship.vel.length() (the physics
+        # velocity, smooth — it changes gradually, not raggedly). The
+        # render pose advances at actual_speed * clock_advance per frame
+        # (clock_advance is ragged: 1 tick in steady state, 2 ticks on a
+        # burst frame). The cap (actual_speed * dt, with dt ~ TICK at 60
+        # FPS) is 1 tick at the ship's current speed, so it matches the
+        # render pose's steady-state advance (zero lag) and caps the
+        # burst-frame jump (smooth).
+        actual_speed = self._ship.vel.length()
+        pos_cap = actual_speed * dt
         # Position: move toward the target, capped at pos_cap.
         delta = target_pos - self._smooth_pos
         dist = delta.length()
@@ -2407,14 +2429,26 @@ class PredictedShip:
             self._smooth_pos += delta / dist * pos_cap
         else:
             self._smooth_pos = pygame.Vector2(target_pos)
-        # Angle: move toward the target (wrapped delta), capped at
-        # ROT_SPEED * dt (1 tick of rotation at the ship's max turn rate).
-        # The ship's max turn rate is ROT_SPEED * the hull's
-        # turn_rate_factor (the same cap the sim applies). In steady state
-        # the target angle moves <= this cap, so the smoothed angle tracks
-        # with zero lag. On a burst frame the target angle jumps 2 ticks,
-        # but the smoothed angle moves only 1 tick (capped).
-        ang_cap = ROT_SPEED * self._ship.hull.turn_rate_factor * dt
+        # Angle: move toward the target (wrapped delta), capped at the
+        # ship's ACTUAL turn rate * dt (1 tick of rotation at the ship's
+        # CURRENT turn rate). The ship's actual turn rate is
+        # inp.turn * ROT_SPEED * turn_rate_factor (the angular velocity,
+        # smooth — it's the input × the turn rate). Using max turn rate
+        # was the same bug as the position: the cap (max_turn_rate * dt)
+        # is higher than the render pose's per-frame angle advance
+        # (actual_turn_rate * TICK) when actual_turn_rate < max_turn_rate,
+        # so the cap doesn't bind and the angle lurches. Using the ACTUAL
+        # turn rate makes the cap match the render pose's steady-state
+        # angle advance (zero lag) and cap the burst-frame angle jump
+        # (smooth), at ALL turn rates.
+        #
+        # self._last_inp is the last input the ghost was stepped with (set
+        # in step()). .turn is -1, 0, or 1 (the turn input). The turn rate
+        # is 0 when not turning (the angle is static — no smoothing
+        # needed), ±ROT_SPEED*turn_rate_factor when turning.
+        turn = self._last_inp.turn if self._last_inp is not None else 0.0
+        actual_turn_rate = turn * ROT_SPEED * self._ship.hull.turn_rate_factor
+        ang_cap = abs(actual_turn_rate) * dt
         da = (target_angle - self._smooth_angle + math.pi) % (2 * math.pi) - math.pi
         if abs(da) > ang_cap:
             self._smooth_angle += math.copysign(ang_cap, da)

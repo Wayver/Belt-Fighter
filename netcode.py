@@ -65,7 +65,7 @@ import pygame
 
 from .config import (INTERP_DELAY, INTERP_DELAY_MIN, INTERP_DELAY_MAX,
                     ADAPT_K, SNAPSHOT_INTERVAL, SNAPSHOT_BUFFER_MAX, TICK,
-                    MAX_FRAME_DT, ROT_SPEED,
+                    MAX_FRAME_DT, ROT_SPEED, MAX_SPEED,
                     MAX_BULLETS, MAX_MISSILES,
                     MISSILE_SPEED, MISSILE_ACCEL, MISSILE_BOOST_TIME,
                     MISSILE_TURN_RATE, MISSILE_LIFE,
@@ -1204,6 +1204,16 @@ class PredictedShip:
         self._render_base_angle = None
         self._render_next = None
         self._render_next_angle = None
+        # The SMOOTHED render pose (the decoupled visual layer). The
+        # physics pose (s.pos) is ragged on burst frames (it jumps 2
+        # ticks when the sim clock jumps 2 ticks), so rendering it
+        # directly would lurch the ship 2 ticks for one frame (the
+        # shudder). The smoothed render pose chases the physics pose
+        # (at the clock's time) at a bounded rate (1x real time), so it
+        # never jumps more than 1 tick per frame. None until the first
+        # render_pose call (then it is initialized to the target).
+        self._smooth_pos = None
+        self._smooth_angle = None
         # The last ShipInput the ghost was stepped with (set in step()).
         # The render pre-step reads its .turn to predict the angular motion
         # over the L gap. None before the first step (the pre-step then
@@ -2145,18 +2155,23 @@ class PredictedShip:
             # whether the MAX_LEAD cap is binding (now_raw > now).
             _ht_raw = host_time.now_raw(real_time)
             _ht_cap = host_time.now(real_time)
-            # The RENDER clock is the RAW capped estimate (now), NOT
-            # now_smooth. The reconcile re-anchors the ghost's clock to
-            # the raw estimate each snapshot (the caller passes
-            # now = ghost.sim_time, which is raw + rtt_ow), so the
-            # pre-reconcile clock must be the SAME raw estimate — a
-            # smoothed clock lags the raw anchor by its correction
-            # time-constant (~6 ms at SMOOTH_ALPHA 0.05) and that lag
-            # IS a per-reconcile snap. The raw estimate is already
-            # smooth between arrivals (it advances at the fitted rate
-            # with a fixed anchor, and re-anchors continuously), so
-            # smoothing it added lag without removing wobble (measured:
-            # raw and smooth frame-to-frame wobble are identical).
+            # The SIM clock is the RAW capped estimate (now), NOT now_smooth.
+            # The raw estimate is phase-locked to the host's tick grid
+            # (it is anchored on the newest snapshot's stamp), so the
+            # reconcile's pose correction is ~0 (the ghost's physics
+            # pose is at the same time as the snapshot's data). A
+            # smoothed clock (now_smooth) lags the raw estimate by up to
+            # ~16 ms after a burst, so the reconcile's correction would
+            # be ~1 tick (~8.67 px) — the phase-lock is broken.
+            #
+            # The raw estimate IS ragged on burst frames (it jumps 2
+            # ticks on a double-arrival frame), but that raggedness is
+            # absorbed by the RENDER pose's smoothing (see render_pose):
+            # the sim clock (and the physics pose) can be ragged, as long
+            # as the RENDER pose is smooth. The render pose chases the
+            # physics pose at a bounded rate (1x real time), so it never
+            # jumps more than 1 tick per frame, even when the physics
+            # pose jumps 2 ticks.
             self._sim_time = host_time.now(real_time) + rtt_ow
         # Branch 3: real_time given but host_time not ready (the window
         # before the first snapshot, and some tests — e.g. test_10_11c).
@@ -2296,6 +2311,82 @@ class PredictedShip:
         da = (a1 - a0 + math.pi) % (2 * math.pi) - math.pi
         rangle = a0 + da * alpha
         return rpos, rangle
+
+    def render_pose_smoothed(self, dt):
+        """The ghost's SMOOTHED render pose — (pos, angle).
+
+        The render pose (from render_pose) is ragged on burst frames: the
+        sim clock (phase-locked to the host's raw tick grid) jumps 2 ticks
+        when two snapshots arrive in one frame, so the physics pose jumps
+        2 ticks, and the render pose (at the clock's time) jumps 2 ticks
+        too. Rendering that directly lurches the ship 2 ticks for one
+        frame (the shudder).
+
+        The fix: a BOUNDED-RATE CHASE of the render pose (the same
+        discipline the interpolation buffer's RenderPoint uses for remote
+        entities). The smoothed pose chases the render pose, but moves at
+        most `max_speed * dt` per frame (1 tick of motion at the ship's
+        max speed). In steady state the render pose moves <= 1 tick/frame
+        (the ship never exceeds max_speed), so the smoothed pose tracks
+        with ZERO lag. On a burst frame the render pose jumps 2 ticks,
+        but the smoothed pose moves only 1 tick (capped) — the jump is
+        spread over 2 frames instead of 1, and the smoothed pose catches
+        up on the next frame (no permanent lag).
+
+        Why not a low-pass filter (EMA)? An EMA of the pose lags the ship
+        by SMOOTH_TAU * v in steady state (e.g. 0.05 s * 520 px/s = 26 px
+        at max speed) — the ship would be drawn 26 px behind where it
+        actually is, and the camera (which follows the ship) would be off
+        too. The bounded-rate chase has ZERO steady-state lag (the cap is
+        >= the ship's actual per-frame motion in steady state), so the
+        ship is drawn exactly where it is, and only the burst-frame jump
+        is smoothed.
+
+        This is a RENDER helper only — it does NOT touch self._ship.pos
+        (the ghost's actual simulated pose, which the no-teleport/rewind
+        gates and the handoff math read). Before the first call the
+        smoothed pose is None: return the render pose (the caller only
+        renders once seeded).
+        """
+        target_pos, target_angle = self.render_pose()
+        if self._smooth_pos is None:
+            # First call: initialize to the target (no smoothing yet).
+            self._smooth_pos = pygame.Vector2(target_pos)
+            self._smooth_angle = target_angle
+            return self._smooth_pos, self._smooth_angle
+        # Bounded-rate chase: move the smoothed pose toward the target,
+        # but at most `max_speed * dt` per frame (1 tick of motion at the
+        # ship's max speed). The ship's max speed is MAX_SPEED * the
+        # hull's max_speed_factor (the same cap the sim applies in
+        # Ship.update). In steady state the target moves <= this cap
+        # (the ship never exceeds max_speed), so the smoothed pose tracks
+        # with zero lag. On a burst frame the target jumps 2 ticks
+        # (2 * max_speed * TICK), but the smoothed pose moves only 1 tick
+        # (max_speed * dt, with dt ~ TICK at 60 FPS) — the jump is spread
+        # over 2 frames.
+        max_speed = MAX_SPEED * self._ship.hull.max_speed_factor
+        pos_cap = max_speed * dt
+        # Position: move toward the target, capped at pos_cap.
+        delta = target_pos - self._smooth_pos
+        dist = delta.length()
+        if dist > pos_cap:
+            self._smooth_pos += delta / dist * pos_cap
+        else:
+            self._smooth_pos = pygame.Vector2(target_pos)
+        # Angle: move toward the target (wrapped delta), capped at
+        # ROT_SPEED * dt (1 tick of rotation at the ship's max turn rate).
+        # The ship's max turn rate is ROT_SPEED * the hull's
+        # turn_rate_factor (the same cap the sim applies). In steady state
+        # the target angle moves <= this cap, so the smoothed angle tracks
+        # with zero lag. On a burst frame the target angle jumps 2 ticks,
+        # but the smoothed angle moves only 1 tick (capped).
+        ang_cap = ROT_SPEED * self._ship.hull.turn_rate_factor * dt
+        da = (target_angle - self._smooth_angle + math.pi) % (2 * math.pi) - math.pi
+        if abs(da) > ang_cap:
+            self._smooth_angle += math.copysign(ang_cap, da)
+        else:
+            self._smooth_angle = target_angle
+        return self._smooth_pos, self._smooth_angle
 
     def pos(self):
         """The ghost's current (x, y, angle) for rendering."""

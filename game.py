@@ -2349,14 +2349,19 @@ class Game:
         # Frame time of the frame that also ran the reconcile (the log
         # line is written in this same frame) — the snap's timing context.
         self.last_frame_dt = dt
-        # The ghost's INTERPOLATED render pose (lerp across the in-progress
-        # step, the same sub-step interpolation the host's local ship gets
-        # from _ship_pose). The local ship + its beams + the camera are
-        # drawn at this pose so they move together and glide instead of
-        # stepping in 60 Hz jumps. The fog still reads
-        # self.ghost.ship.pos (the current pose) — exactly like the host's
-        # _draw_local_ship.
-        gpos, gangle = self.ghost.render_pose()
+        # The ghost's SMOOTHED render pose (the decoupled visual layer —
+        # render_pose_smoothed chases the unsmoothed render pose at a
+        # bounded rate, so a burst frame's 2-tick jump is spread over 2
+        # frames instead of lurching the ship). The local ship + its
+        # beams + the camera are drawn at this pose so they move
+        # together and glide instead of stepping in 60 Hz jumps. The
+        # unsmoothed render_pose() is still used for the reconcile
+        # diagnostics (last_render_snap_px) — the phase-lock is
+        # measured on the unsmoothed pose, and the smoothed pose is a
+        # pure render helper (it never touches the physics). The fog
+        # still reads self.ghost.ship.pos (the current pose) — exactly
+        # like the host's _draw_local_ship.
+        gpos, gangle = self.ghost.render_pose_smoothed(dt)
         # Advance + cull the client-side death bursts (presentation).
         self._step_death_bursts(dt)
         # Age + cull the remote player's laser beams (T_BEAM events).

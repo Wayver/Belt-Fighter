@@ -17,24 +17,29 @@ The three relevant numbers (`config.py`):
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `FIRE_COOLDOWN` | `0.01` | min interval between shots → the gun *wants* **100 shots/s** |
+| `FIRE_COOLDOWN` | `0.01` | min interval between shots (shorter than a tick) |
 | `BULLET_LIFE` | `1.5` | seconds a bullet lives |
 | `MAX_BULLETS` | `12` | the "cap" |
 
-Without the cap, holding fire produces a steady **100 × 1.5 = 150 live
-bullets**. The cap is **12 — 8% of the natural count**. So the cap is not a
+> **Rate correction (measured, Phase 0):** `FIRE_COOLDOWN` (0.01) is shorter
+> than `TICK` (0.0167), so the gun fires **once per tick = 60/s**, not the
+> nominal 100/s. The capture confirms ~53–60/s. Natural live count =
+> **60 × 1.5 = 90 per player, 180 world (2P)** — not 150/300.
+
+Without the cap, holding fire produces a steady **90 live bullets per player
+(180 world)**. The cap is **12 — ~7% of the natural count**. So the cap is not a
 loose safety bound; it is **permanently hard-bound** the instant the trigger
 is held. That is the "overflow": the natural bullet population overflows the
 pool ~12×, so the **pool — not the input — is the dominant constraint**.
 
 What that produces, tick by tick, holding fire:
 
-- **t = 0 → 0.12 s:** the gun fires at its native 100/s, dumping all 12 (a burst).
-- **t = 0.12 → 1.5 s:** the pool is full → **no fire** (a 1.38 s dead zone).
-- **t = 1.5 → 1.62 s:** the 12 burst bullets expire one/tick, the pool refills, 12 more fire.
+- **t = 0 → 0.2 s:** the gun fires at its native 60/s, dumping all 12 (a burst).
+- **t = 0.2 → 1.5 s:** the pool is full → **no fire** (a 1.3 s dead zone).
+- **t = 1.5 → 1.7 s:** the 12 burst bullets expire one/tick, the pool refills, 12 more fire.
 - **repeat every 1.5 s.**
 
-So the cap silently converts a smooth 100/s laser into a **12-shot burst every
+So the cap silently converts a smooth 60/s laser into a **12-shot burst every
 1.5 s (8% duty cycle)**. That is almost certainly not the intended feel — it is
 a side effect of using a *pool size* as a *fire-rate* control.
 
@@ -340,7 +345,7 @@ host files needed).
   so a host gun that is *ready but capped* runs its cooldown negative
   ("ready but suppressed ~7 s"); the ghost, having fired, sits at +0.01.
 - **Mechanism refinement (vs. §1.2's assumption):** the ghost's local-draw
-  count is *not* tiny — it climbs to ~11 (mean 4.9; at 100 shots/s with a
+  count is *not* tiny — it climbs to ~11 (mean 4.9; at 60 shots/s with a
   0.1 s handoff delay the ghost holds ~10 of its own bullets). So the ghost's
   cap *does* bind — but the **host's WORLD cap binds first** (it counts both
   players' bullets), so the host stops firing while the ghost's *local* count
@@ -377,11 +382,12 @@ not a 1.5 s burst.
 
 1. **The sustained fire rate** (`FIRE_COOLDOWN`). The current *effective* rate
    is 8/s (a side effect of the cap). Removing the cap makes the rate
-   `1/FIRE_COOLDOWN`. Options (live bullets per player = `1.5 / FIRE_COOLDOWN`):
+   `min(1/FIRE_COOLDOWN, 60)` shots/s (the tick grid caps it at 60/s).
+   Options (live bullets per player = `rate × 1.5`):
 
    | `FIRE_COOLDOWN` | rate | live/player | world (2P) |
    |---|---|---|---|
-   | 0.01 | 100/s | 150 | 300 |
+   | 0.01 | 60/s (tick-capped) | 90 | 180 |
    | 0.02 | 50/s | 75 | 150 |
    | 0.05 | 20/s | 30 | 60 |
    | 0.10 | 10/s | 15 | 30 |
@@ -390,7 +396,7 @@ not a 1.5 s burst.
    manageable and the feel snappy; **re-tune bullet damage** to match (the
    current damage was effectively tuned against the 8/s cap rate).
 2. **`BULLET_POOL_MAX`** = ~2× the chosen world natural count (e.g. 120 for the
-   0.05 rate). Purely a safety net.
+   0.05 rate; 360 for the 0.01 rate). Purely a safety net.
 3. **Steady laser (Option A) vs. burst window (Option B).** Recommend **A** now;
    add B only if a burst feel is explicitly wanted.
 
@@ -400,7 +406,7 @@ not a 1.5 s burst.
 
 | Risk | Why | Mitigation |
 |---|---|---|
-| **Performance** — more live bullets → more bullet-vs-asteroid/ship checks | 300 bullets × ~20 rocks = 6000 checks/tick at the 0.01 rate | Pick a moderate rate (§7); profile the tick in Phase 4; if hot, add a cheap distance early-out or spatial bucketing — *without* touching the fire decision |
+| **Performance** — more live bullets → more bullet-vs-asteroid/ship checks | 180 bullets × ~20 rocks = 3600 checks/tick at the 0.01 rate | Pick a moderate rate (§7); profile the tick in Phase 4; if hot, add a cheap distance early-out or spatial bucketing — *without* touching the fire decision |
 | **Balance** — the sustained rate changes from an emergent 8/s to a chosen value | the cap was silently setting the rate | Make the rate an explicit knob; re-tune damage in Phase 4; playtest |
 | **Ghost draws a host-culled bullet** | the cull is world-dependent; the ghost doesn't reproduce it | Imperceptible (a 3 px dot for < 1 tick of its remaining life; presentation-only, never collides on the client). The ceiling is set above the natural count so this essentially never happens |
 | **A future world term re-breaks lockstep** | the whole fix rests on the fire decision being input-local | Document the invariant (§3.3) at the fire path; add a Phase-2 test that fails if ghost/host seqs ever diverge |

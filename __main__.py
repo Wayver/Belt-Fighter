@@ -1151,23 +1151,36 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
         est_now = game.host_time.now(now)
         if est_now is not None:
             game.ghost.record_input(est_now, inp)
-        # Advance the ghost to the CURRENT frame BEFORE the poll loop, so
-        # the reconcile (inside the loop) sees a current-frame pose/clock
-        # instead of the previous frame's — a 1-frame-stale clock sat 12 ms
-        # behind the fresh snapshot stamp and caused the ~8 px snap on
-        # nearly every reconcile. Mirrors predicted_view's advance (same
-        # dt/inp/enemies/clock); predicted_view's own advance later in the
-        # frame is a no-op on the step grid (the branch-2 clock is a pure
-        # function of real_time, and steps are boundary-based).
-        if game.ghost.seeded:
+        # Advance the ghost to the CURRENT frame using the estimator's
+        # CURRENT anchor. Called once before the poll (so no-snapshot
+        # frames still advance the ghost and the render sees a
+        # current-frame pose) and AGAIN after each snapshot's record() in
+        # the poll loop — record() moves the anchor to that snapshot, so
+        # the re-advance steps the ghost's PHYSICS POSE up to that
+        # snapshot's time before the reconcile. Without the in-poll
+        # re-advance, a double-arrival frame's second reconcile would
+        # overwrite the first reconcile's pose (auth at stamp1) with
+        # auth at stamp2 — a full tick of motion -> the 8.67 px snap,
+        # even with the clock correct. For a single arrival the in-poll
+        # re-advance is a no-op (the pre-poll advance already caught up).
+        # Mirrors predicted_view's advance (same dt/inp/enemies/clock);
+        # predicted_view's own advance later in the frame is a no-op on
+        # the step grid (the branch-2 clock is a pure function of
+        # real_time, and steps are boundary-based).
+        def _advance_ghost():
+            if not game.ghost.seeded:
+                return
             _rp = game.render_point.now()
-            if _rp is not None:
-                _pos = game.snap_buf.positions_at(_rp)
-                if _pos is not None:
-                    game.ghost.advance(
-                        dt, inp, enemies=game._ghost_enemy_proxies(_pos),
-                        real_time=now, host_time=game.host_time,
-                        rtt_ow=game._rtt_ow)
+            if _rp is None:
+                return
+            _pos = game.snap_buf.positions_at(_rp)
+            if _pos is None:
+                return
+            game.ghost.advance(
+                dt, inp, enemies=game._ghost_enemy_proxies(_pos),
+                real_time=now, host_time=game.host_time,
+                rtt_ow=game._rtt_ow)
+        _advance_ghost()
         # Poll the host: each snapshot feeds the host-time estimator (its
         # wire stamp vs the local arrival time — the estimator's
         # per-arrival jitter sample is the adaptive delay's input) and
@@ -1188,6 +1201,17 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
                         game._snap_log_f.flush()
                 if game.host_time.record(now, m["sim_time"]):
                     game.latency.update(game.host_time.last_jitter)
+                # Re-advance the ghost to the FRESH anchor (this snapshot's
+                # stamp) BEFORE the reconcile: record() above moved the
+                # anchor, so this steps the ghost's PHYSICS POSE up to this
+                # snapshot's time. In a double-arrival frame the pre-poll
+                # advance only caught up to the FIRST stamp; without this
+                # the second reconcile would overwrite the first
+                # reconcile's pose (auth at stamp1) with auth at stamp2 —
+                # a full tick of motion -> the 8.67 px snap, even with the
+                # clock correct. For a single arrival this is a no-op (the
+                # pre-poll advance already caught up to this stamp).
+                _advance_ghost()
                 # Reconcile at the ghost's clock anchored on THIS snapshot's
                 # FRESH anchor — not the once-per-frame game.ghost.sim_time
                 # (advanced before the poll loop, anchored on the PREVIOUS

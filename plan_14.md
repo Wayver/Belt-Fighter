@@ -1,6 +1,7 @@
 # Plan 14 — Input-Local Fire Decision (the Bullet-Cap Foundation Fix)
 
-**Status:** blueprint (source of truth for implementation). No code written yet.
+**Status:** Phase 0 (measure) DONE — drift confirmed, mechanism pinned down
+(see §6). Phase 1 (host fire path) is next.
 **Scope:** the player bullet + missile fire path (host + ghost). The "early
 enemy-bullet hit" presentation bug is **out of scope** here (it is a separate
 time-domain offset) — but this plan de-risks it by making the bullet system a
@@ -83,6 +84,11 @@ ghost's predicted bullet *and* the host's buffered bullet are both drawn. That
 is the "one stream spawning out of empty space." The seq resync on reconcile
 only fixes the *counter*, not the already-in-flight ghost-only bullet, so the
 double-draw persists until that bullet ages out (~1.5 s).
+
+> **Measured (Phase 0):** the divergence is real and bounded — the seq gap
+> sits at exactly +1 (the ghost fires one extra bullet per reconcile cycle,
+> always its "13th"), and 554 such host-never-fired bullets were captured in a
+> 63 s session. See §6 for the full measurement.
 
 **The deeper principle:** *the fire decision must be a pure function of state
 the ghost can reproduce (its own input + weapon state). A world bullet count is
@@ -313,12 +319,33 @@ round-trip already carries `bullet_seq` / `missile_seq` (ship snapshot fields
 
 ## 6. Phases (small, sequential, testable)
 
-**Phase 0 — Measure (no behavior change).** Add one telemetry row on the client
-per reconcile: `(ghost bullet_seq, host bullet_seq from snapshot,
-len(local_bullets), buffer player-bullet count, ghost gun cooldown, host gun
-cooldown)`. Confirm the seq/cooldown divergence actually occurs when the cap
-binds, and that a double-draw correlates with it. *Do not trust the theory —
-measure it, as we did for the clock.* (This also gives the before/after proof.)
+**Phase 0 — Measure (no behavior change). DONE.** Added `bullet_telemetry.py`
+(client-side, F3-gated, writes `bullet_debug.csv`) logging the bullet
+lifecycle (FIRE / RECONCILE / HANDBACK / DEDUP) + `tools/analyze_bullet_drift.py`.
+The RECONCILE row carries both the ghost's predicted `bullet_seq` + gun
+cooldown and the host's authoritative `bullet_seq` (snapshot field 24) +
+at-snapshot cooldown (field 18) — so the client file alone is sufficient (no
+host files needed).
+
+**Measured result (63 s 2P capture, sustained fire): DRIFT CONFIRMED.**
+- **SEQ GAP bounded at exactly +1** (2021 reconciles at 0, 1785 at +1, 3 at
+  −1, never above +1). Each reconcile resyncs the ghost's `bullet_seq` to the
+  host's, then the ghost fires **one more** before the next reconcile.
+- **The extra bullet is always the ghost's "13th"** — `1:12` when the host's
+  seq is 12. 554 true-extra bullets captured (a lower bound; DEDUP uses
+  change-detection). This is the double-draw.
+- **COOLDOWN DELTA: 47% of reconciles |delta| > 5 ms.** The negative host
+  cooldowns (down to −6.98 s) are *real*: in `Ship._fire`, `w.cooldown -= dt`
+  runs unconditionally and only resets to `fire_cooldown` when the gun fires,
+  so a host gun that is *ready but capped* runs its cooldown negative
+  ("ready but suppressed ~7 s"); the ghost, having fired, sits at +0.01.
+- **Mechanism refinement (vs. §1.2's assumption):** the ghost's local-draw
+  count is *not* tiny — it climbs to ~11 (mean 4.9; at 100 shots/s with a
+  0.1 s handoff delay the ghost holds ~10 of its own bullets). So the ghost's
+  cap *does* bind — but the **host's WORLD cap binds first** (it counts both
+  players' bullets), so the host stops firing while the ghost's *local* count
+  is still < 12 → the ghost fires one more → the +1 gap. Conclusion unchanged:
+  the world-vs-local cap mismatch is the driver.
 
 **Phase 1 — Host fire path.** Remove the two world gates; add the cull-oldest
 safety net. Single-player test: hold fire, assert (a) sustained rate =
@@ -383,8 +410,10 @@ not a 1.5 s burst.
 
 ## 9. Verification checklist
 
-- [ ] Phase 0 telemetry confirms the seq/cooldown divergence + its correlation
-      with the double-draw (before), and shows lockstep (after).
+- [x] Phase 0 telemetry confirms the seq/cooldown divergence + its correlation
+      with the double-draw (before) — DONE: seq gap bounded at +1, 554
+      host-never-fired bullets, 47% cooldown delta. (Re-run after Phase 1–2 to
+      confirm lockstep: gap stays 0, no true-extra bullets.)
 - [ ] Single-player: steady rate = `1/FIRE_COOLDOWN`; no burst-then-dead-zone;
       pool ≤ `BULLET_POOL_MAX`.
 - [ ] 2P: ghost `bullet_seq` / `missile_seq` + gun cooldown == host's across N

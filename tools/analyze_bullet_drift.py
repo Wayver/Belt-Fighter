@@ -19,10 +19,14 @@ The signals:
      non-zero delta = the two guns are out of phase (the ghost reset its
      cooldown on a shot the host didn't fire).
 
-  3. DOUBLE-DRAW (the visible symptom): per DEDUP row, a ghost bullet id
-     that is in NEITHER the buffer's drawn NOR skipped set = the ghost drew
-     a bullet the host never fired (its id drifted from the host's, so the
-     buffer has no matching copy to dedup against). Count these.
+  3. DOUBLE-DRAW (the visible symptom): a ghost bullet the host NEVER
+     fired. The clean test is `ghost bullet seq >= host_seq` (the host's
+     authoritative bullet_seq at that moment, correlated from the nearest
+     RECONCILE row) — the host's cap suppressed it, so its id drifted from
+     the host's and the buffer has no matching copy. (A raw "orphan" — a
+     ghost bullet absent from the buffer's drawn/skipped set — is
+     CONTAMINATED: it also counts normal prediction-ahead bullets the host
+     will fire a moment later, so it is reported only as context.)
 
   4. CAP BINDING (context): FIRE rows' f_cap_before (the ghost's local-draw
      count before the append) — if it stays tiny (0-2) while the host's
@@ -130,34 +134,52 @@ def main():
                  100.0 * len(big) / len(cdvals) if cdvals else 0.0))
 
     # ---- 3. DOUBLE-DRAW (the visible symptom) ----
+    # Correlate each DEDUP row with the nearest preceding RECONCILE's
+    # host_seq. A TRUE extra bullet = a ghost bullet with seq >= host_seq
+    # (the host never fired it — its cap suppressed it). This is the clean
+    # double-draw signal. (The raw "orphan" — absent from the buffer's
+    # drawn/skipped set — is contaminated by prediction-ahead bullets, so
+    # it is reported only as context.)
+    import bisect
+    rec_sorted = sorted(rec, key=lambda r: float(r["t"]))
+    rec_t = [float(r["t"]) for r in rec_sorted]
+    rec_hostseq = [int(r["r_snap_bseq"]) for r in rec_sorted]
     dd_total = 0
     dd_frames = 0
     dd_examples = []
+    orphan_total = 0
     for r in ded:
+        t = float(r["t"])
+        i = bisect.bisect_right(rec_t, t) - 1
+        if i < 0:
+            continue
+        host_seq = rec_hostseq[i]
         ghost = parse_ids(r["d_ghost_bids"])
         drawn = parse_ids(r["d_buf_bdrawn"])
         skipped = parse_ids(r["d_buf_bskipped"])
-        # A ghost bullet with no buffer counterpart (not drawn, not
-        # skipped) = the ghost drew a shot the host never fired.
+        extra = {b for b in ghost if b[1] >= host_seq}
         orphan = ghost - (drawn | skipped)
-        if orphan:
-            dd_total += len(orphan)
+        orphan_total += len(orphan)
+        if extra:
+            dd_total += len(extra)
             dd_frames += 1
             if len(dd_examples) < 8:
-                dd_examples.append((float(r["t"]),
-                                    sorted(orphan), sorted(ghost)))
-    print("\n== 3. DOUBLE-DRAW (ghost bullets with no buffer counterpart)")
-    print("  orphan bullets across DEDUP rows: %d (in %d frames)"
+                dd_examples.append((t, host_seq, sorted(extra),
+                                    sorted(ghost)))
+    print("\n== 3. DOUBLE-DRAW (ghost bullets the host NEVER fired)")
+    print("  TRUE extra bullets (ghost seq >= host_seq): %d (in %d frames)"
           % (dd_total, dd_frames))
+    print("  (context: raw 'orphan' bullets, incl. prediction-ahead: %d)"
+          % orphan_total)
     if dd_examples:
-        print("  examples (t, orphan_ids, all_ghost_ids):")
-        for t, orphan, ghost in dd_examples:
-            print("    t=%.3f  orphan=%s  ghost=%s"
-                  % (t,
-                     ",".join("%d:%d" % i for i in orphan),
+        print("  examples (t, host_seq, extra_ids, all_ghost_ids):")
+        for t, hs, extra, ghost in dd_examples:
+            print("    t=%.3f  host_seq=%d  extra=%s  ghost=%s"
+                  % (t, hs,
+                     ",".join("%d:%d" % i for i in extra),
                      ",".join("%d:%d" % i for i in ghost)))
     else:
-        print("  (no double-draw — every ghost bullet has a buffer copy)")
+        print("  (no double-draw — every ghost bullet was fired by the host)")
 
     # ---- 4. CAP BINDING (context) ----
     caps = [int(r["f_cap_before"]) for r in fir if r["f_cap_before"] != ""]

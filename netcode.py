@@ -1214,6 +1214,15 @@ class PredictedShip:
         # render_pose call (then it is initialized to the target).
         self._smooth_pos = None
         self._smooth_angle = None
+        # Whether the ship was DEAD on the last render_pose_smoothed
+        # call. When the ship respawns (dead->alive), the target pose
+        # jumps from the death location to the spawn point, and the
+        # smoothed pose would chase it at max_speed * dt per frame —
+        # the ship visibly "flies back" to the spawn point. The fix:
+        # on the dead->alive transition, reset the smoothed pose to the
+        # target instantly (the ship appears at the spawn point, not
+        # flying back). Set by render_pose_smoothed.
+        self._smooth_dead = False
         # The last ShipInput the ghost was stepped with (set in step()).
         # The render pre-step reads its .turn to predict the angular motion
         # over the L gap. None before the first step (the pre-step then
@@ -2349,21 +2358,46 @@ class PredictedShip:
         renders once seeded).
         """
         target_pos, target_angle = self.render_pose()
+        # The ship's dead state (the ghost is frozen while dead — advance()
+        # takes 0 steps, so the render pose is the death pose, static).
+        _dead = self._ship.dead
         if self._smooth_pos is None:
             # First call: initialize to the target (no smoothing yet).
             self._smooth_pos = pygame.Vector2(target_pos)
             self._smooth_angle = target_angle
+            self._smooth_dead = _dead
             return self._smooth_pos, self._smooth_angle
-        # Bounded-rate chase: move the smoothed pose toward the target,
-        # but at most `max_speed * dt` per frame (1 tick of motion at the
-        # ship's max speed). The ship's max speed is MAX_SPEED * the
-        # hull's max_speed_factor (the same cap the sim applies in
-        # Ship.update). In steady state the target moves <= this cap
-        # (the ship never exceeds max_speed), so the smoothed pose tracks
-        # with zero lag. On a burst frame the target jumps 2 ticks
+        # Dead->alive transition (respawn): the target pose jumps from the
+        # death location to the spawn point. The smoothed pose would chase
+        # it at max_speed * dt per frame — the ship visibly "flies back" to
+        # the spawn point. The fix: reset the smoothed pose to the target
+        # instantly (the ship appears at the spawn point, not flying back).
+        if self._smooth_dead and not _dead:
+            self._smooth_pos = pygame.Vector2(target_pos)
+            self._smooth_angle = target_angle
+            self._smooth_dead = _dead
+            return self._smooth_pos, self._smooth_angle
+        # While dead: the render pose is the death pose (static — the ghost
+        # is frozen). The smoothed pose tracks it exactly (no chase needed;
+        # the target is static). This keeps the smoothed pose at the death
+        # location while dead, so the dead->alive transition (above) resets
+        # it to the spawn point.
+        if _dead:
+            self._smooth_pos = pygame.Vector2(target_pos)
+            self._smooth_angle = target_angle
+            self._smooth_dead = _dead
+            return self._smooth_pos, self._smooth_angle
+        # Alive->alive: bounded-rate chase. Move the smoothed pose toward
+        # the target, but at most `max_speed * dt` per frame (1 tick of
+        # motion at the ship's max speed). The ship's max speed is
+        # MAX_SPEED * the hull's max_speed_factor (the same cap the sim
+        # applies in Ship.update). In steady state the target moves <= this
+        # cap (the ship never exceeds max_speed), so the smoothed pose
+        # tracks with zero lag. On a burst frame the target jumps 2 ticks
         # (2 * max_speed * TICK), but the smoothed pose moves only 1 tick
         # (max_speed * dt, with dt ~ TICK at 60 FPS) — the jump is spread
         # over 2 frames.
+        self._smooth_dead = _dead
         max_speed = MAX_SPEED * self._ship.hull.max_speed_factor
         pos_cap = max_speed * dt
         # Position: move toward the target, capped at pos_cap.

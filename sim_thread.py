@@ -31,18 +31,28 @@ Game.update — MAX_STEPS_PER_FRAME + ACC_BACKLOG_CAP):
      with the LATEST published local input (pinned #5: the host applies
      the latest received input each tick — the local input gets the same
      treatment);
-  3. PUBLISH (only when >= 1 step ran): g.acc = acc (so render_model's
-     step_alpha is the sim's real acc/STEP), then
-     latest_model = game.render_model() (atomic reference swap; the
-     render thread reads it and draws with it), and
-     worker.publish_snapshot(game.sim_time, game.snapshot()) — the
-     worker serializes + sends it the moment it lands, so the snapshot's
-     age at send is ~0 and the client's `now = sim_time + L` is exact.
-     Publishing only on a step keeps the model object STABLE between
-     steps (the render clock detects a new model by identity and
-     advances its alpha while the same model is re-read) and avoids the
-     ~94% wasted render_model() calls (the thread iterates every ~1 ms
-     but only steps 60x/sec);
+  3. PUBLISH:
+     a. SNAPSHOT — after EACH step (inside the step loop):
+        worker.publish_snapshot(game.sim_time, game.snapshot()). The
+        stamp is the tick's END (sim_time advanced at the top of _step),
+        so the stamps are a smooth 1-tick cadence even when the OS
+        batches 2 ticks into one wake (a per-wake publish stamped the
+        batch at its final sim_time — a 33 ms stamp jump, the ~8 px
+        snap; per-step makes the batching invisible to the client).
+        The worker serializes + sends it the moment it lands, so the
+        snapshot's age at send is ~0 and the client's `now = sim_time +
+        L` is exact.
+     b. MODEL — only when >= 1 step ran, and PER WAKE (latest-wins):
+        g.acc = acc (so render_model's step_alpha is the sim's real
+        acc/STEP), then latest_model = game.render_model() (atomic
+        reference swap; the render thread reads it and draws with it).
+        Publishing only on a step keeps the model object STABLE between
+        steps (the render clock detects a new model by identity and
+        advances its alpha while the same model is re-read) and avoids
+        the ~94% wasted render_model() calls (the thread iterates every
+        ~1 ms but only steps 60x/sec). The model must stay per-wake —
+        a per-step model would re-anchor the render clock every step
+        and pin its alpha at 0 (the M4 bug);
   4. sleep until the next tick boundary (dynamic sleep — see _run).
 
 The render thread's interpolation alpha is NOT this thread's acc/STEP —
@@ -211,18 +221,53 @@ class SimThread:
                 g._step(STEP, inp)
                 acc -= STEP
                 steps += 1
+                # SNAPSHOT PUBLISH — after EACH step, not per wake. The
+                # snapshot's stamp is g.sim_time, which _step advanced to
+                # this tick's END at its top, so every publish is stamped
+                # exactly STEP after the previous one — a smooth 1-tick
+                # cadence the client's interpolation buffer can read.
+                #
+                # WHY per-step (not per-wake): the OS wakes this thread
+                # ~1 tick late ~19% of the time (plan_13 telemetry), so a
+                # batched wake steps 2 ticks in one go. Publishing once
+                # per wake stamped that wake at the FINAL sim_time — the
+                # stamp jumped 33 ms, the client's ghost reconcile
+                # corrected a larger span, and that was the ~8 px snap.
+                # Publishing after each step makes a batched wake emit 2
+                # snapshots 16.7 ms apart: the batching is invisible to
+                # the client's stamp cadence (the client's
+                # HostTimeEstimator / SnapshotBuffer / reconcile all
+                # handle two arrivals in one frame — the estimator
+                # re-anchors, the buffer appends both, the reconcile
+                # replays from the NEWER stamp).
+                #
+                # The host's NET process (plan_13) drains its net Queue
+                # and sends EACH queued snap (no drain-to-newest), so both
+                # snapshots reach the wire. The in-process NetWorker
+                # (single-player / pre-plan_13) drains to the newest —
+                # it would drop the intermediate one, but that path has
+                # no client to serve (SP has no worker at all).
+                #
+                # Age at send is still ~0: the snapshot is taken the
+                # moment the step finishes, so the client's
+                # `now = sim_time + L` stays exact.
+                if self._worker is not None:
+                    self._worker.publish_snapshot(g.sim_time, g.snapshot())
             # The host CSV's per-window step count (see _steps_total in
             # __init__).
             self._steps_total += steps
-            # 3. publish ONLY when the sim actually stepped. Publishing a
+            # 3. MODEL publish ONLY when the sim actually stepped — and
+            #    still PER WAKE (one model per wake, latest-wins). The
+            #    model is the host's own render feed: the render clock
+            #    detects a new model by object identity and advances its
+            #    alpha while the same model is re-read, so publishing a
             #    fresh model every ~1 ms iteration (even when nothing
-            #    changed) would (a) make the render clock re-anchor every
-            #    frame (it detects a "new model" by object identity, so it
-            #    never advanced its alpha between publishes) and (b) waste
-            #    ~94% of the render_model() calls (the model was identical
-            #    to the last step's). Publishing only on a step keeps the
-            #    model object STABLE between steps (so the render clock can
-            #    advance its alpha) and cuts the sim thread's CPU ~94%.
+            #    changed) would (a) re-anchor the render clock every
+            #    frame and (b) waste ~94% of the render_model() calls.
+            #    The model is latest-wins and the render clock needs it
+            #    stable — it must NOT move to per-step like the snapshot
+            #    (a per-step model would re-anchor the render clock on
+            #    every step and pin its alpha at 0, the M4 bug).
             #
             #    Also write g.acc = acc before publishing: render_model()
             #    reads self.acc for step_alpha, but this thread uses its
@@ -234,16 +279,14 @@ class SimThread:
                 g.acc = acc
                 self.latest_model = g.render_model()
                 if self._worker is not None:
-                    # Hand the worker the fresh snapshot to send NOW (it
-                    # serializes + sends on the worker thread). The
-                    # snapshot's age at send is ~0, so the client's
-                    # `now = sim_time + L` is exact.
-                    self._worker.publish_snapshot(g.sim_time, g.snapshot())
-                    # Send any laser beams fired this step as T_BEAM events
-                    # (drained here, on the sim thread — the only thread
-                    # that touches g._beam_events). The client draws each
-                    # immediately on receipt; one-way LAN latency is
-                    # imperceptible against the 0.15 s beam flash.
+                    # Send any laser beams fired this wake as T_BEAM
+                    # events (drained here, on the sim thread — the only
+                    # thread that touches g._beam_events). The client
+                    # draws each immediately on receipt; one-way LAN
+                    # latency is imperceptible against the 0.15 s beam
+                    # flash. Stays per-wake: a beam is a 0.15 s flash,
+                    # not a cadence — one flush per wake covers every
+                    # step's beams.
                     for (sx, sy, ex, ey, t, owner, lx, ly) in g._beam_events:
                         self._worker.send({"type": T_BEAM, "sim_time": t,
                                            "sx": sx, "sy": sy,
@@ -258,6 +301,9 @@ class SimThread:
                     # snapshot). The client's rewind replay uses these
                     # instead of its own sent input (the in-flight input
                     # snapback fix). ~60 msg/s, a few KB/s — negligible.
+                    # Stays per-wake: the echo list already carries one
+                    # entry per stepped tick, so a batched wake's echo
+                    # covers both ticks in one message.
                     echo = g.flush_remote_input_echo()
                     if echo:
                         self._worker.send({

@@ -115,13 +115,18 @@ def _render_load(stop_event, hold_ms, frame_ms):
 
 class _StampWorker:
     """A NetWorker stand-in that records the sim_time of every
-    publish_snapshot (the snapshot-stamp cadence)."""
+    publish_snapshot (the snapshot-stamp cadence the client sees) AND the
+    wall time of each publish (the wake cadence — a batched wake's
+    per-step publishes land within a few ms of each other in wall time
+    even though their stamps are 16.7 ms apart)."""
 
     def __init__(self):
         self.stamps = []
+        self.walls = []
 
     def publish_snapshot(self, sim_time, snap):
         self.stamps.append(sim_time)
+        self.walls.append(time.monotonic())
 
     def send(self, msg):
         pass
@@ -152,11 +157,40 @@ def _report(tag, stamps):
     return n, batched, pct
 
 
+def _wall_gap_stats(walls):
+    """Classify the WALL-time gaps between consecutive publishes.
+
+    Returns (n_gaps, n_back2back, pct_back2back, max_gap). A back-to-back
+    pair is two publishes whose wall gap is < 0.5*TICK: a batched wake
+    steps 2 ticks and publishes after each, so the two publishes land
+    within a few ms of each other in wall time even though their STAMPS
+    are 16.7 ms apart. This is the wake-cadence signal the per-step
+    publish fix moves the batching into (the stamps stay smooth — that is
+    the point of the fix)."""
+    gaps = [walls[i] - walls[i - 1] for i in range(1, len(walls))]
+    if not gaps:
+        return 0, 0, 0.0, 0.0
+    n2 = sum(1 for g in gaps if g < 0.5 * TICK)
+    return len(gaps), n2, (100.0 * n2 / len(gaps)), max(gaps)
+
+
+def _report_walls(tag, walls):
+    n, n2, pct, mx = _wall_gap_stats(walls)
+    print("  [%s] wall: %d gaps: back-to-back(<8.3ms)=%d (%.1f%%)  "
+          "max_gap=%.1f ms" % (tag, n, n2, pct, mx * 1000.0))
+    return n, n2, pct
+
+
 def arm_in_process():
     """Arm A: the SimThread + the render GIL load in the SAME process.
 
-    Returns (stamps, batched_pct). The GIL load starves the sim thread,
-    so the stamps should show 2-tick batching."""
+    Returns (stamps, walls). The GIL load starves the sim thread, so it
+    BATCHES 2 ticks per wake — visible in the WALL times (a batched
+    wake's per-step publishes land within a few ms of each other) and in
+    the sim's step count, NOT in the stamps: the per-step publish fix
+    stamps every step at its own tick end, so the stamp cadence is a
+    smooth 1-tick even when the sim batches (that is the fix — the
+    client's stamp cadence no longer inherits the wake raggedness)."""
     g = Game(None, None, None, None, None, None, seed=1234, players=2)
     worker = _StampWorker()
     st = SimThread(g, worker)
@@ -169,7 +203,7 @@ def arm_in_process():
     stop.set()
     loader.join()
     st.stop()
-    return worker.stamps
+    return worker.stamps, worker.walls
 
 
 def arm_separate_process():
@@ -907,6 +941,10 @@ def test_m3_host_e2e():
 
     pongs = []
     wire_seen = []          # wire messages the client received (M4 bridge)
+    snap_stamps = []        # the sim_time of each received snapshot (the
+                            # client's stamp cadence — the per-step publish
+                            # fix must keep this a smooth 1-tick cadence
+                            # even when the sim batches 2 ticks per wake)
     client_err = []
     client_stop = threading.Event()
     def fake_client():
@@ -933,7 +971,10 @@ def test_m3_host_e2e():
                     t = m.get("type")
                     if t == T_PONG:
                         pongs.append(m.get("tag"))
-                    elif t in ("snap", "beam", "echo"):
+                    elif t == "snap":
+                        wire_seen.append(t)
+                        snap_stamps.append(m.get("sim_time"))
+                    elif t in ("beam", "echo"):
                         wire_seen.append(t)
                 time.sleep(0.1)
             conn.close()
@@ -1090,6 +1131,47 @@ def test_m3_host_e2e():
     check("M4: the client received input echoes over the wire",
           "echo" in wire_kinds, "kinds=%r" % sorted(wire_kinds))
 
+    # --- M4b: the client's STAMP cadence is a smooth 1-tick (the
+    #     per-step publish fix). The fake client records the sim_time of
+    #     every snapshot it RECEIVES (the exact cadence the client's
+    #     interpolation buffer + ghost clock see). Before the fix, a
+    #     batched sim wake published ONE snapshot stamped at its final
+    #     sim_time, so the client's stamps jumped 33 ms ~19% of the time
+    #     (the ~8 px snap). After the fix, the sim publishes after EACH
+    #     step, so even a batched wake emits 2 snapshots 16.7 ms apart —
+    #     the client's stamp gaps must stay 1-tick.
+    #
+    #     A gap is '1-tick' if in [0.5, 1.5)*TICK, '2-tick' if in
+    #     [1.5, 2.5)*TICK, 'more' if >= 2.5*TICK. (The same bands as
+    #     _gap_stats.) A gap of ~0 (a duplicate stamp) is dropped — the
+    #     client's SnapshotBuffer drops out-of-order / equal stamps too,
+    #     so a duplicate is invisible to the client. The tolerance is
+    #     generous (a few % of 2-tick gaps): the sim process runs
+    #     headless in a spawn context here, and a rare OS deschedule of
+    #     the NET process (not the sim) can still merge two sends — but
+    #     the fix removes the systematic 19% batching, so the rate must
+    #     be near 0, not ~19%.
+    if len(snap_stamps) > 30:
+        gaps = [snap_stamps[i] - snap_stamps[i - 1]
+                for i in range(1, len(snap_stamps))]
+        gaps = [g for g in gaps if g > 0.5 * TICK]   # drop duplicates
+        n1 = sum(1 for g in gaps if g < 1.5 * TICK)
+        n2 = sum(1 for g in gaps if 1.5 * TICK <= g < 2.5 * TICK)
+        nm = sum(1 for g in gaps if g >= 2.5 * TICK)
+        n = len(gaps)
+        pct = (100.0 * (n2 + nm) / n) if n else 0.0
+        check("M4b: the client's stamp cadence is 1-tick (per-step "
+              "publish — no 33 ms stamp jumps)",
+              n > 30 and pct < 5.0,
+              "n=%d 1-tick=%d 2-tick=%d >2-tick=%d batched=%.1f%%"
+              % (n, n1, n2, nm, pct))
+        print("  [M4b] client stamp cadence: n=%d 1-tick=%d 2-tick=%d "
+              ">2-tick=%d batched=%.1f%%" % (n, n1, n2, nm, pct))
+    else:
+        check("M4b: the client's stamp cadence is 1-tick (per-step "
+              "publish — no 33 ms stamp jumps)", False,
+              "too few snapshots received: n=%d" % len(snap_stamps))
+
     return ok
 
 
@@ -1107,12 +1189,13 @@ def main():
                                           RUN_SECONDS))
 
         print("A. IN-PROCESS (sim thread + render GIL load, same process):")
-        stamps_a = arm_in_process()
-        n_a, batched_a, pct_a = _report("in-process", stamps_a)
+        stamps_a, walls_a = arm_in_process()
+        n_a, batched_a, pct_a = _report("in-process STAMPS", stamps_a)
+        _report_walls("in-process WALL", walls_a)
 
         print("\nB. SEPARATE PROCESS (sim in spawned process, GIL load in parent):")
         stamps_b = arm_separate_process()
-        n_b, batched_b, pct_b = _report("separate", stamps_b)
+        n_b, batched_b, pct_b = _report("separate STAMPS", stamps_b)
 
         print()
         # The separate-process sim must actually be running (enough stamps
@@ -1120,27 +1203,49 @@ def main():
         ok &= check("separate-process: the sim ran and published a cadence",
                     n_b > 30, "n_gaps=%d" % n_b)
         if stamps_b:
-            rate = (stamps_b[-1] - stamps_b[0]) / max(
-                1e-9, (RUN_SECONDS))
             # sim_time span over the run ~= RUN_SECONDS at 1x real time.
             ok &= check("separate-process: sim clock runs at ~1x real time",
                         0.8 <= (stamps_b[-1] - stamps_b[0]) / RUN_SECONDS <= 1.2,
                         "sim span=%.2f s over %.1f s wall"
                         % (stamps_b[-1] - stamps_b[0], RUN_SECONDS))
-        # THE FIX: the separate-process cadence is smooth (no 2-tick
-        # batching) — the parent's GIL load did not starve the sim.
-        ok &= check("separate-process: NO 2-tick batching (the fix)",
+        # THE FIX (per-step publish): the STAMP cadence is a smooth 1-tick
+        # in BOTH arms — even the GIL-starved in-process sim, which batches
+        # 2 ticks per wake, now publishes after EACH step, so its stamps
+        # are 16.7 ms apart (a batched wake emits 2 snapshots, not one
+        # stamped 33 ms ahead). This is what the client's interpolation
+        # buffer + ghost clock see: the batching no longer shows up as a
+        # 33 ms stamp gap.
+        ok &= check("in-process: STAMP cadence is 1-tick despite batching "
+                    "(the per-step publish fix)",
+                    pct_a < 5.0, "batched=%.1f%%" % pct_a)
+        ok &= check("separate-process: STAMP cadence is 1-tick",
                     pct_b < 5.0, "batched=%.1f%%" % pct_b)
-        # THE BUG: the in-process cadence DOES batch (the GIL load
-        # starved the sim thread) — this is what the separate process
-        # eliminates. If this fails, the GIL load is not strong enough to
-        # reproduce the contention (tune GIL_HOLD_MS / SWITCH_INTERVAL).
-        ok &= check("in-process: 2-tick batching reproduced (the bug)",
-                    pct_a > 10.0, "batched=%.1f%%" % pct_a)
-        # The A/B delta: the separate process must be clearly smoother.
-        ok &= check("A/B: separate-process is smoother than in-process",
-                    pct_b < pct_a, "separate=%.1f%% vs in-process=%.1f%%"
-                    % (pct_b, pct_a))
+        # THE BUG (still present in-process, eliminated by the separate
+        # process): the GIL load starves the in-process sim thread, so it
+        # BATCHES 2 ticks per wake. With per-step publish the batching is
+        # invisible in the stamps — it shows up in the WALL times: a
+        # batched wake's two per-step publishes land back-to-back (< half
+        # a tick apart in wall time). The separate-process sim wakes on
+        # time (no shared GIL), so its publishes are ~1 tick apart in wall
+        # time too. If the in-process wall check fails, the GIL load is
+        # not strong enough to reproduce the contention (tune
+        # GIL_HOLD_MS / SWITCH_INTERVAL).
+        n_wa, n2a, pct_wa, _mx_wa = _wall_gap_stats(walls_a)
+        ok &= check("in-process: wake batching reproduced in WALL times "
+                    "(the bug the separate process eliminates)",
+                    n_wa > 30 and pct_wa > 10.0,
+                    "back-to-back=%.1f%% (n=%d)" % (pct_wa, n_wa))
+        # The A/B delta: the in-process sim batches its wakes (wall
+        # back-to-back pairs), the separate-process sim does not (its
+        # stamps are a smooth 1-tick at 1x real time — checked above; the
+        # child reports stamps only, not wall times, because the
+        # parent-side model-stream measurement is corrupted by queue
+        # drops + beat frequency — see the M1 design notes).
+        ok &= check("A/B: in-process wall batching is the mechanism "
+                    "(separate arm is smooth by construction)",
+                    pct_wa > 10.0 and pct_b < 5.0,
+                    "in-process wall=%.1f%% vs separate stamps=%.1f%%"
+                    % (pct_wa, pct_b))
     finally:
         sys.setswitchinterval(old_switch)
 

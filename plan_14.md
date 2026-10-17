@@ -12,7 +12,13 @@ the host across 30 reconciles, and no ghost-only missile id is ever drawn
 (see §6). Phase 4 (balance) DONE — the gun is now a max-auto-burst
 weapon: 6 shots at 20/s, then a 0.4 s rest (~8.6/s sustained, the old
 effective 8/s feel with a snappy burst), input-local on both peers so the
-lockstep holds (see §6). Phase 5 (regression + live playtest) is next.
+lockstep holds (see §6). Phase 5 (regression) DONE except the live 2P
+playtest — full suite green (one Phase-4 weapon-tuple regression found +
+fixed), tick profile within budget (mean 1.1 ms / max 2.4 ms vs the 16.67
+ms budget), fresh headless drift capture proves the ghost fires the same
+shots as the host (0 ghost-only ids). The live 2P playtest (feel + damage
+judgment + analyzer on the live F3 capture) is the last step — see the
+Playtest instructions in §6 Phase 5.
 **Scope:** the player bullet + missile fire path (host + ghost). The "early
 enemy-bullet hit" presentation bug is **out of scope** here (it is a separate
 time-domain offset) — but this plan de-risks it by making the bullet system a
@@ -559,15 +565,97 @@ lifetime to be observable at the lower rate). Full gate green:
 test_14_1/2/3, test_10_3b, test_render_model, test_determinism,
 test_snapshot, test_interpolation, test_10_7, test_net_process.
 
-**Phase 5 — Regression.** Full suite: `test_interpolation`,
-`test_determinism`, `test_10_*`, `test_snapshot`, `test_net_process`. Live
-2P playtest: the double-bullet is gone at all fire rates; the gun feels
-like a snappy 6-shot burst with a rest (no continuous auto-fire); the
-bullet damage (still 1.0) is judged here — if too hot, add a
-`BULLET_DAMAGE` constant and re-tune; dead→respawn and reconcile are
-still clean (`snap_px` / `render_snap_px` small). Re-run
-`tools/analyze_bullet_drift.py` on a fresh capture (expect seq gap 0,
-true-extra 0).
+**Phase 5 — Regression.** (a) Full suite, (b) tick profile, (c) fresh
+drift capture, (d) live 2P playtest (user).
+
+**(a) Full regression suite — DONE (one Phase-4 regression found + fixed).**
+Ran every test file (the `test_14_*` / `test_10_*` / `test_determinism` /
+`test_snapshot` / `test_interpolation` are standalone `main()` scripts run
+as `python -m ship5.<test>` from `/mnt`; `test_net_process` /
+`test_sim_process` / `test_sim_thread` are pytest-style). Result: **green
+except the 4 known pre-existing failures** (`test_10_3a_ghost_beams`,
+`test_10_9_ghost_pose`, `test_10_11c_phase_lock`, `test_network` — identical
+on the clean tree). **One genuine Phase-4 regression found and fixed:**
+Phase 4 added `Weapon.burst_count` as weapon-snapshot field 4 (so
+`apply_snapshot` unpacks a 4-tuple) but only updated `test_render_model`'s
+assert — it missed the `make_snap()` builders in `test_10_3a_ghost_beams`
+and `test_10_4_remote_beams`, which still built 3-tuples → `ValueError` on
+`apply_snapshot`. `test_10_4_remote_beams` was a real regression (passed at
+Phase 3, crashed at Phase 4) — now fixed → ALL PASS. `test_10_3a` was
+already failing at Phase 3 (beam re-anchor, a known pre-existing failure);
+Phase 4's 3-tuple crash had masked it — now restored to that known state.
+Commit `4a40440`.
+
+**(b) Tick profile — DONE, within budget.** New `profile_tick.py`
+(`python -m ship5.profile_tick`) profiles `Game._step()` under 2P sustained
+fire (the §8 worst case: both players firing, full asteroid field, 87
+rocks). Result: **mean 1.1 ms, max 2.4 ms per tick vs the 16.67 ms (60 Hz)
+budget — ~900 ticks/s sustained.** The bullet-vs-asteroid/ship collision
+checks at the chosen burst rate are trivially within budget; no spatial
+work needed. The §8 performance risk is resolved. Commit `2a517c1`.
+
+**(c) Fresh drift capture — DONE (clean signal; analyzer needs the live
+capture).** New `capture_drift.py` (`python -m ship5.capture_drift`) drives
+the REAL client loop path headlessly (host_time.record + latency.update on
+each arrival, push_snapshot seed+reconcile, predicted_view ghost-advance +
+id-dedup + DEDUP telemetry) with a scripted 2P host (player 1 holds fire,
+L=3-tick one-way latency). The bullet_telemetry hooks are the same ones the
+live F3 client uses. **Clean signal: host `bullet_seq` == ghost
+`bullet_seq` (88 == 88), NO GHOST-ONLY ID — the ghost fired exactly the
+same shots as the host in the real client loop. The double-draw is gone.**
+Commit `c968f80`. NOTE: the analyzer's SEQ GAP / TRUE-EXTRA metrics are
+contaminated by the L-tick prediction-ahead in this SYNTHETIC capture (the
+ghost is legitimately L ticks ahead of the stale snapshot stamp → a
+transient 0/1 gap, unlike the Phase-0 cap bug's STABLE +1 gap where the
+ghost fired a shot the host *never* fired). The clean ghost-only-id signal
+is the authoritative double-draw check; the **live F3 capture** (step d) is
+needed for the analyzer's literal "gap 0, true-extra 0" reading.
+
+**(d) Live 2P playtest — PENDING (user).** See the Playtest instructions
+below. The double-bullet is gone at all fire rates (proven in (a)+(c)); the
+remaining items are the FEEL (snappy 6-shot burst with a rest, no
+continuous auto-fire), the BULLET DAMAGE judgment (still 1.0 — if too hot,
+add a `BULLET_DAMAGE` constant and re-tune), and the snap checks
+(`snap_px` / `render_snap_px` small on dead→respawn and reconcile).
+
+**Playtest instructions (live 2P, user).** Two machines (or one machine,
+host + client on a second display). Machine A: `python -m ship5` → menu →
+**Host**. Machine B: `python -m ship5` → menu → **Join** (same seed if you
+want the same world). On the CLIENT (machine B) press **F3** to turn on the
+net-debug overlay (top-right) + the CSV logs (`bullet_debug.csv`,
+`net_debug.csv`, `ghost_clock.csv`). Then:
+
+1. **Double-bullet gone.** Both players hold fire (the gun) at each other
+   from mid-range for ~30 s. Watch the client's own bullets: there must be
+   NO "stream from empty space" (a bullet spawning a tick late / out of
+   phase with the host's). The F3 overlay's `SNAP x.xx px` should stay small
+   (a few px, not tens).
+2. **Gun feel.** The gun is a max-auto-burst: 6 shots, then a 0.4 s rest.
+   Holding fire should feel like a snappy 6-shot burst with a gap — NOT a
+   continuous laser, NOT a 12-shot-every-1.5-s dead zone. Tap-tap-tap
+   (releasing between bursts) must NOT dodge the rest (the burst does not
+   reset on release).
+3. **Bullet damage (the open judgment).** The bullet damage is still 1.0
+   (hardcoded in `Ship.register_hit`). At the new ~8.6/s sustained rate the
+   DPS is ~2.5× the old effective 8/s. Judge: is it too hot (killing
+   enemies too fast) or about right? If too hot, add a `BULLET_DAMAGE`
+   constant (default 1.0) to `config.py` and read it in
+   `Ship.register_hit`, then re-tune (e.g. 0.4).
+4. **Dead→respawn + reconcile clean.** Kill the client's ship (or let it
+   die), respawn, and confirm the ghost does NOT snap on respawn or on a
+   reconcile — the F3 `SNAP` stays small and `net_debug.csv`'s
+   `snap_px` / `render_snap_px` columns stay small (single-digit px).
+5. **Analyzer on the live capture.** After the session, run
+   `python tools/analyze_bullet_drift.py` (from the workspace root). Expect
+   **seq gap 0** (the live snapshot stamp is current relative to the ghost's
+   clock, so the prediction-ahead contamination that affects the synthetic
+   capture is absent) and **true-extra 0** (no ghost bullet the host never
+   fired). This is the literal Phase-5 checklist reading.
+
+If all of 1–5 check out, Phase 5 is complete and the bullet-cap foundation
+fix is done. The deferred presentation bugs (the "early enemy-bullet hit"
+and the ghost bullet spawn/angle misalignment at rest — §5) are the next
+focused pass.
 
 ---
 
@@ -647,7 +735,20 @@ true-extra 0).
       `test_interpolation`, `test_determinism`, `test_snapshot`,
       `test_net_process` all pass. (Phase 1: all green; `test_snapshot`
       needed the particles-oracle fix — see §6 Phase 1.)
-- [ ] Tick profile at the chosen rate is within budget.
+- [x] Tick profile at the chosen rate is within budget. (Phase 5:
+      `profile_tick.py` — 2P sustained fire, both players firing, 87 rocks:
+      mean 1.1 ms, max 2.4 ms per tick vs the 16.67 ms budget, ~900 ticks/s
+      sustained. The §8 collision-check risk is resolved.)
+- [x] Fresh drift capture: the ghost fires the SAME shots as the host (no
+      ghost-only id). (Phase 5: `capture_drift.py` drives the real client
+      loop headlessly — host `bullet_seq` == ghost `bullet_seq` (88 == 88),
+      0 ghost-only ids. The analyzer's literal "gap 0, true-extra 0" reading
+      needs the live F3 capture below — the synthetic capture's gap metric is
+      contaminated by the L-tick prediction-ahead.)
 - [ ] Live 2P playtest: the "stream from empty space" is gone; the gun feels
-      like a steady weapon; dead→respawn and reconcile are still clean
-      (`snap_px` / `render_snap_px` small).
+      like a snappy 6-shot burst with a rest (no continuous auto-fire); the
+      bullet damage (still 1.0) is judged (if too hot, add a
+      `BULLET_DAMAGE` constant and re-tune); dead→respawn and reconcile are
+      still clean (`snap_px` / `render_snap_px` small); the analyzer on the
+      live F3 capture shows seq gap 0, true-extra 0. (See the Playtest
+      instructions in §6 Phase 5.)

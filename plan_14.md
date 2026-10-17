@@ -6,7 +6,10 @@ input-local, cull-oldest safety net in place, single-player sustained fire
 = 60/s with pool at the natural 90 (see §6). Phase 2 (ghost fire path)
 DONE — the ghost's local-draw gate is gone, the ghost is in bullet_seq /
 cooldown lockstep with the host across 30 reconciles, and no ghost-only id
-is ever drawn (see §6). Phase 3 (missiles) is next.
+is ever drawn (see §6). Phase 3 (missiles) DONE — the ghost's missile
+local-draw gate is gone, the ghost is in missile_seq / lock lockstep with
+the host across 30 reconciles, and no ghost-only missile id is ever drawn
+(see §6). Phase 4 (balance + performance) is next.
 **Scope:** the player bullet + missile fire path (host + ghost). The "early
 enemy-bullet hit" presentation bug is **out of scope** here (it is a separate
 time-domain offset) — but this plan de-risks it by making the bullet system a
@@ -324,6 +327,29 @@ round-trip already carries `bullet_seq` / `missile_seq` (ship snapshot fields
 - **Enemy bullets** — untouched (not player-fired; no cap problem).
 - The "early enemy-bullet hit" presentation bug — **out of scope** (separate
   time-domain offset; revisit after this lands).
+- **Ghost bullet spawn/angle misalignment at rest — DEFERRED (user report,
+  2026-10-17, observed in a live 2P test).** Symptom: after moving the ship
+  (rotating or flying) then coming to COMPLETE rest (the B button), firing —
+  the bullets do not align with the front of the ship; they are off by a
+  small angle, or appear to spawn a tiny distance from the "correct" visual
+  spawn point. **Hypothesis (UNVERIFIED — confirm the exact settling when we
+  dig in):** a render-pose-vs-physics-pose offset. A bullet spawns from the
+  ghost's PHYSICS pose (`shot.pos` / `shot.vel` captured at the fire tick),
+  but the ship is DRAWN at the RENDER pose (the smoothed/interpolated
+  `_prev→curr` lerp + `v·_acc`). Beams hide this because they re-anchor to
+  the render pose every frame; bullets can't, because they have already
+  flown off. It is most visible after a hard stop because that is when the
+  render pose/angle settles to a value slightly off from the physics
+  pose/angle (during motion the continuous lerp keeps them close, or the
+  motion masks it). **NOT a Phase 2 regression** — Phase 2 only changed how
+  MANY bullets the ghost holds (removed the local-draw cap, added the
+  cull-oldest net); it did not touch WHERE a bullet spawns or WHICH WAY it
+  flies (still `shot.pos` / `shot.vel` from the fire tick's physics pose,
+  byte-for-byte as before). Same class as the deferred "early enemy-bullet
+  hit" presentation bug (render vs. sim / time-domain). **Action:** bundle
+  with the early-enemy-bullet-hit into ONE focused presentation pass after
+  the lockstep foundation (Phases 3–5) lands; do not interleave with the
+  missile work.
 
 ---
 
@@ -440,8 +466,64 @@ tracks the presentation list's depth — the cap it measured is gone).
   matches → the double-bullet is gone at the root. The 2P asymmetry
   expected after Phase 1 (ghost firing fewer than the host) is resolved.
 
-**Phase 3 — Missiles.** Same two edits for the missile path. 2P test: assert
-`missile_seq` lockstep + no double-draw. Re-run `test_10_3b_ghost_missiles`.
+**Phase 3 — Missiles. DONE.** Same two edits as Phase 2, mirrored for the
+missile path in `PredictedShip.step`: removed the ghost's local-draw gate
+(`len(self.local_missiles) < MAX_MISSILES`) and added the matching
+cull-oldest safety net (`while len(self.local_missiles) > MISSILE_POOL_MAX:
+pop(0)`), mirroring the host (Phase 1) and the bullet net (Phase 2). The
+re-fire guard (`if any(tuple(g.id) == mid ...): continue`) is KEPT — it
+makes the reconcile replay idempotent, and it now works *because* the seqs
+are in lockstep. The `_mtel` FIRE telemetry (f_guard=0 created / f_guard=1
+suppressed) is kept. `MAX_MISSILES` is no longer read by the ghost — and
+after this edit **nothing reads it at all** (the host's missile gate was
+removed in Phase 1); the constant stays in config for Phase 4 (balance).
+`netcode.py` now imports `MISSILE_POOL_MAX` (dropped `MAX_MISSILES`).
+
+- **New test `test_14_3_missile_lockstep`** (2P host + client ghost, same
+  input stream — player 1 holds the missile key — fixed 3-tick one-way
+  latency, isolated world with ONE stationary TestTarget 300 px ahead of
+  the nose so the missile lock actually fires): drives 300 ticks with a
+  snapshot every 10 ticks and proves, measured PRE-reconcile (the
+  prediction vs the host's actual state at the same instant — a
+  post-reconcile comparison would be masked by the rewind replay):
+  1. **SEQ LOCKSTEP** — the ghost's predicted `missile_seq` == the host's
+     at all 30 reconciles (gap 0 every time).
+  2. **LOCK LOCKSTEP** — max |ghost − host| predicted `lock_progress` =
+     0.0 over 30 reconciles (the lock is the missile's rate limiter — a
+     drift here desyncs the NEXT launch even if the current seqs agree).
+  3. **NO GHOST-ONLY ID** — every in-flight ghost missile id was launched
+     by the host (3 in flight; host launched 6 total).
+  4. **GHOST LAUNCHES THE SAME MISSILES** — 6 launches == the host's 6
+     over 300 ticks (the 0.8 s lock-rebuild cadence); the presentation
+     list stayed ≤ `MISSILE_POOL_MAX` (max 3; natural ~3.75).
+  **Test harness note:** unlike `test_14_2` (the gun fires regardless of
+  target), the missile path needs the reconcile REWIND REPLAY to see the
+  target — the replay builds its enemy proxies from `render_point.now()`
+  + the buffer window, so the test delivers a snapshot to the buffer each
+  tick and advances the render point + latency each tick (mirroring the
+  game loop). Without that the replay runs targetless and resets the
+  ghost's lock (a false lockstep break).
+- **Cadence correction (vs §1.3 / the Phase-3 brief's "2.5 natural
+  count"):** the missile cadence is the **lock-rebuild** (0.8 s —
+  `lock_progress` resets to 0 on launch and rebuilds over
+  `missile_lock_time`), NOT `MISSILE_COOLDOWN` (1.2 s) — grep confirms
+  `MISSILE_COOLDOWN` is read by nothing (only config.py references it).
+  Natural live count = `MISSILE_LIFE / 0.8` = **3.75/player** (measured:
+  6 launches in 5 s). Phase 4 should size `MISSILE_POOL_MAX` off the
+  0.8 s cadence, not 1.2 s.
+- **Full gate PASS:** `test_14_3_missile_lockstep`,
+  `test_10_3b_ghost_missiles` (its RECONCILE-DEDUP check depends on the
+  re-fire guard — still green), `test_14_2_ghost_lockstep` (bullets still
+  in lockstep — no regression), `test_determinism`, `test_snapshot`,
+  `test_interpolation`, `test_10_7_bullet_dedup`, `test_net_process`.
+  Full suite green except the 4 known pre-existing failures (identical on
+  the clean tree): `test_10_3a_ghost_beams`, `test_10_9_ghost_pose`,
+  `test_10_11c_phase_lock`, `test_network`.
+- **Missiles are now input-local on BOTH peers**, like bullets: the fire
+  decision reads only the player's own input + weapon state (the
+  lock-rebuild is the rate limiter), so `missile_seq` and lock stay in
+  lockstep → the id-dedup always matches → the double-missile is gone at
+  the root.
 
 **Phase 4 — Balance + performance.** Set the final `FIRE_COOLDOWN` /
 `BULLET_POOL_MAX` (§7); re-tune bullet damage to the new sustained rate;
@@ -503,8 +585,10 @@ not a 1.5 s burst.
       reconciles; **no ghost-only bullet id ever drawn** (no double-draw).
       (Phase 2: `test_14_2_ghost_lockstep` — gap 0 at all 30 reconciles,
       cooldown delta 0.0 s, 0 ghost-only ids.)
-- [ ] 2P (missiles): ghost `missile_seq` == host's across N reconciles; no
-      ghost-only missile id ever drawn. (Phase 3.)
+- [x] 2P (missiles): ghost `missile_seq` == host's across N reconciles; no
+      ghost-only missile id ever drawn. (Phase 3: `test_14_3_missile_lockstep`
+      — gap 0 at all 30 reconciles, lock delta 0.0, 0 ghost-only ids, 6
+      launches == the host's 6.)
 - [x] `test_10_7_bullet_dedup`, `test_10_3b_ghost_missiles`,
       `test_interpolation`, `test_determinism`, `test_snapshot`,
       `test_net_process` all pass. (Phase 1: all green; `test_snapshot`

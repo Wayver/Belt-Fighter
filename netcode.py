@@ -66,7 +66,7 @@ import pygame
 from .config import (INTERP_DELAY, INTERP_DELAY_MIN, INTERP_DELAY_MAX,
                     ADAPT_K, SNAPSHOT_INTERVAL, SNAPSHOT_BUFFER_MAX, TICK,
                     MAX_FRAME_DT, ROT_SPEED, MAX_SPEED,
-                    MAX_MISSILES, BULLET_POOL_MAX,
+                    BULLET_POOL_MAX, MISSILE_POOL_MAX,
                     MISSILE_SPEED, MISSILE_ACCEL, MISSILE_BOOST_TIME,
                     MISSILE_TURN_RATE, MISSILE_LIFE,
                     SENSOR_SIGNATURE_THRESHOLD, SENSOR_SIG_FULL)
@@ -1754,54 +1754,68 @@ class PredictedShip:
             self.local_beams.append(
                 [beam.local_start, beam.end.copy(), 0.0, BEAM_TTL])
         # Keep the ghost's own LAUNCHED missiles as presentation
-        # GhostMissiles. Each gets the SAME unique id the host assigns at
-        # launch — (player_index, per-ship seq) — and the ghost's
+        # GhostMissiles. The fire decision is INPUT-LOCAL (plan_14 Phase 3):
+        # every missile the ghost's weapon state produces is kept — the old
+        # local-draw cap (len(local_missiles) < MAX_MISSILES) mirrored the
+        # host's old WORLD cap, which the ghost could not reproduce, so it
+        # launched a different set of missiles than the host and desynced
+        # missile_seq (the double-missile). The list is policed by the
+        # cull-oldest safety net below (MISSILE_POOL_MAX, mirroring the
+        # host's) — performance only, never a fire gate. The lock-rebuild
+        # (lock_progress resets to 0 on launch, 0.8 s to rebuild) is the
+        # real rate limiter. Each gets the SAME unique id the host assigns
+        # at launch — (player_index, per-ship seq) — and the ghost's
         # missile_seq is bumped to match (it is resynced to the host's via
         # the ship snapshot on reconcile, so the ids stay aligned). The
         # target is the buffer proxy the ghost locked (m.target is a
-        # _GhostEnemyProxy); homing re-resolves it by id each step. The
-        # host's world cap (MAX_MISSILES) is mirrored as a cap on the
-        # ghost's own list (a faithful stand-in — the lock-rebuild cooldown
-        # is the real limiter).
+        # _GhostEnemyProxy); homing re-resolves it by id each step.
         for m in missiles:
-            if len(self.local_missiles) < MAX_MISSILES:
-                seq_before = s.missile_seq
-                mid = (self.local_index, seq_before)
-                s.missile_seq += 1
-                # The reconcile REWIND (reconcile_rewind) re-runs the fire
-                # tick after apply_snapshot has RESET missile_seq to the
-                # host's pre-fire value — so the replay re-fires the SAME
-                # missile with the SAME id the prediction already emitted
-                # in advance(). Without this guard the ghost would hold two
-                # GhostMissiles of one id (the in-flight one + a fresh one
-                # at the muzzle): the player sees "two missiles" (one right
-                # behind the other) and, because the buffer's copy is
-                # suppressed by the id-dedup, BOTH of the visible ones are
-                # collision-less ghost missiles that pass through the
-                # target and orbit it. Skip the re-fire when the id is
-                # already in flight (the prediction's copy is the fresher
-                # one — it has already integrated the host's flight).
-                guard = any(tuple(g.id) == mid for g in self.local_missiles)
-                if guard:
-                    # TELEMETRY: a re-fire was SUPPRESSED. If the
-                    # suppressed id differs from the in-flight id, the seq
-                    # resync drifted — capture it.
-                    _mtel.log("FIRE", f_mid=_mtel.fmt_ids([mid]),
-                              f_seq_before=seq_before,
-                              f_seq_after=s.missile_seq, f_guard=1,
-                              f_local_ids=_mtel.fmt_ids(
-                                  (tuple(g.id) for g in self.local_missiles)))
-                    continue
-                self.local_missiles.append(
-                    GhostMissile(m.pos, m.vel, mid, target=m.target))
-                # TELEMETRY: a GhostMissile was CREATED. This is the id the
-                # ghost will dedup + handback on. seq_before/after show the
-                # counter move; f_local_ids is the full in-flight set.
+            seq_before = s.missile_seq
+            mid = (self.local_index, seq_before)
+            s.missile_seq += 1
+            # The reconcile REWIND (reconcile_rewind) re-runs the fire
+            # tick after apply_snapshot has RESET missile_seq to the
+            # host's pre-fire value — so the replay re-fires the SAME
+            # missile with the SAME id the prediction already emitted
+            # in advance(). Without this guard the ghost would hold two
+            # GhostMissiles of one id (the in-flight one + a fresh one
+            # at the muzzle): the player sees "two missiles" (one right
+            # behind the other) and, because the buffer's copy is
+            # suppressed by the id-dedup, BOTH of the visible ones are
+            # collision-less ghost missiles that pass through the
+            # target and orbit it. Skip the re-fire when the id is
+            # already in flight (the prediction's copy is the fresher
+            # one — it has already integrated the host's flight).
+            guard = any(tuple(g.id) == mid for g in self.local_missiles)
+            if guard:
+                # TELEMETRY: a re-fire was SUPPRESSED. If the
+                # suppressed id differs from the in-flight id, the seq
+                # resync drifted — capture it.
                 _mtel.log("FIRE", f_mid=_mtel.fmt_ids([mid]),
                           f_seq_before=seq_before,
-                          f_seq_after=s.missile_seq, f_guard=0,
+                          f_seq_after=s.missile_seq, f_guard=1,
                           f_local_ids=_mtel.fmt_ids(
                               (tuple(g.id) for g in self.local_missiles)))
+                continue
+            self.local_missiles.append(
+                GhostMissile(m.pos, m.vel, mid, target=m.target))
+            # TELEMETRY: a GhostMissile was CREATED. This is the id the
+            # ghost will dedup + handback on. seq_before/after show the
+            # counter move; f_local_ids is the full in-flight set.
+            _mtel.log("FIRE", f_mid=_mtel.fmt_ids([mid]),
+                      f_seq_before=seq_before,
+                      f_seq_after=s.missile_seq, f_guard=0,
+                      f_local_ids=_mtel.fmt_ids(
+                          (tuple(g.id) for g in self.local_missiles)))
+        # Cull-oldest performance safety net (plan_14 Phase 3, mirrors the
+        # host's in Game._step): the list is in launch order (newest at the
+        # back), so pop(0) is the oldest. MISSILE_POOL_MAX sits well above
+        # the natural count (~3.75/player at the 0.8 s lock-rebuild
+        # cadence), so this never binds in normal play — it polices the
+        # presentation list without ever changing whether a missile
+        # launches.
+        while len(self.local_missiles) > MISSILE_POOL_MAX:
+            self.local_missiles.pop(0)
 
     def _pick_laser_target(self, s, enemies):
         """Nearest enemy proxy within the max laser range; None if no laser

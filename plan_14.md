@@ -9,7 +9,10 @@ cooldown lockstep with the host across 30 reconciles, and no ghost-only id
 is ever drawn (see §6). Phase 3 (missiles) DONE — the ghost's missile
 local-draw gate is gone, the ghost is in missile_seq / lock lockstep with
 the host across 30 reconciles, and no ghost-only missile id is ever drawn
-(see §6). Phase 4 (balance + performance) is next.
+(see §6). Phase 4 (balance) DONE — the gun is now a max-auto-burst
+weapon: 6 shots at 20/s, then a 0.4 s rest (~8.6/s sustained, the old
+effective 8/s feel with a snappy burst), input-local on both peers so the
+lockstep holds (see §6). Phase 5 (regression + live playtest) is next.
 **Scope:** the player bullet + missile fire path (host + ghost). The "early
 enemy-bullet hit" presentation bug is **out of scope** here (it is a separate
 time-domain offset) — but this plan de-risks it by making the bullet system a
@@ -525,38 +528,81 @@ removed in Phase 1); the constant stays in config for Phase 4 (balance).
   lockstep → the id-dedup always matches → the double-missile is gone at
   the root.
 
-**Phase 4 — Balance + performance.** Set the final `FIRE_COOLDOWN` /
-`BULLET_POOL_MAX` (§7); re-tune bullet damage to the new sustained rate;
-profile the tick with the new bullet count (see §8).
+**Phase 4 — Balance. DONE.** User decision: no continuous auto-fire —
+the gun is a **max-auto-burst** weapon: `GUN_BURST_SIZE = 6` shots at the
+within-burst rate, then a `GUN_BURST_REST = 0.4` s gap. `FIRE_COOLDOWN =
+0.049` (20/s within-burst — see the §7 rate-table correction: 0.05 would
+quantize to 15/s), `BULLET_POOL_MAX = 80` (safety net, ~3× the natural
+26 world). Sustained rate = 6 / (6×0.049 + 0.4) ≈ **8.6/s** — the old
+effective 8/s feel, but a snappy burst instead of a dead zone. Natural
+live bullets track the SUSTAINED rate: 8.6/s × 1.5 s ≈ 13/player (26
+world). Bullet damage stays 1.0 (judge in the Phase-5 playtest).
 
-**Phase 5 — Regression.** Full suite: `test_interpolation`, `test_determinism`,
-`test_10_*`, `test_snapshot`, `test_net_process`. Live 2P playtest: the
-double-bullet is gone at all fire rates; the gun feels like a steady weapon,
-not a 1.5 s burst.
+Mechanism: `Weapon.burst_count` (new field, synced as weapon-snapshot
+field 4) + ~5 lines in `Ship._fire` — after the Nth shot the burst
+resets and the cooldown gets the extra rest. The decision is
+**input-local** (a pure function of input + the ship's own
+`burst_count`), so the host and the client's ghost (which runs the same
+`Ship._fire`) fire the same bursts — the Phase 1–3 lockstep contract is
+preserved with **no netcode change**. Releasing fire does NOT reset the
+burst (no tap-tap-tap to dodge the gap); a brownout pauses it (the count
+only advances when a shot actually fires). Enemies are unaffected (their
+own `fire_timer` path).
+
+Tests: `test_14_1` now proves the burst pattern (bursts of exactly 6,
+max 1 shot/tick, total == an exact float-cooldown reference simulation);
+`test_14_2` check 4 is now "ghost total fired == host total fired" (the
+real fire-gate guard; the retired "grew past MAX_BULLETS 12" check no
+longer discriminates at the low rate); `test_interpolation`'s bullet
+window scan extended 20 → 120 ticks (a drop-out needs a full bullet
+lifetime to be observable at the lower rate). Full gate green:
+test_14_1/2/3, test_10_3b, test_render_model, test_determinism,
+test_snapshot, test_interpolation, test_10_7, test_net_process.
+
+**Phase 5 — Regression.** Full suite: `test_interpolation`,
+`test_determinism`, `test_10_*`, `test_snapshot`, `test_net_process`. Live
+2P playtest: the double-bullet is gone at all fire rates; the gun feels
+like a snappy 6-shot burst with a rest (no continuous auto-fire); the
+bullet damage (still 1.0) is judged here — if too hot, add a
+`BULLET_DAMAGE` constant and re-tune; dead→respawn and reconcile are
+still clean (`snap_px` / `render_snap_px` small). Re-run
+`tools/analyze_bullet_drift.py` on a fresh capture (expect seq gap 0,
+true-extra 0).
 
 ---
 
-## 7. Open decisions (need a balance call before Phase 4)
+## 7. Balance decisions (resolved in Phase 4)
 
-1. **The sustained fire rate** (`FIRE_COOLDOWN`). The current *effective* rate
-   is 8/s (a side effect of the cap). Removing the cap makes the rate
-   `min(1/FIRE_COOLDOWN, 60)` shots/s (the tick grid caps it at 60/s).
-   Options (live bullets per player = `rate × 1.5`):
+1. **The fire rate.** RESOLVED: the user does not want continuous auto-fire —
+   the gun is a **max-auto-burst** weapon (6 shots, 0.4 s rest). The
+   within-burst rate is set by `FIRE_COOLDOWN`.
 
-   | `FIRE_COOLDOWN` | rate | live/player | world (2P) |
+   **Rate-table correction (measured, not derived):** the gun's cooldown is a
+   FLOAT (`cd -= TICK; if cd <= 0: fire; cd = FIRE_COOLDOWN`), so the tick
+   grid QUANTIZES the rate — the original table below was wrong. The
+   achievable rates (simulated with the exact code pattern):
+
+   | `FIRE_COOLDOWN` | original table | **actual** | live/player (×1.5 s) |
    |---|---|---|---|
-   | 0.01 | 60/s (tick-capped) | 90 | 180 |
-   | 0.02 | 50/s | 75 | 150 |
-   | 0.05 | 20/s | 30 | 60 |
-   | 0.10 | 10/s | 15 | 30 |
+   | 0.01 | 60/s | 60/s ✓ | 90 |
+   | 0.02 | 50/s | **30/s** | 45 |
+   | 0.05 | 20/s | **15/s** (slips to the 4-tick band) | 22.5 |
+   | 0.049 | — | **20/s** (3-tick band) | 30 |
+   | 0.033 | — | 30/s | 45 |
+   | 0.10 | 10/s | **8.6/s** | 12.9 |
 
-   A starting point of **0.05 (20/s, 30 live/player)** keeps the count
-   manageable and the feel snappy; **re-tune bullet damage** to match (the
-   current damage was effectively tuned against the 8/s cap rate).
-2. **`BULLET_POOL_MAX`** = ~2× the chosen world natural count (e.g. 120 for the
-   0.05 rate; 360 for the 0.01 rate). Purely a safety net.
-3. **Steady laser (Option A) vs. burst window (Option B).** Recommend **A** now;
-   add B only if a burst feel is explicitly wanted.
+   0.05 lands just past the 3-tick boundary (0.05 > 3×0.01667) and drops to
+   15/s; **0.049** is the value that actually gives 20/s (any value in
+   [0.045, 0.05) works; 0.049 sits mid-band, robust to float wobble).
+2. **`BULLET_POOL_MAX` = 80.** RESOLVED. ~3× the natural world count (26 at
+   the 8.6/s sustained rate). Purely a safety net.
+3. **Steady laser (Option A) vs. burst window (Option B).** RESOLVED: the
+   burst feel is now explicit (the max-auto-burst gate), so Option B's
+   motivation is moot; the laser is unchanged.
+4. **Bullet damage.** RESOLVED: stays 1.0 (hardcoded in
+   `Ship.register_hit` — there is no `BULLET_DAMAGE` constant). At 8.6/s
+   sustained the DPS is ~2.5× the old effective 8/s × 1.0 — judge in the
+   Phase-5 playtest; if too hot, add a `BULLET_DAMAGE` constant then.
 
 ---
 
@@ -564,8 +610,8 @@ not a 1.5 s burst.
 
 | Risk | Why | Mitigation |
 |---|---|---|
-| **Performance** — more live bullets → more bullet-vs-asteroid/ship checks | 180 bullets × ~20 rocks = 3600 checks/tick at the 0.01 rate | Pick a moderate rate (§7); profile the tick in Phase 4; if hot, add a cheap distance early-out or spatial bucketing — *without* touching the fire decision |
-| **Balance** — the sustained rate changes from an emergent 8/s to a chosen value | the cap was silently setting the rate | Make the rate an explicit knob; re-tune damage in Phase 4; playtest |
+| **Performance** — more live bullets → more bullet-vs-asteroid/ship checks | was 180 bullets × ~20 rocks = 3600 checks/tick at the 0.01 rate | RESOLVED (Phase 4): the burst gate drops the natural world count to ~26 (8.6/s sustained × 1.5 s × 2P) — ~676 checks/tick, back below the pre-bug level. No spatial work needed. |
+| **Balance** — the sustained rate changes from an emergent 8/s to a chosen value | the cap was silently setting the rate | RESOLVED (Phase 4): explicit max-auto-burst (6 shots, 0.4 s rest) ≈ 8.6/s sustained — the old feel, deliberately. Damage stays 1.0; judged in the Phase-5 playtest. |
 | **Ghost draws a host-culled bullet** | the cull is world-dependent; the ghost doesn't reproduce it | Imperceptible (a 3 px dot for < 1 tick of its remaining life; presentation-only, never collides on the client). The ceiling is set above the natural count so this essentially never happens |
 | **A future world term re-breaks lockstep** | the whole fix rests on the fire decision being input-local | Document the invariant (§3.3) at the fire path; add a Phase-2 test that fails if ghost/host seqs ever diverge |
 | **Determinism** | the host fire path changes | The fire decision + cull are pure functions of state → the host stays deterministic; the Phase-1 determinism-oracle run proves it |
@@ -578,9 +624,17 @@ not a 1.5 s burst.
       with the double-draw (before) — DONE: seq gap bounded at +1, 554
       host-never-fired bullets, 47% cooldown delta. (Re-run after Phase 1–2 to
       confirm lockstep: gap stays 0, no true-extra bullets.)
-- [x] Single-player: steady rate = `1/FIRE_COOLDOWN`; no burst-then-dead-zone;
-      pool ≤ `BULLET_POOL_MAX`. (Phase 1: `test_14_1_sustained_fire` — 60/s,
-      pool 90, never > 400.)
+- [x] Single-player: the fire pattern is as designed; pool ≤
+      `BULLET_POOL_MAX`. (Phase 1: `test_14_1_sustained_fire` — 60/s steady,
+      pool 90. Phase 4: re-proven as the BURST pattern — bursts of exactly
+      `GUN_BURST_SIZE` 6, max 1 shot/tick, total == an exact
+      float-cooldown reference sim, pool ~13, never > 80.)
+- [x] 2P (bullets, Phase 4 burst): the ghost fires the SAME bursts as the
+      host — ghost total fired == host total fired, at most 1 shot/tick,
+      seq/cooldown lockstep still gap 0 (the burst gate is input-local, so
+      the Phase-2 lockstep survives the rate change).
+      (`test_14_2_ghost_lockstep` — 44 == 44 shots, gap 0 at all 30
+      reconciles, cooldown delta 0.0 s, 0 ghost-only ids.)
 - [x] 2P (bullets): ghost `bullet_seq` + gun cooldown == host's across N
       reconciles; **no ghost-only bullet id ever drawn** (no double-draw).
       (Phase 2: `test_14_2_ghost_lockstep` — gap 0 at all 30 reconciles,

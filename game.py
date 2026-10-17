@@ -344,11 +344,12 @@ def _sync_local_ship(standin, pack):
     s.power_supply = pack["power_supply"]
     s.compute_used = pack["compute_used"]
     s.compute_supply = pack["compute_supply"]
-    for w, (cooldown, charge, lock_progress) in zip(s.weapons,
-                                                    pack["weapons"]):
+    for w, (cooldown, charge, lock_progress, burst_count) in \
+                zip(s.weapons, pack["weapons"]):
         w.cooldown = cooldown
         w.charge = charge
         w.lock_progress = lock_progress
+        w.burst_count = burst_count
 
 
 def _draw_local_ship(screen, cam, standin, pack, alpha,
@@ -1187,7 +1188,7 @@ class Game:
             "power_supply": p.power_supply,
             "compute_used": p.compute_used,
             "compute_supply": p.compute_supply,
-            "weapons": [(w.cooldown, w.charge, w.lock_progress)
+            "weapons": [(w.cooldown, w.charge, w.lock_progress, w.burst_count)
                         for w in p.weapons],
             # Per-player death — draw() shows the dead player the
             # respawn screen (and skips the corpse's shield ring).

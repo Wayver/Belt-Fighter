@@ -8,17 +8,19 @@ Headless: sets SDL_VIDEODRIVER=dummy before pygame.init().
 
 Phase 1 removed the host's WORLD fire gates (len(self.bullets) >=
 MAX_BULLETS) from Game._step. The fire decision is now INPUT-LOCAL
-(cooldown + power only), so holding fire produces a STEADY stream at the
-tick-capped rate (60/s) instead of the old 12-shot-burst-then-1.3s-dead-zone
-cycle. This test proves the host side of that (single-player, so no ghost /
-no lockstep concern — that is Phase 2):
+(cooldown + power only). Phase 4 added the max-auto-burst gate: holding
+fire fires GUN_BURST_SIZE shots at the within-burst rate (20/s), then the
+gun rests GUN_BURST_REST seconds before the next burst. This test proves
+the host side of that (single-player, so no ghost / no lockstep concern —
+that is Phase 2):
 
-  1. SUSTAINED RATE — holding fire for N ticks fires EXACTLY one shot per
-     tick (the ship's bullet_seq delta == 1 every tick): no burst (delta > 1)
-     and no dead zone (delta == 0). Total fired == N == the 60/s tick-capped
-     rate (min(1/FIRE_COOLDOWN, 60)).
+  1. BURST PATTERN — holding fire for N ticks fires in bursts of exactly
+     GUN_BURST_SIZE shots (per-tick bullet_seq delta is 0 or 1, never > 1),
+     with a GUN_BURST_REST gap after each burst, and the total fired matches
+     the expected burst count for N ticks.
   2. POOL GROWS TO NATURAL — the live bullet count climbs to the natural
-     ~90 (60/s x BULLET_LIFE 1.5 s), NOT capped at the old MAX_BULLETS 12.
+     ~13 (the SUSTAINED rate 8.6/s x BULLET_LIFE 1.5 s), NOT capped at the
+     old MAX_BULLETS 12.
   3. POOL BOUNDED — the live count never exceeds BULLET_POOL_MAX (the
      cull-oldest safety net; it never binds at the natural count).
 """
@@ -29,7 +31,8 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 import pygame
 
 from .config import (WIDTH, HEIGHT, TICK, FIRE_COOLDOWN, BULLET_LIFE,
-                     MAX_BULLETS, BULLET_POOL_MAX)
+                     MAX_BULLETS, BULLET_POOL_MAX, GUN_BURST_SIZE,
+                     GUN_BURST_REST)
 from .fog import make_light_texture
 from .game import Game, STEP
 from .intent import ShipInput
@@ -87,41 +90,81 @@ def main():
     # we instead step the fixed loop directly with an explicit ShipInput to
     # hold fire. We call g._step(STEP, fire_inp) — the same fixed step
     # g.update would run — to keep the measurement exact (one step per call).
-    min_delta = None
-    max_delta = None
+    deltas = []
     max_live = 0
     live = 0
     for _ in range(N_TICKS):
         seq_before = ship.bullet_seq
         g._step(STEP, fire_inp)
-        delta = ship.bullet_seq - seq_before
-        min_delta = delta if min_delta is None else min(min_delta, delta)
-        max_delta = delta if max_delta is None else max(max_delta, delta)
+        deltas.append(ship.bullet_seq - seq_before)
         live = len(g.bullets)
         max_live = max(max_live, live)
 
     total_fired = ship.bullet_seq
 
-    # --- 1. SUSTAINED RATE: exactly one shot per tick (no burst, no dead
-    # zone). The tick grid caps the rate at 60/s (FIRE_COOLDOWN 0.01 < TICK
-    # 0.0167), so holding fire fires once per tick = N shots over N ticks.
-    rate_ok = (min_delta == 1 and max_delta == 1 and total_fired == N_TICKS)
-    if rate_ok:
-        print(f"PASS: sustained rate — {total_fired} shots over {N_TICKS} "
-              f"ticks, exactly 1/tick (no burst, no dead zone) = "
-              f"{total_fired / (N_TICKS * TICK):.0f}/s "
-              f"(min(1/FIRE_COOLDOWN, 60) = "
-              f"{min(round(1.0 / FIRE_COOLDOWN), 60)}/s)")
+    # The expected total: simulate the SAME float cooldown + burst gate the
+    # ship runs (cd -= TICK; fire when cd <= 0; burst_count gates the rest).
+    # This is the exact reference — if the burst logic is wrong (size, gap,
+    # or within-burst rate), the total diverges.
+    def expected_total(n_ticks):
+        cd, bc, total = 0.0, 0, 0
+        for _ in range(n_ticks):
+            cd -= TICK
+            if cd <= 0:
+                total += 1
+                bc += 1
+                if bc >= GUN_BURST_SIZE:
+                    bc = 0
+                    cd = FIRE_COOLDOWN + GUN_BURST_REST
+                else:
+                    cd = FIRE_COOLDOWN
+        return total
+
+    exp = expected_total(N_TICKS)
+
+    # Group shots into bursts: a new burst starts when the gap since the
+    # previous shot exceeds the within-burst spacing (3 ticks at 20/s). The
+    # between-burst gap is ~27 ticks, so this cleanly separates them.
+    burst_sizes = []
+    last_shot_tick = None
+    for t, d in enumerate(deltas):
+        if d:
+            if last_shot_tick is None or (t - last_shot_tick) > 3:
+                burst_sizes.append(1)
+            else:
+                burst_sizes[-1] += 1
+            last_shot_tick = t
+
+    # --- 1. BURST PATTERN: at most one shot per tick (the within-burst rate
+    # is 1 shot / 3 ticks), the total matches the exact reference, and every
+    # COMPLETE burst is exactly GUN_BURST_SIZE shots (the last may be
+    # truncated by N_TICKS).
+    pattern_ok = (max(deltas) <= 1 and total_fired == exp
+                  and all(s == GUN_BURST_SIZE for s in burst_sizes[:-1])
+                  and (not burst_sizes or burst_sizes[-1] <= GUN_BURST_SIZE))
+    if pattern_ok:
+        print(f"PASS: burst pattern — {total_fired} shots over {N_TICKS} "
+              f"ticks in {len(burst_sizes)} bursts of "
+              f"{burst_sizes[0] if burst_sizes else 0} "
+              f"(= {total_fired / (N_TICKS * TICK):.1f}/s sustained, "
+              f"{1.0 / FIRE_COOLDOWN:.0f}/s within-burst); "
+              f"max 1 shot/tick, total == expected {exp}")
     else:
         ok = False
-        print(f"FAIL: sustained rate — min_delta={min_delta} "
-              f"max_delta={max_delta} total_fired={total_fired} "
-              f"(want exactly 1/tick, total == {N_TICKS})")
+        print(f"FAIL: burst pattern — max_delta={max(deltas)} "
+              f"total_fired={total_fired} (expected {exp}) "
+              f"burst_sizes={burst_sizes} (want all complete bursts == "
+              f"{GUN_BURST_SIZE})")
 
-    # --- 2. POOL GROWS TO NATURAL: the live count climbs to ~90 (60/s x
-    # BULLET_LIFE 1.5 s), NOT capped at the old MAX_BULLETS 12.
-    natural = round(60 * BULLET_LIFE)   # 90
-    pool_ok = (max_live > MAX_BULLETS and 85 <= live <= 95)
+    # --- 2. POOL GROWS TO NATURAL: the live count climbs to ~13 (the
+    # SUSTAINED rate 8.6/s x BULLET_LIFE 1.5 s), NOT capped at the old
+    # MAX_BULLETS 12. The burst gate keeps the sustained rate at ~8.6/s,
+    # so the live count tracks THAT (a burst's 6 shots are in flight
+    # alongside the tail of the previous burst's).
+    sustained = (GUN_BURST_SIZE /
+                 (GUN_BURST_SIZE * FIRE_COOLDOWN + GUN_BURST_REST))
+    natural = round(sustained * BULLET_LIFE)   # ~13
+    pool_ok = (max_live > MAX_BULLETS and 10 <= live <= 16)
     if pool_ok:
         print(f"PASS: pool grows to natural — live count reached {live} "
               f"(steady state), max {max_live} > old cap {MAX_BULLETS} "

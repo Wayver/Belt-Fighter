@@ -34,18 +34,23 @@ ghost each tick so the rewind replay has the host's actual input.
      by the host (it is in the host's fired set). The Phase-0
      "host-never-fired" bullet (the ghost's 13th, 554 captured) is the
      double-draw; it must never appear.
-  4. GHOST FIRES THE SAME SHOTS — the ghost fires every tick the host
-     does (sustained fire = 1 shot/tick on both, total == the host's).
-     The FIRE COUNT is the real guard against a reintroduced fire gate:
-     a cap on the fire decision would make the ghost fire fewer than the
-     host. The presentation list also grows past the old MAX_BULLETS 12
-     (the gate is gone) and stays under BULLET_POOL_MAX (the cull bounds
-     it). NOTE: the list settles a bit below the host's natural 90
-     (~70 here) because the rewind replay re-steps the presentation
-     bullets (aging their life by the replay span) — a harmless
-     presentation artifact (the buffer draws the authoritative bullets;
-     the ghost's list is short-lived prediction), NOT a fire-path bug. A
-     no-reconcile run reaches exactly 90.
+  4. GHOST FIRES THE SAME SHOTS — the ghost fires the SAME SHOTS the host
+     does (Phase 4's burst gate is input-local, so both fire the same
+     6-shot bursts with the same gaps): the ghost's total fired == the
+     host's total fired, and at most 1 shot/tick (the within-burst rate
+     is 1 shot / 3 ticks). The FIRE COUNT is the real guard against a
+     reintroduced fire gate: a cap on the fire decision would make the
+     ghost fire fewer than the host. The presentation list is non-empty
+     (the ghost actually fired + kept bullets) and stays under
+     BULLET_POOL_MAX (the cull bounds it). NOTE: at the Phase-4 sustained
+     rate (~8.6/s) the natural live count is ~13, so the list no longer
+     grows past the old MAX_BULLETS 12 — that Phase-2 "grew past 12"
+     check is retired; the total-fired equality is the real fire-gate
+     guard now. The list also settles a bit below the host's natural ~13
+     because the rewind replay re-steps the presentation bullets (aging
+     their life by the replay span) — a harmless presentation artifact
+     (the buffer draws the authoritative bullets; the ghost's list is
+     short-lived prediction), NOT a fire-path bug.
 
 The world is ISOLATED (no enemies/asteroids, update_field no-op'd) so
 the only thing that removes a bullet is its own life — collisions can't
@@ -58,8 +63,9 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
 import pygame
 
-from .config import (WIDTH, HEIGHT, TICK, BULLET_LIFE, MAX_BULLETS,
-                     BULLET_POOL_MAX)
+from .config import (WIDTH, HEIGHT, TICK, BULLET_LIFE,
+                     BULLET_POOL_MAX, FIRE_COOLDOWN, GUN_BURST_SIZE,
+                     GUN_BURST_REST)
 from .fog import make_light_texture
 from .game import Game, STEP
 from .intent import ShipInput
@@ -252,29 +258,38 @@ def main():
         print("FAIL: no ghost-only id — %d ghost ids the host never "
               "fired: %r" % (len(ghost_only), ghost_only[:5]))
 
-    # --- 4. GHOST FIRES THE SAME SHOTS: sustained fire = 1 shot/tick on
-    # the ghost too (no burst, no dead zone — the gate is gone), its list
-    # grew past the old MAX_BULLETS 12 (the gate would have capped it
-    # there), and it stayed under BULLET_POOL_MAX (the cull never binds at
-    # the natural count).
-    natural = round(60 * BULLET_LIFE)   # 90
-    rate_ok = (ghost_min_delta == 1 and ghost_max_delta == 1
-               and ghost_fired_ticks == N_TICKS)
-    grew_ok = ghost_max_list > MAX_BULLETS
+    # --- 4. GHOST FIRES THE SAME SHOTS: Phase 4's burst gate is
+    # input-local, so the ghost fires the SAME 6-shot bursts (with the
+    # same gaps) as the host — the real lockstep check is that the ghost's
+    # TOTAL fired == the host's total fired (a reintroduced fire gate
+    # would make the ghost fire fewer). At most 1 shot/tick (the
+    # within-burst rate is 1 shot / 3 ticks; the gap ticks fire 0). The
+    # presentation list is non-empty (the ghost actually fired + kept
+    # bullets) and stays under BULLET_POOL_MAX (the cull never binds at
+    # the natural count). NOTE: at the Phase-4 sustained rate (~8.6/s) the
+    # natural live count is ~13, so the list no longer grows past the old
+    # MAX_BULLETS 12 — that Phase-2 "grew past 12" check is retired; the
+    # total-fired equality is the real fire-gate guard now.
+    sustained = (GUN_BURST_SIZE /
+                 (GUN_BURST_SIZE * FIRE_COOLDOWN + GUN_BURST_REST))
+    natural = round(sustained * BULLET_LIFE)   # ~13
+    rate_ok = (ghost_max_delta <= 1
+               and ghost_fired_ticks == len(host_fired))
+    fired_ok = ghost_max_list > 0
     bound_ok = ghost_max_list <= BULLET_POOL_MAX
-    if rate_ok and grew_ok and bound_ok:
+    if rate_ok and fired_ok and bound_ok:
         print("PASS: ghost fires the same shots — %d shots over %d ticks "
-              "(exactly 1/tick, == the host's %d), list grew to %d "
-              "(> old cap %d, <= BULLET_POOL_MAX %d; natural ~%d)"
+              "(== the host's %d, at most 1/tick), list peaked at %d "
+              "(<= BULLET_POOL_MAX %d; natural ~%d)"
               % (ghost_fired_ticks, N_TICKS, len(host_fired),
-                 ghost_max_list, MAX_BULLETS, BULLET_POOL_MAX, natural))
+                 ghost_max_list, BULLET_POOL_MAX, natural))
     else:
         ok = False
         print("FAIL: ghost fires the same shots — fired=%d/%d "
-              "min_delta=%r max_delta=%r max_list=%d (want 1/tick, "
-              "> %d, <= %d)"
+              "min_delta=%r max_delta=%r max_list=%d (want == host's %d, "
+              "max 1/tick, > 0, <= %d)"
               % (ghost_fired_ticks, N_TICKS, ghost_min_delta,
-                 ghost_max_delta, ghost_max_list, MAX_BULLETS,
+                 ghost_max_delta, ghost_max_list, len(host_fired),
                  BULLET_POOL_MAX))
 
     pygame.quit()

@@ -45,7 +45,8 @@ from .config import (WIDTH, HEIGHT, ROT_SPEED, MAX_SPEED,
                      TARGETING_COMPUTE_PER_TARGET, LASER_DUMP_DECAY, LASER_COLOR,
                      SHIELD_IMPACT_TTL, SHIELD_IMPACT_SPREAD, SHIELD_IMPACT_SPREAD_TIME,
                      SHIELD_IMPACT_STEPS, SENSOR_COLOR, SENSOR_SCAN_COLOR, SCAN_DUMP_DECAY,
-                     HULL_COLLISION_INSET, MISSILE_COLOR, MISSILE_LAUNCH_SPEED)
+                     HULL_COLLISION_INSET, MISSILE_COLOR, MISSILE_LAUNCH_SPEED,
+                     GUN_BURST_SIZE, GUN_BURST_REST)
 
 from .hulls import DEFAULT_HULL, default_loadout, Slot, ComponentType
 
@@ -86,6 +87,11 @@ class Weapon:
     allocation: float = 1.0
     charge: float = 0.0
     lock_progress: float = 0.0
+    # Max-auto-burst gate (plan_14 Phase 4): shots fired in the current
+    # burst. Synced via the weapon snapshot (field 4) so the client's ghost
+    # resumes the host's burst mid-gap. Input-local: a pure function of
+    # input + this state, so host and ghost fire the same bursts.
+    burst_count: int = 0
 
 
 def _lerp_color(c1, c2, t):
@@ -360,7 +366,7 @@ class Ship:
     #                              recomputed next tick, but snapshotting it
     #                              keeps a restored ship render-consistent
     #                              before its first step)
-    #   weapons: per weapon (cooldown, charge, lock_progress)
+    #   weapons: per weapon (cooldown, charge, lock_progress, burst_count)
     #   id                         owner tag for shots (enemy id = None/0)
     #   missile_seq, bullet_seq    per-ship launch/fire counters. The host
     #                              bumps them; the client's ghost resyncs
@@ -413,7 +419,7 @@ class Ship:
             self.sensor_on,
             self.scan_cd, self.scan_reveal, self.scan_dump, self.scan_pulse,
             self.brownout, self.power_factor,
-            tuple((w.cooldown, w.charge, w.lock_progress)
+            tuple((w.cooldown, w.charge, w.lock_progress, w.burst_count)
                   for w in self.weapons),
             self.id,
             self.dead,   # per-player death
@@ -458,10 +464,12 @@ class Ship:
         self.scan_pulse = scan_pulse
         self.brownout = brownout
         self.power_factor = power_factor
-        for w, (cooldown, charge, lock_progress) in zip(self.weapons, weapons):
+        for w, (cooldown, charge, lock_progress, burst_count) in \
+                zip(self.weapons, weapons):
             w.cooldown = cooldown
             w.charge = charge
             w.lock_progress = lock_progress
+            w.burst_count = burst_count
         self.id = ship_id
         self.dead = dead
         self.missile_seq = missile_seq   # resync the launch counter
@@ -682,6 +690,15 @@ class Ship:
         and it has power allocation. The cooldown always ticks down and
         firing resets it to fire_cooldown, so a ship that can't fire
         (browned out) fires the instant it can.
+
+        Max-auto-burst gate (plan_14 Phase 4): each shot bumps
+        w.burst_count; after GUN_BURST_SIZE shots the burst resets and the
+        cooldown gets an extra GUN_BURST_REST (the gap before the next
+        burst). INPUT-LOCAL — a pure function of input + the ship's own
+        burst_count (synced via the weapon snapshot), so the host and the
+        client's ghost fire the same bursts. Releasing fire does NOT reset
+        the burst (no tap-tap-tap to dodge the gap); a brownout pauses it
+        (the count only advances when a shot actually fires).
         """
         shots = []
         for w in self.weapons:
@@ -695,7 +712,12 @@ class Ship:
                 ox, oy = w.slot.orientation
                 vel = (fwd * ox + right * oy) * w.comp.bullet_speed
                 shots.append(Shot(self.to_world(*w.slot.position), vel, self.id))
-                w.cooldown = w.comp.fire_cooldown
+                w.burst_count += 1
+                if w.burst_count >= GUN_BURST_SIZE:
+                    w.burst_count = 0
+                    w.cooldown = w.comp.fire_cooldown + GUN_BURST_REST
+                else:
+                    w.cooldown = w.comp.fire_cooldown
         return shots
 
     def _integrate(self, dt, accel):

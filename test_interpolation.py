@@ -1320,7 +1320,12 @@ def main():
     dt_h = SNAPSHOT_INTERVAL * STEP
     n_popin = n_persist = n_dropout = 0
     bullet_ok = True
-    for w in range(20):
+    # Scan 120 one-tick windows (2 s) — long enough to span a bullet
+    # lifetime (BULLET_LIFE 1.5 s = 90 ticks) so a drop-out (a bullet
+    # alive at tick t, dead at t+1) is observed. At the Phase-4 burst rate
+    # (~8.6/s sustained) the bullets alive at the scan start don't expire
+    # within a short 20-tick scan, so the drop-out case would be vacuous.
+    for w in range(120):
         prev_s = hb.snapshot()
         for t in range(SNAPSHOT_INTERVAL):
             hb.update(STEP, script_input(WARMUP + w * SNAPSHOT_INTERVAL + t))
@@ -1384,7 +1389,7 @@ def main():
     elif bullet_ok:
         print(f"PASS: bullets — {n_popin} pop-in at curr pos, "
               f"{n_persist} persistent on the straight line, "
-              f"{n_dropout} drop-out absent (20 windows)")
+              f"{n_dropout} drop-out absent (120 windows)")
     else:
         ok = False
 

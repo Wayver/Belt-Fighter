@@ -36,23 +36,37 @@ ROT_SPEED = 3.6
 MAX_SPEED = 520.0
 BULLET_SPEED = 860.0
 BULLET_LIFE = 1.5
-# The fire-rate knob (plan_14): the gun fires when input is held, the
-# cooldown has elapsed, and power is allocated — INPUT-LOCAL, no world
-# term. FIRE_COOLDOWN (0.01) < TICK (0.0167), so the tick grid caps the
-# sustained rate at 60/s; natural live bullets = 60 x BULLET_LIFE = 90 per
-# player (180 world at 2P). The final value is a Phase-4 balance call.
-FIRE_COOLDOWN = 0.01
+# The within-burst fire-rate knob (plan_14 Phase 4): the gun fires when
+# input is held, the cooldown has elapsed, and power is allocated —
+# INPUT-LOCAL, no world term. The cooldown is a FLOAT (cd -= TICK), so the
+# tick grid quantizes the rate: 0.049 lands in the 3-tick band (0.045,
+# 0.05) -> exactly 20 shots/s (0.05 would slip to the 4-tick band = 15/s;
+# see the Phase-4 rate table correction in plan_14 §7). The SUSTAINED rate
+# is set by the burst gate below, not by this value.
+FIRE_COOLDOWN = 0.049
+# Max-auto-burst gate (plan_14 Phase 4): holding fire fires GUN_BURST_SIZE
+# shots, then the gun rests GUN_BURST_REST seconds before the next burst.
+# The decision is INPUT-LOCAL (a pure function of input + the ship's own
+# burst_count, which is synced via the weapon snapshot) so the host and the
+# client's ghost fire the same bursts — the Phase 1-3 lockstep contract.
+# Releasing fire does NOT reset the burst (no tap-tap-tap to dodge the
+# gap). 6 shots at 20/s + 0.4 s rest ~= 8.6/s sustained (the old effective
+# 8/s feel, but with a snappy burst instead of a dead zone). Natural live
+# bullets track the SUSTAINED rate (not the within-burst rate): 8.6/s x
+# BULLET_LIFE 1.5 s ~= 13/player (26 world at 2P).
+GUN_BURST_SIZE = 6
+GUN_BURST_REST = 0.4
 # Cull-oldest performance safety net (plan_14 Phase 1): when the live
 # count exceeds this ceiling the OLDEST projectile is dropped. Sized well
-# above the natural world count (180) so it NEVER binds in normal play —
-# it guards against a bug that spawns unbounded projectiles, it is not a
-# fire gate (the fire decision must stay input-local or the ghost/host
-# lockstep breaks). Temporary value; finalized in Phase 4.
-BULLET_POOL_MAX = 400
-# Legacy cap — the HOST no longer reads it as a fire gate (plan_14 Phase 1
-# removed the world gate in Game._step). The GHOST still gates its
-# local-draw list on it (netcode.PredictedShip.step) until Phase 2 removes
-# that gate too; deleted then.
+# above the natural world count (sustained 8.6/s x BULLET_LIFE 1.5 s =
+# 13/player, 26 world at 2P) so it NEVER binds in normal play — it guards
+# against a bug that spawns unbounded projectiles, it is not a fire gate
+# (the fire decision must stay input-local or the ghost/host lockstep
+# breaks).
+BULLET_POOL_MAX = 80
+# Legacy cap — read by NOTHING since plan_14 Phase 2 (the host's world
+# gate was removed in Phase 1, the ghost's local-draw gate in Phase 2).
+# Kept only as a historical reference; delete in a cleanup pass.
 MAX_BULLETS = 12
 STOP_GAIN = 3.0
 MAX_STOP_ACCEL = 600.0

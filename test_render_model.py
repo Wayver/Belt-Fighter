@@ -258,8 +258,9 @@ def check_parity(m, g):
         assert mp["power_supply"] == p.power_supply, "ship power_supply"
         assert mp["compute_used"] == p.compute_used, "ship compute_used"
         assert mp["compute_supply"] == p.compute_supply, "ship compute_supply"
-        assert mp["weapons"] == [(w.cooldown, w.charge, w.lock_progress)
-                                 for w in p.weapons], "ship weapons"
+        assert mp["weapons"] == [(w.cooldown, w.charge, w.lock_progress,
+                                 w.burst_count)
+                                for w in p.weapons], "ship weapons"
     # --- report the coverage so the PASS line is meaningful ---
     return (len(g.asteroids), len(g.enemies), len(g.bullets),
             len(g.enemy_bullets), len(g.missiles), len(g.beams),

@@ -3,8 +3,10 @@
 **Status:** Phase 0 (measure) DONE — drift confirmed, mechanism pinned down
 (see §6). Phase 1 (host fire path) DONE — host fire decision is now
 input-local, cull-oldest safety net in place, single-player sustained fire
-= 60/s with pool at the natural 90 (see §6). Phase 2 (ghost fire path) is
-next.
+= 60/s with pool at the natural 90 (see §6). Phase 2 (ghost fire path)
+DONE — the ghost's local-draw gate is gone, the ghost is in bullet_seq /
+cooldown lockstep with the host across 30 reconciles, and no ghost-only id
+is ever drawn (see §6). Phase 3 (missiles) is next.
 **Scope:** the player bullet + missile fire path (host + ghost). The "early
 enemy-bullet hit" presentation bug is **out of scope** here (it is a separate
 time-domain offset) — but this plan de-risks it by making the bullet system a
@@ -388,10 +390,55 @@ host applies, so it is still correct).
   it still gates on its local-draw count, so in 2P it will now fire *fewer*
   than the host in some cases. That is what Phase 2 fixes.
 
-**Phase 2 — Ghost fire path.** Remove the local-draw gate; add the cull. 2P
-test: assert the ghost's `bullet_seq` and gun cooldown equal the host's across
-N reconciles (no drift), and that no ghost-only id is ever drawn (no
-double-draw). Re-run `test_10_7_bullet_dedup`.
+**Phase 2 — Ghost fire path. DONE.** Removed the ghost's local-draw gate
+(`len(self.local_bullets) < MAX_BULLETS` in `PredictedShip.step`) and added
+the matching cull-oldest safety net (`while len(self.local_bullets) >
+BULLET_POOL_MAX: pop(0)`), mirroring the host. The re-fire guard
+(`if any(tuple(b.id) == bid ...): continue`) is KEPT — it makes the
+reconcile replay idempotent, and it now works *because* the seqs are in
+lockstep. `MAX_BULLETS` is no longer read by the ghost (only the host's
+missile path still reads `MAX_MISSILES` until Phase 3). The `_btel` FIRE
+row's `f_cap_before` column is kept for CSV compatibility (it now just
+tracks the presentation list's depth — the cap it measured is gone).
+
+- **New test `test_14_2_ghost_lockstep`** (2P host + client ghost, same
+  input stream, fixed 3-tick one-way latency, isolated world): drives 300
+  ticks of sustained fire with a snapshot every 10 ticks and proves,
+  measured PRE-reconcile (the prediction vs the host's actual state at the
+  same instant — a post-reconcile comparison would be masked by the rewind
+  replay):
+  1. **SEQ LOCKSTEP** — the ghost's predicted `bullet_seq` == the host's at
+     all 30 reconciles (gap 0 every time; Phase 0 was +1 at 1785/2021).
+  2. **COOLDOWN LOCKSTEP** — max |ghost − host| predicted gun cooldown =
+     0.0 s over 30 reconciles (Phase 0: 47% with |delta| > 5 ms).
+  3. **NO GHOST-ONLY ID** — every in-flight ghost bullet id was fired by
+     the host (host fired 300 total; Phase 0 captured 554 host-never-fired).
+  4. **GHOST FIRES THE SAME SHOTS** — 300 shots over 300 ticks (exactly
+     1/tick, == the host's), list grew past the old cap 12, stayed ≤
+     `BULLET_POOL_MAX`. (The list settles ~70, below the host's natural 90,
+     because the rewind replay re-steps the presentation bullets — a
+     harmless presentation artifact, not a fire-path bug; a no-reconcile
+     run reaches exactly 90.)
+- **`test_interpolation` (i) CAP check updated:** the ghost's local-bullet
+  list is no longer capped at `MAX_BULLETS`, so the check now asserts
+  `max_list <= BULLET_POOL_MAX` (measured 60). The host-side `bullets —`
+  buffer check (pop-in / persistent / drop-out) went from the known
+  pre-existing VACUOUS FAIL to a real PASS (20 pop-in, 721 persistent, 1
+  drop-out) — a Phase-1 side effect (the host now fires continuously, so
+  the interpolation window exercises all three cases), not a Phase-2 change.
+- **Full gate PASS:** `test_14_2_ghost_lockstep`, `test_10_7_bullet_dedup`,
+  `test_determinism`, `test_snapshot`, `test_interpolation`,
+  `test_10_3b_ghost_missiles`, `test_net_process`, `test_10_10_input_echo`.
+  Full suite green except the 4 known pre-existing failures (identical on
+  the clean tree): `test_10_3a_ghost_beams`, `test_10_9_ghost_pose`,
+  `test_10_11c_phase_lock`, `test_network` (the last is a harness
+  `AttributeError: 'ship5.__main__' has no attribute 'Host'`, not a
+  fire/lockstep assertion).
+- **Lockstep is now proven on BOTH peers.** The fire decision is
+  input-local on the host (Phase 1) and the ghost (Phase 2), so the ids,
+  `bullet_seq`, and gun cooldown stay in lockstep → the id-dedup always
+  matches → the double-bullet is gone at the root. The 2P asymmetry
+  expected after Phase 1 (ghost firing fewer than the host) is resolved.
 
 **Phase 3 — Missiles.** Same two edits for the missile path. 2P test: assert
 `missile_seq` lockstep + no double-draw. Re-run `test_10_3b_ghost_missiles`.
@@ -452,8 +499,12 @@ not a 1.5 s burst.
 - [x] Single-player: steady rate = `1/FIRE_COOLDOWN`; no burst-then-dead-zone;
       pool ≤ `BULLET_POOL_MAX`. (Phase 1: `test_14_1_sustained_fire` — 60/s,
       pool 90, never > 400.)
-- [ ] 2P: ghost `bullet_seq` / `missile_seq` + gun cooldown == host's across N
-      reconciles; **no ghost-only id ever drawn** (no double-draw).
+- [x] 2P (bullets): ghost `bullet_seq` + gun cooldown == host's across N
+      reconciles; **no ghost-only bullet id ever drawn** (no double-draw).
+      (Phase 2: `test_14_2_ghost_lockstep` — gap 0 at all 30 reconciles,
+      cooldown delta 0.0 s, 0 ghost-only ids.)
+- [ ] 2P (missiles): ghost `missile_seq` == host's across N reconciles; no
+      ghost-only missile id ever drawn. (Phase 3.)
 - [x] `test_10_7_bullet_dedup`, `test_10_3b_ghost_missiles`,
       `test_interpolation`, `test_determinism`, `test_snapshot`,
       `test_net_process` all pass. (Phase 1: all green; `test_snapshot`

@@ -180,8 +180,8 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 import pygame
 
 from .config import WIDTH, HEIGHT, SNAPSHOT_INTERVAL, INTERP_DELAY, \
-    INTERP_DELAY_MIN, INTERP_DELAY_MAX, ADAPT_K, MAX_FRAME_DT, MAX_BULLETS, \
-    MAX_SPEED
+    INTERP_DELAY_MIN, INTERP_DELAY_MAX, ADAPT_K, MAX_FRAME_DT, \
+    BULLET_POOL_MAX, MAX_SPEED
 from .fog import make_light_texture
 from .game import Game, STEP
 from .ai_enemy import AIEnemy
@@ -1397,7 +1397,9 @@ def main():
     #   1. FIRE TIMING — the ghost produces a local bullet within 1 step
     #      of the first tick its fire input is held (the gun's cooldown
     #      starts at 0, so the first held-fire tick fires).
-    #   2. CAP — the list never exceeds MAX_BULLETS (the host's world cap).
+    #   2. CAP — the list never exceeds BULLET_POOL_MAX (the cull-oldest
+    #      safety net; plan_14 Phase 2 removed the old MAX_BULLETS
+    #      local-draw cap, so the list now grows to the natural count).
     #   3. STRAIGHT LINE — a tracked bullet moves at exactly its speed per
     #      step (bullets don't steer), so its per-step displacement equals
     #      speed * STEP (within float tolerance).
@@ -1457,14 +1459,16 @@ def main():
             print(f"FAIL: local bullet fire timing — first bullet at tick "
                   f"{first_bullet}, first fire {first_fire} (want <= "
                   f"{first_fire + 1})")
-        # 2. cap
-        if max_list <= MAX_BULLETS:
+        # 2. cap — the cull-oldest safety net (plan_14 Phase 2 removed
+        #    the old MAX_BULLETS local-draw cap; the list now grows to
+        #    the natural count and is only policed at BULLET_POOL_MAX).
+        if max_list <= BULLET_POOL_MAX:
             print(f"PASS: local bullet cap — max list {max_list} <= "
-                  f"MAX_BULLETS {MAX_BULLETS}")
+                  f"BULLET_POOL_MAX {BULLET_POOL_MAX}")
         else:
             ok = False
             print(f"FAIL: local bullet cap — max list {max_list} > "
-                  f"MAX_BULLETS {MAX_BULLETS}")
+                  f"BULLET_POOL_MAX {BULLET_POOL_MAX}")
         # 3. straight line: per-step displacement == speed * STEP
         if max_step_err < 1e-6:
             print(f"PASS: local bullet straight line — max per-step "

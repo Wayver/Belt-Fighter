@@ -66,7 +66,7 @@ import pygame
 from .config import (INTERP_DELAY, INTERP_DELAY_MIN, INTERP_DELAY_MAX,
                     ADAPT_K, SNAPSHOT_INTERVAL, SNAPSHOT_BUFFER_MAX, TICK,
                     MAX_FRAME_DT, ROT_SPEED, MAX_SPEED,
-                    MAX_BULLETS, MAX_MISSILES,
+                    MAX_MISSILES, BULLET_POOL_MAX,
                     MISSILE_SPEED, MISSILE_ACCEL, MISSILE_BOOST_TIME,
                     MISSILE_TURN_RATE, MISSILE_LIFE,
                     SENSOR_SIGNATURE_THRESHOLD, SENSOR_SIG_FULL)
@@ -1624,11 +1624,14 @@ class PredictedShip:
         ghost has no enemy list to target (see class docstring).
 
         The SHOTS the ghost's gun fires this step are kept as presentation
-        `Bullet`s in `self.local_bullets` (capped at MAX_BULLETS,
-        mirroring the host's world cap) so the player sees their own shots
-        immediately instead of waiting ~100 ms for the host's next
-        snapshot. Call `step_local_bullets` after `step` to advance +
-        cull the list (the game loop does this via `advance`).
+        `Bullet`s in `self.local_bullets` so the player sees their own
+        shots immediately instead of waiting ~100 ms for the host's next
+        snapshot. The list is uncapped by the fire decision (plan_14
+        Phase 2 — the old local-draw cap mirrored the host's old world
+        cap and desynced the lockstep); a cull-oldest safety net at
+        BULLET_POOL_MAX polices it, mirroring the host's. Call
+        `step_local_bullets` after `step` to advance + cull the list
+        (the game loop does this via `advance`).
 
         `enemies` is a list of lightweight enemy proxies (objects exposing
         `.pos`) built by the caller from the interpolation buffer's enemy
@@ -1670,10 +1673,15 @@ class PredictedShip:
         # the host's live positions) — acceptable for presentation (the
         # contacts are 10 Hz blips/arrows).
         self._update_contacts(s, enemies)
-        # Keep the ghost's own gun shots. The host's world cap is
-        # MAX_BULLETS total; the ghost's list holds only the local player's
-        # shots, so capping it at MAX_BULLETS is a faithful (slightly
-        # generous) stand-in — the gun's own cooldown is the real limiter.
+        # Keep the ghost's own gun shots. The fire decision is
+        # INPUT-LOCAL (plan_14 Phase 2): every shot the ghost's weapon
+        # state produces is kept — the old local-draw cap
+        # (len(local_bullets) < MAX_BULLETS) mirrored the host's old
+        # WORLD cap, which the ghost could not reproduce, so it fired a
+        # different set of shots than the host and desynced bullet_seq /
+        # cooldown (the double-bullet). The list is policed by the
+        # cull-oldest safety net below (BULLET_POOL_MAX, mirroring the
+        # host's) — performance only, never a fire gate.
         # Each ghost bullet gets the SAME unique id the host assigns at
         # fire — (player_index, per-ship bullet_seq) — and the ghost's
         # bullet_seq is bumped to match (it is resynced to the host's via
@@ -1693,38 +1701,45 @@ class PredictedShip:
                 _g_cd = _w.cooldown
                 break
         for shot in shots:
-            if len(self.local_bullets) < MAX_BULLETS:
-                seq_before = s.bullet_seq
-                bid = (self.local_index, seq_before)
-                s.bullet_seq += 1
-                # The reconcile REWIND (reconcile_rewind) re-runs the fire
-                # tick after apply_snapshot has RESET bullet_seq to the
-                # host's pre-fire value — so the replay re-fires the SAME
-                # bullet with the SAME id the prediction already emitted in
-                # advance(). Without this guard the ghost would hold two
-                # Bullets of one id (the in-flight one + a fresh one at the
-                # muzzle): the player sees a double-draw and, because the
-                # buffer's copy is suppressed by the id-dedup, BOTH visible
-                # ones are collision-less ghost bullets. Skip the re-fire
-                # when the id is already in flight (the prediction's copy
-                # is the fresher one).
-                if any(tuple(b.id) == bid for b in self.local_bullets):
-                    continue
-                b = Bullet(shot.pos, shot.vel, owner=shot.owner, bid=bid)
-                b.pending = False   # handback state (client-only)
-                self.local_bullets.append(b)
-                # TELEMETRY (Phase 0, plan_14): a ghost Bullet was CREATED.
-                # f_cap_before = the local-draw count BEFORE this append
-                # (the ghost cap's input — it stays tiny because bullets are
-                # handed off ~INTERP_DELAY after firing, so the ghost cap
-                # almost never binds while the host's WORLD cap does).
-                # f_guard is always 0 here (a guard hit skips the append).
-                _btel.log("FIRE", f_bid=_btel.fmt_ids([bid]),
-                          f_seq_before=seq_before,
-                          f_seq_after=s.bullet_seq, f_guard=0,
-                          f_local_ids=_btel.fmt_ids(
-                              (tuple(b.id) for b in self.local_bullets)),
-                          f_cap_before=len(self.local_bullets) - 1)
+            seq_before = s.bullet_seq
+            bid = (self.local_index, seq_before)
+            s.bullet_seq += 1
+            # The reconcile REWIND (reconcile_rewind) re-runs the fire
+            # tick after apply_snapshot has RESET bullet_seq to the
+            # host's pre-fire value — so the replay re-fires the SAME
+            # bullet with the SAME id the prediction already emitted in
+            # advance(). Without this guard the ghost would hold two
+            # Bullets of one id (the in-flight one + a fresh one at the
+            # muzzle): the player sees a double-draw and, because the
+            # buffer's copy is suppressed by the id-dedup, BOTH visible
+            # ones are collision-less ghost bullets. Skip the re-fire
+            # when the id is already in flight (the prediction's copy
+            # is the fresher one).
+            if any(tuple(b.id) == bid for b in self.local_bullets):
+                continue
+            b = Bullet(shot.pos, shot.vel, owner=shot.owner, bid=bid)
+            b.pending = False   # handback state (client-only)
+            self.local_bullets.append(b)
+            # TELEMETRY (Phase 0, plan_14): a ghost Bullet was CREATED.
+            # f_cap_before = the local-draw count BEFORE this append —
+            # kept for CSV compatibility (the ghost cap it measured is
+            # gone as of Phase 2; the column now just tracks the
+            # presentation list's depth). f_guard is always 0 here (a
+            # guard hit skips the append).
+            _btel.log("FIRE", f_bid=_btel.fmt_ids([bid]),
+                      f_seq_before=seq_before,
+                      f_seq_after=s.bullet_seq, f_guard=0,
+                      f_local_ids=_btel.fmt_ids(
+                          (tuple(b.id) for b in self.local_bullets)),
+                      f_cap_before=len(self.local_bullets) - 1)
+        # Cull-oldest performance safety net (plan_14 Phase 2, mirrors the
+        # host's in Game._step): the list is in fire order (newest at the
+        # back), so pop(0) is the oldest. BULLET_POOL_MAX sits well above
+        # the natural count (90/player at the current 60/s rate), so this
+        # never binds in normal play — it polices the presentation list
+        # without ever changing whether a shot fires.
+        while len(self.local_bullets) > BULLET_POOL_MAX:
+            self.local_bullets.pop(0)
         # Keep the ghost's own laser discharges as presentation entries
         # [local_start, end, age, ttl]. The muzzle is the HULL-LOCAL offset
         # (beam.local_start), NOT the frozen world-space point (beam.start)

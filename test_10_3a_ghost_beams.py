@@ -159,7 +159,7 @@ def make_snap(charge, enemy_offset=ENEMY_OFFSET):
     snap = tmp.snapshot()
     # Rebuild the client-ship snapshot with the lasers at `charge`.
     cs_s = list(snap[0][1])
-    cs_s[18] = tuple((0.0, charge, 0.0) for _ in cs.weapons)
+    cs_s[18] = tuple((0.0, charge, 0.0, 0) for _ in cs.weapons)
     ships = (snap[0][0], tuple(cs_s))
     return (ships,) + snap[1:]
 

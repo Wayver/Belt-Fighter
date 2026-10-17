@@ -8,11 +8,10 @@ Networked-ready:
 """
 import math
 import random
-from dataclasses import replace
 
 import pygame
 
-from .config import (WIDTH, HEIGHT, SPAWN_PROTECT, MAX_BULLETS,
+from .config import (WIDTH, HEIGHT, SPAWN_PROTECT, BULLET_POOL_MAX,
                     BULLET_SPEED,
                     ROCK_SPLIT, ROCK_SIZES, BG, STAR_COLOR,
                     BULLET_COLOR, ENEMY_BULLET_COLOR,
@@ -23,7 +22,7 @@ from .config import (WIDTH, HEIGHT, SPAWN_PROTECT, MAX_BULLETS,
                     BEAM_IMPACT_SPREAD, SENSOR_COLOR, SENSOR_SCAN_COLOR,
                     SENSOR_SIGNATURE_THRESHOLD, SENSOR_SIG_FULL, SENSOR_ARROW_MARGIN,
                     SCAN_DUMP_DECAY, DEBUG_COLLISION,
-                    MISSILE_COLOR, MAX_MISSILES,
+                    MISSILE_COLOR, MISSILE_POOL_MAX,
                     SFX_LASER_MIN_INTERVAL, SFX_ENEMY_LASER_MIN_INTERVAL,
                     SFX_SHIELD_HIT_MIN_INTERVAL, PARTICLE_COLORS)
 
@@ -632,10 +631,10 @@ class Game:
         # (sim_thread.py); cleared on reset/respawn.
         self._beam_events = []
         # Input-echo queue: (sim_time, ShipInput) per tick, remote player
-        # only. _step appends the POST-CAP input it actually applied (the
-        # ghost's step does not apply the world cap, so echoing raw input
-        # would re-introduce fire divergence). Drained by the sim thread
-        # into T_ECHO; cleared on reset/respawn.
+        # only. _step appends the input it actually applied (the world
+        # fire cap is gone — plan_14 — so this is the raw input, which is
+        # exactly what the host applies). Drained by the sim thread into
+        # T_ECHO; cleared on reset/respawn.
         self._remote_input_echo = []
         self.enemy_bullets = []
         self.particles = []
@@ -1304,15 +1303,22 @@ class Game:
                 p.laser_target = self._pick_laser_target(p)
                 p.missile_target = self._pick_missile_target(p)
                 self._update_contacts(p)
-                if p_inp.fire and len(self.bullets) >= MAX_BULLETS:
-                    p_inp = replace(p_inp, fire=False)   # world cap: no room
-                if p_inp.missile_fire and len(self.missiles) >= MAX_MISSILES:
-                    p_inp = replace(p_inp, missile_fire=False)
+                # LOCKSTEP INVARIANT (plan_14): the fire decision must be a
+                # PURE FUNCTION OF INPUT-LOCAL STATE — this player's input +
+                # its own weapon state (cooldown / charge / allocation, all
+                # synced via the ship snapshot). The old world-count gates
+                # (len(self.bullets) >= MAX_BULLETS) are GONE: a world count
+                # is not reproducible by the ghost, so gating fire on it
+                # desynced bullet_seq / cooldown (the double-bullet). The
+                # bullet population is policed by the cull-oldest safety net
+                # below (performance only — it never changes whether a shot
+                # fires). Any future term added to the fire path must be
+                # input-local or the lockstep (and the id-dedup) breaks.
                 if i == 1:
-                    # Echo the POST-CAP input actually applied to player 1
-                    # this tick (the client's rewind replay uses it — the
-                    # ghost's step does not apply the world cap, so raw
-                    # input would re-introduce fire divergence). Tagged
+                    # Echo the input actually applied to player 1 this tick
+                    # (the client's rewind replay uses it). With the world
+                    # cap gone, p_inp is the RAW input — exactly what the
+                    # host applies, so the echo is still correct. Tagged
                     # with the tick's START (sim_time was already advanced
                     # to the tick's END at the top of _step); an end-tag
                     # would be off by one tick.
@@ -1329,6 +1335,14 @@ class Game:
                     p.bullet_seq += 1
                     self.bullets.append(Bullet(shot.pos, shot.vel,
                                                owner=shot.owner, bid=bid))
+                # Cull-oldest performance safety net (plan_14): the lists
+                # are in fire order (newest at the back), so pop(0) is the
+                # oldest. Sized above the natural count, so this never
+                # binds in normal play — it only guards against a bug that
+                # spawns unbounded projectiles. It NEVER changes whether a
+                # shot fires (that decision is input-local, above).
+                while len(self.bullets) > BULLET_POOL_MAX:
+                    self.bullets.pop(0)
                 # S3: fire sounds. The gun fires ~100 shots/s (FIRE_COOLDOWN
                 # 0.01), so the laser blip is throttled to a human rate.
                 if shots:
@@ -1343,6 +1357,10 @@ class Game:
                     p.missile_seq += 1
                     self.missiles.append(Missile(m.pos, m.vel, owner=m.owner,
                                                  target=m.target, mid=mid))
+                # Cull-oldest performance safety net (plan_14) — see the
+                # bullet cull above.
+                while len(self.missiles) > MISSILE_POOL_MAX:
+                    self.missiles.pop(0)
                 if missiles:
                     self._sfx("missile_launch")
 
@@ -1421,10 +1439,11 @@ class Game:
     def flush_remote_input_echo(self):
         """Return + clear the input-echo queue (the sim thread calls this
         after each stepped iteration and sends the entries as one
-        T_ECHO). Each entry is (sim_time, ShipInput) — the POST-CAP input
-        the host applied to player 1 on the tick that STARTS at sim_time
-        (see the capture in _step). Empty when the sim did not step player
-        1 (single-player, game_over, or a dead player-1 ship)."""
+        T_ECHO). Each entry is (sim_time, ShipInput) — the input the host
+        applied to player 1 on the tick that STARTS at sim_time (see the
+        capture in _step; with the world fire cap gone, plan_14, this is
+        the raw input). Empty when the sim did not step player 1
+        (single-player, game_over, or a dead player-1 ship)."""
         out = self._remote_input_echo
         self._remote_input_echo = []
         return out

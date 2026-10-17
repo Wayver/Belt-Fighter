@@ -143,6 +143,20 @@ def main():
              seed=SEED)
     b.apply_snapshot(snap)
 
+    # Particles are presentation-only and NOT part of the wire snapshot
+    # (Game.snapshot() deliberately omits them — the client regenerates its
+    # own on impact). So the round-trip cannot preserve them; clear both
+    # games' particles before comparing so the oracle checks only SYNCED
+    # state. (Before plan_14 Phase 1 this passed by luck: the world bullet
+    # cap made collisions rare enough that A often had no live particles at
+    # tick 600. Sustained fire makes collisions frequent, so A now has live
+    # particles while restored B has none — the latent bug is now
+    # deterministic. Clearing isolates the synced state both asserts care
+    # about; with identical rng + input, A and B then evolve identical
+    # particles for ASSERT #2.)
+    a.particles.clear()
+    b.particles.clear()
+
     ok = True
 
     # ASSERT #1: the round-trip is lossless

@@ -36,7 +36,23 @@ ROT_SPEED = 3.6
 MAX_SPEED = 520.0
 BULLET_SPEED = 860.0
 BULLET_LIFE = 1.5
+# The fire-rate knob (plan_14): the gun fires when input is held, the
+# cooldown has elapsed, and power is allocated — INPUT-LOCAL, no world
+# term. FIRE_COOLDOWN (0.01) < TICK (0.0167), so the tick grid caps the
+# sustained rate at 60/s; natural live bullets = 60 x BULLET_LIFE = 90 per
+# player (180 world at 2P). The final value is a Phase-4 balance call.
 FIRE_COOLDOWN = 0.01
+# Cull-oldest performance safety net (plan_14 Phase 1): when the live
+# count exceeds this ceiling the OLDEST projectile is dropped. Sized well
+# above the natural world count (180) so it NEVER binds in normal play —
+# it guards against a bug that spawns unbounded projectiles, it is not a
+# fire gate (the fire decision must stay input-local or the ghost/host
+# lockstep breaks). Temporary value; finalized in Phase 4.
+BULLET_POOL_MAX = 400
+# Legacy cap — the HOST no longer reads it as a fire gate (plan_14 Phase 1
+# removed the world gate in Game._step). The GHOST still gates its
+# local-draw list on it (netcode.PredictedShip.step) until Phase 2 removes
+# that gate too; deleted then.
 MAX_BULLETS = 12
 STOP_GAIN = 3.0
 MAX_STOP_ACCEL = 600.0
@@ -218,7 +234,17 @@ MISSILE_BOOST_TIME = 0.62  # s of straight flight before seeking starts
 MISSILE_TURN_RATE = 3.0    # rad/s — THE evasion knob
 MISSILE_LIFE = 3.0         # range limit
 MISSILE_DAMAGE = 2
+# The missile fire-rate knob (input-local, like FIRE_COOLDOWN): natural
+# live count = MISSILE_LIFE / MISSILE_COOLDOWN = 2.5 per player.
 MISSILE_COOLDOWN = 1.2
+# Cull-oldest performance safety net (plan_14 Phase 1): above the natural
+# world count (5 at 2P) so it never binds in normal play; not a fire gate.
+# Temporary value; finalized in Phase 4.
+MISSILE_POOL_MAX = 12
+# Legacy cap — the HOST no longer reads it as a fire gate (plan_14 Phase 1
+# removed the world gate in Game._step). The GHOST still gates its
+# local-draw list on it (netcode.PredictedShip.step) until Phase 2 removes
+# that gate too; deleted then.
 MAX_MISSILES = 3
 MISSILE_LOCK_RANGE = 900.0 # matches TARGETING_RANGE
 MISSILE_COLOR = (255, 140, 60)

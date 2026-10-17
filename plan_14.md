@@ -1,7 +1,10 @@
 # Plan 14 — Input-Local Fire Decision (the Bullet-Cap Foundation Fix)
 
 **Status:** Phase 0 (measure) DONE — drift confirmed, mechanism pinned down
-(see §6). Phase 1 (host fire path) is next.
+(see §6). Phase 1 (host fire path) DONE — host fire decision is now
+input-local, cull-oldest safety net in place, single-player sustained fire
+= 60/s with pool at the natural 90 (see §6). Phase 2 (ghost fire path) is
+next.
 **Scope:** the player bullet + missile fire path (host + ghost). The "early
 enemy-bullet hit" presentation bug is **out of scope** here (it is a separate
 time-domain offset) — but this plan de-risks it by making the bullet system a
@@ -352,12 +355,38 @@ host files needed).
   is still < 12 → the ghost fires one more → the +1 gap. Conclusion unchanged:
   the world-vs-local cap mismatch is the driver.
 
-**Phase 1 — Host fire path.** Remove the two world gates; add the cull-oldest
-safety net. Single-player test: hold fire, assert (a) sustained rate =
-`1/FIRE_COOLDOWN` (no burst-then-dead-zone), (b) the pool stays ≤
-`BULLET_POOL_MAX`, (c) the determinism oracle still passes (the host is still
-deterministic — the fire decision and the cull are both pure functions of
-state).
+**Phase 1 — Host fire path. DONE.** Removed the two world gates from
+`Game._step`; added the cull-oldest safety net (`BULLET_POOL_MAX = 400`,
+`MISSILE_POOL_MAX = 12` — temporary, finalized in Phase 4). `MAX_BULLETS` /
+`MAX_MISSILES` stay in config (the ghost still reads them until Phase 2).
+The input-echo block now echoes the raw input (which is exactly what the
+host applies, so it is still correct).
+
+- **New test `test_14_1_sustained_fire`** (single-player, isolated world):
+  holding fire for 240 ticks fires EXACTLY 1 shot/tick (no burst, no dead
+  zone) = 60/s; the live pool climbs to the natural 90 (not capped at 12);
+  the pool never exceeds `BULLET_POOL_MAX`. PASS.
+- **`test_10_10_input_echo`** section 2 rewritten: WORLD-CAP → RAW-ECHO
+  (a full world no longer strips fire; the echo carries fire=True and the
+  host fires). PASS.
+- **`test_snapshot` latent bug fixed:** its local oracle compared
+  `particles`, but `Game.snapshot()` deliberately omits them
+  (presentation-only — the client regenerates its own). It passed before
+  only because the world cap made collisions rare enough that Game A often
+  had no live particles at tick 600; sustained fire made that deterministic.
+  The test now clears both games' particles before comparing (synced state
+  only). PASS.
+- **Determinism:** `test_determinism` PASS (the fire decision + cull are
+  pure functions of state — the host stays deterministic).
+- **Full required suite PASS:** `test_determinism`, `test_snapshot`,
+  `test_interpolation`, `test_10_7_bullet_dedup`,
+  `test_10_3b_ghost_missiles`, `test_net_process`. (Pre-existing failures
+  unrelated to this phase: `test_10_3a_ghost_beams`,
+  `test_10_11c_phase_lock`, `test_network`, `test_fog_pixel` — identical on
+  the clean tree.)
+- **Expected temporary asymmetry (per the brief):** the ghost is UNCHANGED —
+  it still gates on its local-draw count, so in 2P it will now fire *fewer*
+  than the host in some cases. That is what Phase 2 fixes.
 
 **Phase 2 — Ghost fire path.** Remove the local-draw gate; add the cull. 2P
 test: assert the ghost's `bullet_seq` and gun cooldown equal the host's across
@@ -420,13 +449,15 @@ not a 1.5 s burst.
       with the double-draw (before) — DONE: seq gap bounded at +1, 554
       host-never-fired bullets, 47% cooldown delta. (Re-run after Phase 1–2 to
       confirm lockstep: gap stays 0, no true-extra bullets.)
-- [ ] Single-player: steady rate = `1/FIRE_COOLDOWN`; no burst-then-dead-zone;
-      pool ≤ `BULLET_POOL_MAX`.
+- [x] Single-player: steady rate = `1/FIRE_COOLDOWN`; no burst-then-dead-zone;
+      pool ≤ `BULLET_POOL_MAX`. (Phase 1: `test_14_1_sustained_fire` — 60/s,
+      pool 90, never > 400.)
 - [ ] 2P: ghost `bullet_seq` / `missile_seq` + gun cooldown == host's across N
       reconciles; **no ghost-only id ever drawn** (no double-draw).
-- [ ] `test_10_7_bullet_dedup`, `test_10_3b_ghost_missiles`,
+- [x] `test_10_7_bullet_dedup`, `test_10_3b_ghost_missiles`,
       `test_interpolation`, `test_determinism`, `test_snapshot`,
-      `test_net_process` all pass.
+      `test_net_process` all pass. (Phase 1: all green; `test_snapshot`
+      needed the particles-oracle fix — see §6 Phase 1.)
 - [ ] Tick profile at the chosen rate is within budget.
 - [ ] Live 2P playtest: the "stream from empty space" is gone; the gun feels
       like a steady weapon; dead→respawn and reconcile are still clean

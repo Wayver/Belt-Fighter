@@ -22,15 +22,17 @@ its own sent input. A dropped echo degrades gracefully (the replay holds the
 last echoed input — exactly what the host itself did).
 
 This test proves it (value-level):
-  1. ECHO-CAPTURE  — Game._step records the POST-CAP player-1 input, tagged
-                     at the tick's START (sim_time - dt), and ONLY player 1's
-                     (player 0's input is never echoed). flush returns +
-                     clears.
-  2. WORLD-CAP     — when the world is full (len(bullets) >= MAX_BULLETS) the
-                     echo carries fire=False (the POST-CAP input — the ghost's
-                     step() does NOT apply the world cap, so echoing the raw
-                     input would re-introduce a fire divergence). When the
-                     world has room the echo carries fire=True.
+  1. ECHO-CAPTURE  — Game._step records the player-1 input it actually
+                     applied, tagged at the tick's START (sim_time - dt),
+                     and ONLY player 1's (player 0's input is never
+                     echoed). flush returns + clears.
+  2. RAW-ECHO      — the echo carries the RAW input: with the world fire cap
+                     gone (plan_14 Phase 1), a full world (len(bullets) >=
+                     MAX_BULLETS) no longer strips fire — the echo carries
+                     fire=True and the host FIRES (the fire decision is
+                     input-local; the echo must match what the host applies,
+                     which is now the raw input). Room in the world: fire=True
+                     too.
   3. SHAPE/ROUND-TRIP — the T_ECHO message the sim thread sends (a list of
                      [sim_time, inp_dict] entries) survives the wire and
                      inverts back to the exact (sim_time, ShipInput) pairs.
@@ -72,8 +74,9 @@ from .fog import make_light_texture
 
 # A gun-fitted test hull (the 10.7 pattern): the scout polygon + the stock
 # slots + a 'gun' weapon slot. default_loadout(hull) maps 'gun' -> GUN_TYPE,
-# so the stock loadout gives this hull a pulse gun (needed for the WORLD-CAP
-# gate — the world cap strips fire/missile_fire when the world is full).
+# so the stock loadout gives this hull a pulse gun (needed for the RAW-ECHO
+# check — the host must fire even when the world is full, since the world
+# fire cap is gone, plan_14 Phase 1).
 GUN_HULL = HullType(
     id='gun_test',
     polygon=((18, 0), (14, 3.5), (8, 6.5), (0, 8), (-8, 8), (-12, 11),
@@ -184,44 +187,47 @@ def main():
     finally:
         _gm.update_field = orig_uf
 
-    # --- (2) WORLD-CAP: the echo carries the POST-CAP input. When the world
-    # is full (len(bullets) >= MAX_BULLETS) fire is stripped -> the echo
-    # carries fire=False (the ghost's step() does NOT apply the world cap, so
-    # echoing the raw input would re-introduce a fire divergence). When the
-    # world has room the echo carries fire=True.
+    # --- (2) RAW-ECHO: the echo carries the RAW input. With the world fire
+    # cap gone (plan_14 Phase 1), a full world (len(bullets) >= MAX_BULLETS)
+    # no longer strips fire: the echo carries fire=True AND the host fires
+    # (the fire decision is input-local — cooldown + power only — so the
+    # echo must match what the host applies, which is now the raw input).
+    # When the world has room the echo carries fire=True too.
     g = make_host(res)
     _gm = __import__("ship5.game", fromlist=["update_field"])
     orig_uf = _gm.update_field
     _gm.update_field = lambda *a, **k: None
     try:
-        # Fill the world to the cap with real Bullets (the cap checks
-        # len(self.bullets) >= MAX_BULLETS).
+        # Fill the world past the legacy cap with real Bullets (the old
+        # gate checked len(self.bullets) >= MAX_BULLETS; it is gone, but
+        # the world is still "full" in the old sense).
         g.bullets = [Bullet(pygame.Vector2(100.0, 100.0),
                             pygame.Vector2(1.0, 0.0), owner=1)
                      for _ in range(MAX_BULLETS)]
         g.remote_input = ShipInput(fire=True)
         g.update(STEP, IDLE_KEYS)
         echo_full = g.flush_remote_input_echo()
-        # The world is full -> fire is stripped -> the echo carries
-        # fire=False (the POST-CAP input).
-        wc_full = (len(echo_full) == 1
-                   and echo_full[0][1].fire is False
-                   and len(g.bullets) == MAX_BULLETS)   # no new bullet fired
+        # The world is full -> fire is NOT stripped -> the echo carries
+        # fire=True (the RAW input) and the host FIRED (a new bullet was
+        # appended; the pool safety net is far above, so nothing is culled).
+        re_full = (len(echo_full) == 1
+                   and echo_full[0][1].fire is True
+                   and len(g.bullets) == MAX_BULLETS + 1)
         # Control: the world has room -> fire is NOT stripped -> the echo
         # carries fire=True.
         g2 = make_host(res)
         g2.remote_input = ShipInput(fire=True)
         g2.update(STEP, IDLE_KEYS)
         echo_room = g2.flush_remote_input_echo()
-        wc_room = (len(echo_room) == 1
+        re_room = (len(echo_room) == 1
                    and echo_room[0][1].fire is True)
-        if wc_full and wc_room:
-            print(f"PASS: world-cap — full world -> echo fire=False "
-                  f"(POST-CAP, no new bullet: {len(g.bullets)} "
-                  f"== MAX_BULLETS); room -> echo fire=True")
+        if re_full and re_room:
+            print(f"PASS: raw-echo — full world -> echo fire=True (RAW, "
+                  f"host fired: {len(g.bullets)} == MAX_BULLETS + 1); "
+                  f"room -> echo fire=True")
         else:
             ok = False
-            print(f"FAIL: world-cap — full={wc_full} room={wc_room} "
+            print(f"FAIL: raw-echo — full={re_full} room={re_room} "
                   f"(full echo={echo_full}, room echo={echo_room})")
     finally:
         _gm.update_field = orig_uf

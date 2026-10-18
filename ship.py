@@ -710,7 +710,15 @@ class Ship:
             if inp.fire and w.cooldown <= 0 and w.allocation > 0:
                 fwd, right = self.axes()
                 ox, oy = w.slot.orientation
-                vel = (fwd * ox + right * oy) * w.comp.bullet_speed
+                # Physical muzzle velocity: the bullet inherits the ship's
+                # world velocity (a projectile leaves a moving gun carrying
+                # the gun's velocity) plus the barrel's own speed along the
+                # weapon facing. Pure function of the ship's synced state
+                # (self.vel) + input, so host and ghost compute the SAME
+                # velocity at the same tick (lockstep preserved). The
+                # render-point extrapolation (b.pos - b.vel*t_off) reads
+                # b.vel, so it stays consistent automatically.
+                vel = self.vel + (fwd * ox + right * oy) * w.comp.bullet_speed
                 shots.append(Shot(self.to_world(*w.slot.position), vel, self.id))
                 w.burst_count += 1
                 if w.burst_count >= GUN_BURST_SIZE:

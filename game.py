@@ -44,6 +44,7 @@ from .camera import Camera
 from .netcode import SnapshotBuffer, PredictedShip, BEAM_TTL
 from . import missile_telemetry as _mtel
 from . import bullet_telemetry as _btel
+from . import bullet_time_telemetry as _bttel
 from .config import (INTERP_DELAY, SNAPSHOT_INTERVAL, ROCK_FILL, ROCK_EDGE,
                     ENEMY_FILL, ENEMY_EDGE, ENEMY_FLAME,
                     SHIP_COLOR, SHIP_EDGE,
@@ -2785,6 +2786,12 @@ class Game:
         # player's bullets (a BULLET_COLOR dot). Presentation only: no
         # collision, no sim feedback.
         _D = self.ghost._last_step_time - rp
+        # TIME-DOMAIN TELEMETRY (bullet_time_telemetry, F3-gated): collect
+        # each bullet's DRAWN position (the same _rx/_ry the circle below
+        # uses) + the ship's drawn pose, so the ship-vs-bullet time-domain
+        # gap (D) and the muzzle-trailing are measurable. No-op when F3 is
+        # off (set_enabled gates it).
+        _bttel_rows = []
         for b in self.ghost.local_bullets:
             _a = BULLET_LIFE - b.life
             _t_off = min(_a, max(_D, 0.0))
@@ -2792,6 +2799,8 @@ class Game:
             _ry = b.pos.y - b.vel.y * _t_off
             s = self.cam.to_screen(pygame.Vector2(_rx, _ry))
             pygame.draw.circle(screen, BULLET_COLOR, (int(s.x), int(s.y)), 3)
+            _bttel_rows.append((b.id, _rx, _ry, b.vel.x, b.vel.y, _a))
+        _bttel.log_frame(self, gpos, rp, _D, _bttel_rows)
         # The player's OWN missiles — the ghost's predicted missiles, drawn
         # immediately at their predicted (homing) positions so the player
         # sees their fire the instant they launch — not ~100 ms later when

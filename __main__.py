@@ -43,6 +43,7 @@ from .sound import SoundBank
 from .intent import ShipInput
 from . import missile_telemetry
 from . import bullet_telemetry
+from . import bullet_time_telemetry
 
 
 class _HostRenderClock:
@@ -1092,6 +1093,9 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
         # Bullet telemetry (Phase 0, plan_14): the fire-drift + double-draw
         # measurement, same F3 toggle, client only.
         bullet_telemetry.set_enabled(game.debug_net)
+        # Bullet TIME-DOMAIN telemetry (ship-vs-bullet clock gap + muzzle
+        # trailing), same F3 toggle, client only.
+        bullet_time_telemetry.set_enabled(game.debug_net)
         # 11.x diagnostics: open/close ghost_clock.csv on the F3 edge and
         # set/clear the ghost's diag_sink. Opening on the rising edge
         # (not every frame) keeps the file fresh per capture; clearing the
@@ -1346,6 +1350,8 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
     missile_telemetry.close()
     # Flush + close the bullet telemetry CSV (Phase 0, plan_14).
     bullet_telemetry.close()
+    # Flush + close the bullet time-domain telemetry CSV.
+    bullet_time_telemetry.close()
     # Stop the worker (join its thread) BEFORE closing the
     # connection — the worker owns the socket, and closing a socket a worker
     # still owns crashes that worker with EBADF (the 8.1 gotcha). stop() is

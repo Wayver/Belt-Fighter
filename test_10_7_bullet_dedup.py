@@ -42,10 +42,11 @@ This test proves it (value-level):
   4. RENDER+DEDUP  — predicted_view draws the ghost's bullet, SKIPS the
                      buffer's copy of the SAME bullet (id match), and still
                      draws the OTHER player's buffer bullet (id mismatch).
-  5. PULL-FORWARD  — a handed-off bullet (pending, buffer copy advancing)
-                     is removed from the ghost and drawn by the buffer
-                     PULLED FORWARD by V*delay (ahead of the raw buffer
-                     position, in the velocity direction).
+  5. SEAMLESS HANDOFF — a handed-off bullet (pending, buffer copy
+                     advancing) is removed from the ghost and drawn by the
+                     buffer at its RAW interpolated position (no
+                     pull-forward — plan_15 draws the ghost's bullets at
+                     the render point, so the handoff is seamless).
 """
 import os
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
@@ -327,11 +328,11 @@ def main():
           "buffer's copy of the SAME bullet (id (1,0)) at (300,0) is "
           "SKIPPED; the host's bullet (id (0,0)) draws at (150,50)")
 
-    # --- 5. PULL-FORWARD: a handed-off bullet (pending, buffer copy
-    #     ADVANCING) is removed from the ghost and drawn by the buffer
-    #     PULLED FORWARD by V*delay — ahead of the raw buffer position, in
-    #     the velocity direction. The closed-form handoff: buffer_pos +
-    #     V*delay == ghost_pos (a no-op visually). ---
+    # --- 5. SEAMLESS HANDOFF: a handed-off bullet (pending, buffer copy
+    #     ADVANCING) is removed from the ghost and drawn by the buffer at
+    #     its RAW interpolated position (no pull-forward — plan_15 draws
+    #     the ghost's bullets at the render point, so the handoff is
+    #     seamless). ---
     g2 = Game(screen, font, big_font, light_tex, fog_surf, light_surf,
               hull=GUN_HULL, loadout=LOADOUT, seed=1234, players=2,
               local_index=LOCAL_INDEX)
@@ -383,29 +384,25 @@ def main():
     assert _raw is not None, \
         "the buffer must carry the (1,0) bullet in the window: %r" \
         % _pos['bullets']
-    _delay = g2.latency.delay
-    _ex, _ey = _raw[0] + _raw[2] * _delay, _raw[1] + _raw[3] * _delay
     g2.predicted_view(0.016, pygame.key.get_pressed())
     assert len(g2.ghost.local_bullets) == 0, \
         "the handed-off bullet must be REMOVED from the ghost (the buffer " \
         "draws it now): %r" % (g2.ghost.local_bullets,)
-    assert bullet_px(screen, g2.cam, _ex, _ey) > 0, \
-        "the handed-off bullet must be DRAWN PULLED FORWARD at " \
-        "(%.1f, %.1f) = raw + V*delay: %d px" \
-        % (_ex, _ey, bullet_px(screen, g2.cam, _ex, _ey))
-    # The pulled-forward position is AHEAD of the raw buffer position in the
-    # velocity direction (the handoff never moves the bullet backward).
-    assert _ex > _raw[0], \
-        "the pulled-forward x (%.1f) must be ahead of the raw buffer x " \
-        "(%.1f) for a +x bullet: the handoff is forward-only" \
-        % (_ex, _raw[0])
-    print("PASS: PULL-FORWARD — the handed-off bullet is removed from the "
-          "ghost and drawn by the buffer PULLED FORWARD at (%.1f, %.1f) "
-          "(raw (%.1f, %.1f) + V*delay, delay=%.3f s)"
-          % (_ex, _ey, _raw[0], _raw[1], _delay))
+    # plan_15: the handed-off bullet is drawn at its RAW interpolated
+    # position (NO pull-forward) — the ghost already drew it at the render
+    # point, so the buffer's copy is seamless here.
+    assert bullet_px(screen, g2.cam, _raw[0], _raw[1]) > 0, \
+        "the handed-off bullet must be DRAWN at its raw interpolated " \
+        "position (%.1f, %.1f), no pull-forward: %d px" \
+        % (_raw[0], _raw[1],
+           bullet_px(screen, g2.cam, _raw[0], _raw[1]))
+    print("PASS: SEAMLESS HANDOFF — the handed-off bullet is removed from "
+          "the ghost and drawn by the buffer at its RAW interpolated "
+          "position (%.1f, %.1f) (no pull-forward, plan_15)"
+          % (_raw[0], _raw[1]))
 
     print("ALL PASS: 10.7 (ghost's own gun shots deduped against the "
-          "buffer; no double-draw; closed-form pull-forward handoff)")
+          "buffer; no double-draw; seamless render-point handoff)")
 
 
 if __name__ == "__main__":

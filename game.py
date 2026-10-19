@@ -8,6 +8,7 @@ Networked-ready:
 """
 import math
 import random
+import time
 
 import pygame
 
@@ -284,6 +285,39 @@ def _draw_world_particle(screen, cam, pos, vel, color, life, max_life):
     s2 = cam.to_screen(tail)
     pygame.draw.line(screen, color, (s1.x, s1.y), (s2.x, s2.y),
                      max(1, int(2 * a)))
+
+
+def _seg_circle_hit(p0x, p0y, p1x, p1y, cx, cy, r):
+    """Swept segment-circle test (client-side, presentation only).
+
+    Returns (hit, hx, hy): whether the segment (p0 -> p1) comes within
+    radius `r` of the circle center (cx, cy), and the closest point on the
+    segment to the center (the impact point). Swept (not a point test) so a
+    fast bullet cannot tunnel through a hull between frames. Pure math —
+    no pygame dependency, so it is trivially testable."""
+    dx = p1x - p0x
+    dy = p1y - p0y
+    fx = p0x - cx
+    fy = p0y - cy
+    a = dx * dx + dy * dy
+    if a < 1e-9:
+        # Degenerate segment (the bullet did not move this frame): a plain
+        # point test.
+        d2 = fx * fx + fy * fy
+        return (d2 <= r * r, p0x, p0y)
+    b = fx * dx + fy * dy
+    c = fx * fx + fy * fy
+    # t = the parameter in [0, 1] of the closest point on the segment.
+    t = -b / a
+    if t < 0.0:
+        t = 0.0
+    elif t > 1.0:
+        t = 1.0
+    hx = p0x + t * dx
+    hy = p0y + t * dy
+    ex = hx - cx
+    ey = hy - cy
+    return (ex * ex + ey * ey <= r * r, hx, hy)
 
 
 # --- model-driven LOCAL-SHIP render helpers -------------------------------
@@ -714,6 +748,26 @@ class Game:
         # an alive->dead buffer flip it spawns its own presentation burst at
         # the death pose. {(ship_index): [Particle, ...]}, never synced.
         self._death_bursts = {}
+        # Client-side bullet-impact sparks (option A, the pass-through fix):
+        # when a present-time local bullet visually reaches a remote ship's
+        # drawn hull, spawn a shield_burst spark + throttled shield_hit SFX
+        # (mirrors the host's surviving-hit FX) and cull the bullet so it
+        # stops at the hull instead of passing through. [Particle, ...],
+        # presentation only, never synced. The synced shield-oval flash is
+        # KEPT (option i) — it is the same effect the host draws.
+        self._hit_fx = []
+        # Wall time of the last _step_hit_fx (for a frame-rate-independent
+        # dt); None until the first step.
+        self._hit_fx_last_t = None
+        # bids already visually hit -> wall time of the hit. PERSISTENT (not
+        # per-frame): the buffer's copy of a bullet stays alive until the
+        # host's AUTHORITATIVE hit, which is `delay` (~100 ms) AFTER the
+        # visual hit, so a per-frame cull would let the buffer bullet
+        # reappear and pass through. The cull persists until the host
+        # culls the bullet; it is TTL-pruned at BULLET_LIFE (far longer
+        # than the delay gap) so the set cannot grow unbounded. The draw
+        # loops skip any bid in this dict.
+        self._hit_fx_cull_bids = {}
         # Local ghost's dead state last frame (detects the alive->dead
         # transition so the burst spawns exactly once).
         self._local_was_dead = False
@@ -855,6 +909,10 @@ class Game:
         self._missile_handoff_buf_pos.clear()
         self._bullet_handoff_buf_pos.clear()   # stale bullet handoff
         self._bullet_handoff_ghost_pos.clear()   # stale handoff telemetry
+        # Stale impact sparks + hit guards (their bullets are gone).
+        self._hit_fx = []
+        self._hit_fx_hit_ids = set()
+        self._hit_fx_last_t = None
         self._sfx_thruster(False)   # never carry the engine loop across a reset
         if self.test_mode:
             self._setup_test_scene()
@@ -2431,6 +2489,8 @@ class Game:
         gpos, gangle = self.ghost.render_pose_smoothed(dt)
         # Advance + cull the client-side death bursts (presentation).
         self._step_death_bursts(dt)
+        # Age + cull the client-side bullet-impact sparks (presentation).
+        self._step_hit_fx(dt)
         # Age + cull the remote player's laser beams (T_BEAM events).
         self._step_remote_beams(dt)
 
@@ -2652,6 +2712,64 @@ class Game:
                     _hbuf.pop(_mid, None)
                 else:
                     _hgo[_mid] = (_dx, _dy)
+        # HIT FX (option A, the pass-through fix) — runs BEFORE the draw loops so
+        # the cull set is ready before any bullet is drawn. A local bullet
+        # (ghost-drawn or buffer-drawn, both at the PRESENT) that visually
+        # reaches a remote ship's drawn hull spawns a shield_burst spark +
+        # throttled shield_hit SFX (mirrors the host's surviving-hit FX) and
+        # is marked for cull so it stops at the hull instead of passing
+        # through. The synced shield-oval flash is KEPT (option i) — it is
+        # the same effect the host draws. Presentation only: no sim, no
+        # authority (the authoritative hit + damage still come from the
+        # host snapshot).
+        # Persistent cull (bid -> wall time of the visual hit). TTL-prune entries
+        # older than BULLET_LIFE (far longer than the `delay` gap between
+        # the visual hit and the host's authoritative cull, so the buffer
+        # copy stays culled until the host removes it; the TTL only bounds
+        # the set's growth).
+        _hit_fx_now = time.time()
+        _hit_fx_cull = self._hit_fx_cull_bids
+        for _bid in [b for b, t in _hit_fx_cull.items()
+                     if _hit_fx_now - t > BULLET_LIFE]:
+            del _hit_fx_cull[_bid]
+        _hit_fx_bullets = []
+        # Ghost-drawn local bullets (at the present, b.pos).
+        for b in self.ghost.local_bullets:
+            if b.id is not None:
+                _hit_fx_bullets.append((
+                    tuple(b.id), b.prev_pos.x, b.prev_pos.y,
+                    b.pos.x, b.pos.y))
+        # Buffer-drawn local bullets (pulled forward to the present).
+        for (x, y, vx, vy, kind, owner, boost, mid) in pos['bullets']:
+            if kind == 'player' and mid is not None \
+                    and tuple(mid)[0] == self.local_index \
+                    and tuple(mid) not in local_bullet_ids:
+                _hit_fx_bullets.append((
+                    tuple(mid), x - vx * _bdpull, y - vy * _bdpull,
+                    x, y))
+        # Remote ships' drawn poses + collision radii (live ships only).
+        _hit_fx_ships = []
+        for i, (x, y, ang, dead, s_dump, s_clock, flame_mags,
+                brownout, pf) in enumerate(pos['ships']):
+            if i != self.local_index and not dead:
+                _hit_fx_ships.append(
+                    (i, x, y, self.players[i].hull.collision_radius))
+        # Swept segment-circle test: the bullet's per-frame segment
+        # (prev -> present) vs the ship's drawn hull radius. Swept (not a
+        # point test) so a fast bullet cannot tunnel through between
+        # frames.
+        for (bid, x0, y0, x1, y1) in _hit_fx_bullets:
+            if bid in _hit_fx_cull:
+                continue
+            for (si, sx, sy, sr) in _hit_fx_ships:
+                hit, hx, hy = _seg_circle_hit(x0, y0, x1, y1, sx, sy, sr)
+                if hit:
+                    _hit_fx_cull[bid] = _hit_fx_now
+                    shield_burst(self._hit_fx, pygame.Vector2(hx, hy),
+                                 rng=random)
+                    self._sfx_throttled("shield_hit",
+                                        SFX_SHIELD_HIT_MIN_INTERVAL)
+                    break
         # TELEMETRY: the DEDUP ground truth — which buffer projectiles were
         # DRAWN vs SKIPPED this frame, against the ghost's in-flight ids.
         # log_dedup writes a row only when the triple CHANGES, so a
@@ -2683,6 +2801,11 @@ class Game:
             # Enemy bullets (mid is None) are drawn as-is.
             if kind == 'player' and mid is not None:
                 _bid_t = tuple(mid)
+                if _bid_t in _hit_fx_cull:
+                    continue   # visually hit a remote ship this frame —
+                    # culled (not drawn past the hull; the spark is drawn
+                    # instead, mirroring the host which removes the bullet
+                    # on the hit tick).
                 if _bid_t in local_bullet_ids:
                     _buf_skipped.append(_bid_t)
                     _buf_bskipped.append(_bid_t)
@@ -2860,6 +2983,11 @@ class Game:
         # off (set_enabled gates it).
         _bttel_rows = []
         for b in self.ghost.local_bullets:
+            # HIT FX: a bullet that visually hit a remote ship this frame is
+            # culled — not drawn (the spark is drawn instead, mirroring the
+            # host which removes the bullet on the hit tick).
+            if b.id is not None and tuple(b.id) in _hit_fx_cull:
+                continue
             _a = BULLET_LIFE - b.life
             # Present-time draw (the plan_15 revert): b.pos, no t_off shift.
             _rx = b.pos.x
@@ -2868,6 +2996,13 @@ class Game:
             pygame.draw.circle(screen, BULLET_COLOR, (int(s.x), int(s.y)), 3)
             _bttel_rows.append((b.id, _rx, _ry, b.vel.x, b.vel.y, _a))
         _bttel.log_frame(self, gpos, rp, _D, _bttel_rows)
+        # HIT FX: remove the culled bullets from local_bullets NOW (before
+        # the fog light loop below) so they get no lingering glow and the
+        # dedup/handoff bookkeeping sees them gone.
+        if _hit_fx_cull:
+            self.ghost.local_bullets = [
+                b for b in self.ghost.local_bullets
+                if b.id is None or tuple(b.id) not in _hit_fx_cull]
         # The player's OWN missiles — the ghost's predicted missiles, drawn
         # immediately at their predicted (homing) positions so the player
         # sees their fire the instant they launch — not ~100 ms later when
@@ -2928,6 +3063,10 @@ class Game:
         # before the fog, but the client's fog would otherwise hide a
         # burst behind the local light bubble).
         self._draw_death_bursts(screen, self.cam)
+        # The client-side bullet-impact sparks, drawn AFTER the fog too
+        # (same reason — the fog would hide them behind the local light
+        # bubble).
+        self._draw_hit_fx(screen, self.cam)
 
         # The ghost's scan pulse ring + sensor contacts, drawn
         # ABOVE the fog — the SAME two calls the host's model path makes
@@ -3219,6 +3358,27 @@ class Game:
                 self._death_bursts[index] = parts
             else:
                 del self._death_bursts[index]
+
+    def _step_hit_fx(self, dt):
+        """Advance + cull the client-side bullet-impact sparks (presentation
+        only). Called once per frame from predicted_view. Mirrors
+        _step_death_bursts: each Particle ages by dt and is dropped once its
+        life expires."""
+        if not self._hit_fx:
+            return
+        for p in self._hit_fx:
+            p.update(dt)
+        self._hit_fx = [p for p in self._hit_fx if p.life > 0]
+
+    def _draw_hit_fx(self, screen, cam):
+        """Draw the client-side bullet-impact sparks (mirrors
+        _draw_world_particle). Called from predicted_view AFTER the fog so
+        the spark is visible (the client's fog would otherwise hide it
+        behind the local light bubble — same reason the death bursts are
+        drawn after the fog)."""
+        for p in self._hit_fx:
+            _draw_world_particle(screen, cam, p.pos, p.vel, p.color,
+                                 p.life, p.max_life)
 
     def _draw_death_bursts(self, screen, cam):
         """Draw the client-side death bursts (mirrors _draw_world_particle).

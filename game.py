@@ -2240,10 +2240,11 @@ class Game:
         # Remote enemies as their REAL hulls. Buffer entry: (tag, x, y,
         # angle, vx, vy, id, shield_dump, shield_clock, power_used,
         # flame_mags, shield_charge).
-        for (tag, x, y, ang, vx, vy, _eid, s_dump, s_clock, _p_used,
+        for (tag, x, y, ang, vx, vy, eid, s_dump, s_clock, _p_used,
              flame_mags, _s_charge) in pos['enemies']:
             self._draw_remote_enemy_hull(screen, tag, x, y, ang,
-                                         s_dump, s_clock, flame_mags)
+                                         s_dump, s_clock, flame_mags,
+                                         eid=eid)
         # Remote projectiles. The entry carries the missile id (mid) too —
         # unused here (remote_view has no ghost to dedup against).
         for (x, y, vx, vy, kind, owner, boost, _mid) in pos['bullets']:
@@ -2595,10 +2596,11 @@ class Game:
         # the hull is fixed on both peers, so the per-tag stand-in draws it
         # faithfully. Shield state + flame mags feed the stand-in so the
         # impact flash and exhaust render (mirrors the host's model path).
-        for (tag, x, y, ang, vx, vy, _eid, s_dump, s_clock, _p_used,
+        for (tag, x, y, ang, vx, vy, eid, s_dump, s_clock, _p_used,
              flame_mags, _s_charge) in pos['enemies']:
             self._draw_remote_enemy_hull(screen, tag, x, y, ang,
-                                         s_dump, s_clock, flame_mags)
+                                         s_dump, s_clock, flame_mags,
+                                         eid=eid)
         # Remote projectiles: every bullet and missile in the buffer, at its
         # interpolated position. DEDUP: the buffer also carries the LOCAL
         # player's own missiles (the host's snapshot includes them ~100 ms
@@ -2848,12 +2850,15 @@ class Game:
             else:
                 _cr, _oval, _has_comp, _s_up = \
                     16.0, (30.0, 22.0, 0.0, 0.0), False, False
-            # Entry: (tag, x, y, ang, hull_r, s_up, oval, es_charge,
-            # has_comp). es_charge + has_comp are the shield-decision
-            # inputs, carried so the HIT telemetry row can show WHY a hit
-            # took the hull path instead of the shield path (10.13b).
+            # Entry: (tag, x, y, ang, hull_r, s_up, oval, es_charge, has_comp,
+            # eid). es_charge + has_comp are the shield-decision inputs,
+            # carried so the HIT telemetry row can show WHY a hit took the
+            # hull path instead of the shield path (10.13b). eid is the
+            # per-enemy id (NOT the tag) — the local glow is keyed by it so
+            # two enemies of the same tag don't flash together.
             _hit_fx_enemies.append(
-                (_tag, x, y, ang, _cr, _s_up, _oval, es_charge, _has_comp))
+                (_tag, x, y, ang, _cr, _s_up, _oval, es_charge, _has_comp,
+                 eid))
         # Swept segment-circle test: the bullet's per-frame segment
         # (prev -> present) vs the target's drawn hull radius. Swept (not
         # a point test) so a fast bullet cannot tunnel through between
@@ -2879,7 +2884,7 @@ class Game:
             if bid in _hit_fx_cull:
                 continue
             for (et, ex, ey, eang, er, e_shield_up, _oval,
-                     es_charge, has_comp) in _hit_fx_enemies:
+                     es_charge, has_comp, eid) in _hit_fx_enemies:
                 _ea, _eb, _ecx, _ecy = _oval
                 # Shield UP: point test the bullet's PRESENT position
                 # against the shield oval — the SAME criteria as the host's
@@ -2954,12 +2959,16 @@ class Game:
                         if _proxy is not None \
                                 and _proxy.ship.shield_comp is not None:
                             _ph = _proxy.ship.shield_comp.power_hit
-                            _cur = self._enemy_glow.get(et)
+                            # Key by ENEMY ID (not tag): the stand-in is
+                            # per-tag (shared by all enemies of a type),
+                            # but the glow is per-enemy — two motes must
+                            # not flash together when one is hit.
+                            _cur = self._enemy_glow.get(eid)
                             if _cur is None:
-                                self._enemy_glow[et] = (_ph, 0.0)
+                                self._enemy_glow[eid] = (_ph, 0.0)
                             else:
-                                self._enemy_glow[et] = (_cur[0] + _ph,
-                                                        _cur[1])
+                                self._enemy_glow[eid] = (_cur[0] + _ph,
+                                                         _cur[1])
                     else:
                         # Mirrors the host's surviving ENEMY hit: a small
                         # burst at the impact point (no SFX — the host
@@ -3371,7 +3380,7 @@ class Game:
 
     def _draw_remote_enemy_hull(self, screen, tag, x, y, ang,
                             shield_dump=0.0, shield_clock=0.0,
-                            flame_mags=None):
+                            flame_mags=None, eid=None):
         """Draw a remote enemy as its REAL hull at the interpolated
         (pos, angle) (replaces the 10 px dot, the D4 defect). The
         stand-in's Ship.draw takes explicit pos/angle, so the stand-in's
@@ -3395,8 +3404,11 @@ class Game:
         # Blend the buffer's (host's delayed) shield_dump with the LOCAL
         # immediate glow the option-A trigger set this frame: max() so a
         # fresh local flash is never dimmed by the (usually 0) buffer
-        # value, and the host's dump still shows once it arrives.
-        _lg = self._enemy_glow.get(tag)
+        # value, and the host's dump still shows once it arrives. Keyed by
+        # ENEMY ID (not tag): the stand-in is per-TAG (shared by all
+        # enemies of a type), but the glow is per-ENEMY — two motes must
+        # not flash together when one is hit.
+        _lg = self._enemy_glow.get(eid) if eid is not None else None
         if _lg is not None:
             shield_dump = max(shield_dump, _lg[0])
             shield_clock = _lg[1]

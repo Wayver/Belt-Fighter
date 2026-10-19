@@ -205,9 +205,13 @@ def main():
     #     trigger sets _enemy_glow['ai'] to the shield's power_hit;
     #     _step_hit_fx decays it at SHIELD_DUMP_DECAY until it clears. ---
     from .config import SHIELD_DUMP_DECAY
-    assert 'ai' in g._enemy_glow, \
-        "a shield-up hit must set the local glow: %r" % (g._enemy_glow,)
-    _glow_dump, _glow_clock = g._enemy_glow['ai']
+    # The glow is keyed by ENEMY ID (not tag) — the test's enemy has id
+    # 999 (see make_snap). Two enemies of the same tag must not share a
+    # glow, so the key is the per-enemy id.
+    assert 999 in g._enemy_glow, \
+        "a shield-up hit must set the local glow (keyed by enemy id): " \
+        "%r" % (g._enemy_glow,)
+    _glow_dump, _glow_clock = g._enemy_glow[999]
     _ph = g._get_remote_enemies()['ai'].ship.shield_comp.power_hit
     assert abs(_glow_dump - _ph) < 1e-9, \
         "the local glow must start at the shield's power_hit (%.1f): " \
@@ -216,7 +220,7 @@ def main():
     _frames = int(_ph / (SHIELD_DUMP_DECAY * 0.016)) + 2
     for _ in range(_frames):
         g._step_hit_fx(0.016)
-    assert 'ai' not in g._enemy_glow, \
+    assert 999 not in g._enemy_glow, \
         "the local glow must decay to zero and clear: %r" \
         % (g._enemy_glow,)
     print("PASS: LOCAL-GLOW — a shield-up hit flashes the stand-in's "

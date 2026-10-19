@@ -45,6 +45,7 @@ from .netcode import SnapshotBuffer, PredictedShip, BEAM_TTL
 from . import missile_telemetry as _mtel
 from . import bullet_telemetry as _btel
 from . import bullet_time_telemetry as _bttel
+from . import bullet_handoff_telemetry as _bhtel
 from .config import (INTERP_DELAY, SNAPSHOT_INTERVAL, ROCK_FILL, ROCK_EDGE,
                     ENEMY_FILL, ENEMY_EDGE, ENEMY_FLAME,
                     SHIP_COLOR, SHIP_EDGE,
@@ -744,6 +745,11 @@ class Game:
         # the first frame the position CHANGES (the pop-in window is
         # frozen). Client-only.
         self._bullet_handoff_buf_pos = {}
+        # Bullet handoff telemetry (bullet_handoff_telemetry): the ghost's
+        # DRAWN position at the handoff frame, {bid: (gx, gy)}. Consumed on
+        # the first frame the buffer's copy is drawn (to compute the
+        # handoff offset: ghost_pos - buf_drawn_pos). Client-only.
+        self._bullet_handoff_ghost_pos = {}
         self.reset()
 
     @property
@@ -848,6 +854,7 @@ class Game:
         self._missile_handoff_ghost_pos.clear()
         self._missile_handoff_buf_pos.clear()
         self._bullet_handoff_buf_pos.clear()   # stale bullet handoff
+        self._bullet_handoff_ghost_pos.clear()   # stale handoff telemetry
         self._sfx_thruster(False)   # never carry the engine loop across a reset
         if self.test_mode:
             self._setup_test_scene()
@@ -2545,6 +2552,14 @@ class Game:
                               h_buf_ids="", h_before="", h_after="",
                               h_culled=_mtel.fmt_ids([_bid]),
                               h_jump="")
+                    # TELEMETRY (bullet_handoff_telemetry): record the
+                    # ghost's DRAWN position at the handoff frame (b.pos —
+                    # the present-time position the ghost was drawing it
+                    # at). Consumed in the buffer draw loop below to
+                    # compute the handoff offset (ghost_pos - buf_drawn).
+                    if _bid is not None:
+                        self._bullet_handoff_ghost_pos[_bid] = (
+                            b.pos.x, b.pos.y)
                     continue
             _bkept.append(b)
         self.ghost.local_bullets = _bkept
@@ -2675,6 +2690,24 @@ class Game:
                 if _bid_t[0] == self.local_index:
                     x += vx * _bdelay
                     y += vy * _bdelay
+                    # TELEMETRY (bullet_handoff_telemetry): the FIRST frame
+                    # the buffer's copy is drawn (the handoff frame), log
+                    # the offset between the ghost's last drawn position
+                    # (recorded in the handoff block) and this buffer
+                    # drawn position (already pulled forward by V*delay).
+                    # The offset decomposes into a parallel component
+                    # (time-domain mismatch: ghost_present != newest) and a
+                    # perpendicular component (prediction/muzzle error).
+                    _bhp = self._bullet_handoff_ghost_pos.pop(_bid_t, None)
+                    if _bhp is not None:
+                        _bhtel.log_handoff(
+                            _bid_t, _bhp[0], _bhp[1], x, y, vx, vy,
+                            _bdelay,
+                            ship=(self.ghost.ship.pos.x,
+                                  self.ghost.ship.pos.y,
+                                  self.ghost.ship.angle,
+                                  self.ghost.ship.vel.x,
+                                  self.ghost.ship.vel.y))
             if kind == 'missile' and mid is not None:
                 _mid_t = tuple(mid)
                 _buf_drawn.append(_mid_t)

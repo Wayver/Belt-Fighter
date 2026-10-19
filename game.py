@@ -2716,13 +2716,15 @@ class Game:
         # HIT FX (option A, the pass-through fix) — runs BEFORE the draw loops so
         # the cull set is ready before any bullet is drawn. A local bullet
         # (ghost-drawn or buffer-drawn, both at the PRESENT) that visually
-        # reaches a remote ship's drawn hull spawns a shield_burst spark +
-        # throttled shield_hit SFX (mirrors the host's surviving-hit FX) and
-        # is marked for cull so it stops at the hull instead of passing
-        # through. The synced shield-oval flash is KEPT (option i) — it is
-        # the same effect the host draws. Presentation only: no sim, no
-        # authority (the authoritative hit + damage still come from the
-        # host snapshot).
+        # reaches a target's drawn hull spawns a spark and is marked for
+        # cull so it stops at the hull instead of passing through. Targets:
+        #   * the other PLAYER (pos['ships']) -> shield_burst + throttled
+        #     shield_hit SFX (mirrors the host's surviving player-hit FX);
+        #     the synced shield-oval flash is KEPT (option i).
+        #   * AI ENEMIES (pos['enemies']) -> a small burst at the impact
+        #     point (mirrors the host's surviving enemy-hit FX; no SFX).
+        # Presentation only: no sim, no authority (the authoritative hit +
+        # damage still come from the host snapshot).
         # Persistent cull (bid -> wall time of the visual hit). TTL-prune entries
         # older than BULLET_LIFE (far longer than the `delay` gap between
         # the visual hit and the host's authoritative cull, so the buffer
@@ -2759,10 +2761,13 @@ class Game:
             if i != self.local_index and not dead:
                 _hit_fx_ships.append(
                     (i, x, y, self.players[i].hull.collision_radius))
-        # TELEMETRY (hit_fx): AI enemies in the buffer. The trigger does
-        # NOT test these (it only tests pos['ships']), so their
-        # closest-approach is logged to expose the missing-target bug.
-        # The per-tag stand-in owns a real Ship -> its collision_radius.
+        # AI enemies' drawn poses + collision radii (the per-tag stand-in
+        # owns a real Ship -> its collision_radius). These are the
+        # PRIMARY targets in 2P (the player shoots AI enemies, not the
+        # other player) — the first pass of this trigger only tested
+        # pos['ships'], so the target list was empty in normal play and
+        # no spark ever fired (hit_fx_debug.csv: 27 enemy_hit frames,
+        # 0 HIT rows).
         _hf_standin = self._get_remote_enemies()
         _hit_fx_enemies = []
         for (_tag, x, y, ang, evx, evy, eid,
@@ -2771,9 +2776,9 @@ class Game:
             _cr = _proxy.ship.collision_radius if _proxy else 16.0
             _hit_fx_enemies.append((_tag, x, y, _cr))
         # Swept segment-circle test: the bullet's per-frame segment
-        # (prev -> present) vs the ship's drawn hull radius. Swept (not a
-        # point test) so a fast bullet cannot tunnel through between
-        # frames.
+        # (prev -> present) vs the target's drawn hull radius. Swept (not
+        # a point test) so a fast bullet cannot tunnel through between
+        # frames. Ships first (the other player), then AI enemies.
         _hf_min_ship = None    # (dist, radius, label) closest remote ship
         _hf_min_enemy = None   # (dist, radius, label) closest AI enemy
         for (bid, x0, y0, x1, y1, _src) in _hit_fx_bullets:
@@ -2792,16 +2797,23 @@ class Game:
                                         SFX_SHIELD_HIT_MIN_INTERVAL)
                     _hftel.log_hit(bid, _src, "ship%d" % si, hx, hy, _d)
                     break
-        # TELEMETRY (hit_fx): closest approach to AI enemies (NOT tested by
-        # the trigger). A small min_d_enemy with enemy_hit==1 while
-        # ship_hit==0 confirms the trigger never targets enemies.
-        for (bid, x0, y0, x1, y1, _src) in _hit_fx_bullets:
             if bid in _hit_fx_cull:
                 continue
             for (et, ex, ey, er) in _hit_fx_enemies:
                 _d = _hftel.seg_point_dist(x0, y0, x1, y1, ex, ey)
                 if _hf_min_enemy is None or _d < _hf_min_enemy[0]:
                     _hf_min_enemy = (_d, er, et)
+                hit, hx, hy = _seg_circle_hit(x0, y0, x1, y1, ex, ey, er)
+                if hit:
+                    _hit_fx_cull[bid] = _hit_fx_now
+                    # Mirrors the host's surviving ENEMY hit: a small
+                    # burst at the impact point (no SFX — the host plays
+                    # none on a surviving enemy hit; the killing hit is
+                    # covered by the existing death burst `delay` later).
+                    burst(self._hit_fx, pygame.Vector2(hx, hy), 6,
+                          rng=random)
+                    _hftel.log_hit(bid, _src, "enemy:%s" % et, hx, hy, _d)
+                    break
         _hftel.log_frame(_hf_n_ghost, _hf_n_buf,
                          len(_hit_fx_ships), len(_hit_fx_enemies),
                          _hf_min_ship, _hf_min_enemy,

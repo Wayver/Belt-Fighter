@@ -2565,11 +2565,24 @@ class Game:
         self.ghost.local_bullets = _bkept
         local_bullet_ids = {tuple(b.id) for b in self.ghost.local_bullets
                             if b.id is not None}
-        # Pull-forward magnitude: the buffer's copy is drawn V*delay ahead of
-        # its interpolated position so it lands where the ghost was
-        # drawing it (buffer_pos + V*delay == ghost_pos). `delay` is the
-        # client's current adaptive delay (render point = newest - delay).
+        # Pull-forward magnitude: the buffer's copy is drawn V*D ahead of
+        # its interpolated position so it lands where the ghost was drawing
+        # it (buffer_pos + V*D == ghost_pos). The ghost bullet is drawn at
+        # its PREDICTED clock (_last_step_time ~= host_time + rtt_ow, the
+        # "present"), while the buffer's copy is at the RENDER POINT
+        # (rp = newest - delay). The gap between them is
+        #   D = _last_step_time - rp = (present - newest) + delay,
+        # NOT just `delay` — the ghost sits AHEAD of the newest snapshot by
+        # (present - newest) ~= rtt_ow + the step phase. Pulling by V*delay
+        # only lands the buffer copy at `newest`, leaving it
+        # (present - newest) behind the ghost -> a backward jump along the
+        # bullet's path at the handoff frame (the "shifted" symptom; the
+        # jump is parallel to travel, not perpendicular — a diagonal path
+        # makes a backward jump read as a sideways shift). Pulling by V*D
+        # closes the full gap. `_bdelay` (the adaptive delay) is kept for
+        # the telemetry row; `_bdpull` (D) is the actual pull.
         _bdelay = self.latency.delay
+        _bdpull = self.ghost._last_step_time - rp
         # Missile render offset (the handback fix): the buffer's copy of a
         # handed-off missile is INTERP_DELAY seconds BEHIND the ghost's
         # predicted position, so drawing it at its interpolated position
@@ -2677,19 +2690,23 @@ class Game:
                 _buf_drawn.append(_bid_t)
                 _buf_bdrawn.append(_bid_t)
                 # The LOCAL player's handed-off bullet: the ghost was
-                # drawing it at the PRESENT (b.pos), but the buffer's copy
-                # is at the render point (present - delay). Pull it forward
-                # by V*delay so it lands where the ghost was drawing it
-                # (buffer_pos + V*delay == ghost_pos) — a seamless handoff.
-                # (The plan_15 revert: the ghost is back at the present, so
-                # the pull-forward is needed again — without it the bullet
-                # pops backward V*delay at the handoff frame.) The REMOTE
-                # player's bullets (id[0] != local_index) are drawn at the
-                # raw interpolated position (the remote ship is also drawn
-                # from the buffer — same time domain, no pull).
+                # drawing it at the PRESENT (b.pos, its predicted clock),
+                # but the buffer's copy is at the render point (rp). Pull
+                # it forward by V*D (D = _last_step_time - rp) so it lands
+                # where the ghost was drawing it (buffer_pos + V*D ==
+                # ghost_pos) — a seamless handoff. (The plan_15 revert: the
+                # ghost is back at the present, so the pull-forward is
+                # needed again — without it the bullet pops backward at the
+                # handoff frame. The pull is V*D, NOT V*delay: the ghost
+                # sits ahead of the newest snapshot by (present - newest),
+                # so V*delay alone leaves a backward jump — see the
+                # _bdpull comment above.) The REMOTE player's bullets
+                # (id[0] != local_index) are drawn at the raw interpolated
+                # position (the remote ship is also drawn from the buffer —
+                # same time domain, no pull).
                 if _bid_t[0] == self.local_index:
-                    x += vx * _bdelay
-                    y += vy * _bdelay
+                    x += vx * _bdpull
+                    y += vy * _bdpull
                     # TELEMETRY (bullet_handoff_telemetry): the FIRST frame
                     # the buffer's copy is drawn (the handoff frame), log
                     # the offset between the ghost's last drawn position
@@ -2702,7 +2719,7 @@ class Game:
                     if _bhp is not None:
                         _bhtel.log_handoff(
                             _bid_t, _bhp[0], _bhp[1], x, y, vx, vy,
-                            _bdelay,
+                            _bdpull,
                             ship=(self.ghost.ship.pos.x,
                                   self.ghost.ship.pos.y,
                                   self.ghost.ship.angle,
@@ -2885,7 +2902,7 @@ class Game:
         lights = self._remote_fog_lights(pos, self.ghost.ship, local_missile_ids,
                                  handoff_offsets=self._missile_handoff_offsets,
                                  local_bullet_ids=local_bullet_ids,
-                                 delay=_bdelay,
+                                 pull=_bdpull,
                                  local_index=self.local_index)
         # The player's OWN gun shots glow too — mirrors the
         # host's _build_lights, which adds a LightSource per player bullet.
@@ -3070,7 +3087,7 @@ class Game:
 
     def _remote_fog_lights(self, pos, local_ship, local_missile_ids=(),
                        handoff_offsets=None, local_bullet_ids=(),
-                       delay=0.0, local_index=0):
+                       pull=0.0, local_index=0):
         """LightSources for the client's fog of war (
         predicted_view previously skipped draw_fog entirely, so fire did
         not glow through the dark like on the host). Mirrors
@@ -3099,9 +3116,10 @@ class Game:
         (added by the caller), so the same bullet does not light twice.
         A LOCAL bullet the ghost has handed off (its id NOT in
         local_bullet_ids, id[0] == local_index) is lit PULLED FORWARD by
-        V*delay (the closed-form handoff — the same pull the sprite gets),
-        so the glow follows the bullet. The REMOTE player's bullets
-        (id[0] != local_index) are lit at their raw position (no pull).
+        V*pull (pull = D = _last_step_time - rp, the same pull the sprite
+        gets — see the _bdpull comment in predicted_view), so the glow
+        follows the bullet. The REMOTE player's bullets (id[0] !=
+        local_index) are lit at their raw position (no pull).
         `local_index` is the local player's index (the id's first element
         is the firing player's index, so it distinguishes local from
         remote)."""
@@ -3113,7 +3131,7 @@ class Game:
             # The ghost's OWN gun shots — same skip as missiles. A bullet the
             # ghost is still drawing is skipped (it glows from the ghost's
             # predicted pos); a LOCAL bullet the ghost has handed off is
-            # lit PULLED FORWARD by V*delay (the closed-form handoff — the
+            # lit PULLED FORWARD by V*pull (the closed-form handoff — the
             # same pull the sprite gets). The REMOTE player's bullets
             # (id[0] != local_index) are lit at their raw position (no
             # pull — they are not predicted by the ghost).
@@ -3122,17 +3140,16 @@ class Game:
                 if _bid_t in local_bullet_ids:
                     continue   # glows from the ghost's predicted pos
                 # The LOCAL player's handed-off bullet: the ghost was
-                # drawing it at the PRESENT (b.pos), but the buffer's copy
-                # is at the render point (present - delay). Pull it forward
-                # by V*delay so the glow lands where the ghost was drawing
-                # it (the same pull the sprite gets) — a seamless handoff.
-                # (The plan_15 revert: the ghost is back at the present, so
-                # the pull-forward is needed again.) The REMOTE player's
-                # bullets (id[0] != local_index) are lit at their raw
-                # position (no pull).
+                # drawing it at the PRESENT (b.pos, its predicted clock),
+                # but the buffer's copy is at the render point (rp). Pull
+                # it forward by V*pull (pull = D = _last_step_time - rp)
+                # so the glow lands where the ghost was drawing it (the
+                # same pull the sprite gets) — a seamless handoff. The
+                # REMOTE player's bullets (id[0] != local_index) are lit
+                # at their raw position (no pull).
                 if _bid_t[0] == local_index:
-                    x += vx * delay
-                    y += vy * delay
+                    x += vx * pull
+                    y += vy * pull
             # Apply the handoff offset to the fog light (same
             # position as the missile sprite).
             if kind == 'missile' and mid is not None and handoff_offsets:

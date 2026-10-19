@@ -390,19 +390,23 @@ def main():
         "the handed-off bullet must be REMOVED from the ghost (the buffer " \
         "draws it now): %r" % (g2.ghost.local_bullets,)
     # plan_15 REVERT: the ghost draws its own bullets at the PRESENT
-    # (b.pos), so the buffer's handed-off copy (at the render point,
-    # present - delay) must be PULLED FORWARD by V*delay to land where the
-    # ghost was drawing it — a seamless handoff. Without the pull the
-    # bullet pops backward V*delay at the handoff frame.
-    _delay = g2.latency.delay
-    _pulled = (_raw[0] + _raw[2] * _delay, _raw[1] + _raw[3] * _delay)
+    # (b.pos, its predicted clock), so the buffer's handed-off copy (at the
+    # render point, rp) must be PULLED FORWARD by V*D (D = _last_step_time
+    # - rp) to land where the ghost was drawing it — a seamless handoff.
+    # Without the pull the bullet pops backward at the handoff frame. The
+    # pull is V*D, NOT V*delay: the ghost sits ahead of the newest snapshot
+    # by (present - newest), so V*delay alone leaves a backward jump. (In
+    # this controlled test the ghost's clock == newest, so D == delay — the
+    # real (present - newest) gap is exercised by the 2P capture, not here.)
+    _bdpull = g2.ghost._last_step_time - _rp
+    _pulled = (_raw[0] + _raw[2] * _bdpull, _raw[1] + _raw[3] * _bdpull)
     assert bullet_px(screen, g2.cam, _pulled[0], _pulled[1]) > 0, \
-        "the handed-off bullet must be DRAWN PULLED FORWARD by V*delay " \
+        "the handed-off bullet must be DRAWN PULLED FORWARD by V*D " \
         "(%.1f, %.1f), not at its raw position (%.1f, %.1f): %d px" \
         % (_pulled[0], _pulled[1], _raw[0], _raw[1],
            bullet_px(screen, g2.cam, _pulled[0], _pulled[1]))
     print("PASS: SEAMLESS HANDOFF — the handed-off bullet is removed from "
-          "the ghost and drawn by the buffer PULLED FORWARD by V*delay " \
+          "the ghost and drawn by the buffer PULLED FORWARD by V*D " \
           "(%.1f, %.1f) (plan_15 revert: ghost back at the present)"
           % (_pulled[0], _pulled[1]))
 

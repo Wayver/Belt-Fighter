@@ -693,7 +693,7 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
                     flame_mags, brownout, power_factor), ...],
          'enemies': [(tag, x, y, angle, vx, vy, id,
                       shield_dump, shield_clock, power_used,
-                      flame_mags), ...],
+                      flame_mags, shield_charge), ...],
          'asteroids': [(x, y), ...],
          'bullets': [(x, y, vx, vy, kind, owner, boost, mid), ...]}
 
@@ -760,7 +760,10 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
     # and velocity come from the CURRENT snapshot. The prev enemy carries
     # (x, y, angle, shield_dump, shield_clock, power_used) — lerp'd with
     # the pose; a new enemy pops in at its curr values. flame_mags
-    # (ship_s[23]) comes from the CURRENT snapshot, NOT lerp'd.
+    # (ship_s[23]) and shield_charge (ship_s[5]) come from the CURRENT
+    # snapshot, NOT lerp'd (a state latch, like `dead`/`brownout` — the
+    # client's option-A trigger reads shield_charge to decide whether to
+    # spark at the shield boundary or the hull).
     prev_enemies = {}
     for _tag, p in prev_s[1]:
         es = p[0]
@@ -774,7 +777,8 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
         pp = prev_enemies.get(eid)
         if pp is None:
             enemies.append((tag, cpos[0], cpos[1], ce[4], ce[2], ce[3],
-                            eid, ce[6], ce[7], ce[22], dict(ce[23])))
+                            eid, ce[6], ce[7], ce[22], dict(ce[23]),
+                            ce[5]))
         else:
             enemies.append((tag,
                             lerp(pp[0], cpos[0], a),
@@ -785,7 +789,8 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
                             lerp(pp[3], ce[6], a),
                             lerp(pp[4], ce[7], a),
                             lerp(pp[5], ce[22], a),
-                            dict(ce[23])))
+                            dict(ce[23]),
+                            ce[5]))
 
     prev_rocks = {_asteroid_key(p): (p[1], p[2]) for p in prev_s[5]}
     asteroids = []

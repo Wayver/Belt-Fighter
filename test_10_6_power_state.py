@@ -22,9 +22,10 @@ Headless: sets SDL_VIDEODRIVER=dummy before pygame.init().
          power-presentation fields (brownout / power_factor / power_used /
          flame_mags) into one plain dict for future power features.
        * netcode.interp_positions carries flame_mags through the buffer:
-         the ship entry is now a 7-tuple (… , flame_mags) and the enemy
-         entry an 11-tuple (… , flame_mags) — both taken from the CURRENT
-         snapshot (a flame dict has no meaningful cross-window blend).
+         the ship entry is now a 9-tuple (… , flame_mags) and the enemy
+         entry a 12-tuple (… , flame_mags, shield_charge) — flame_mags
+         taken from the CURRENT snapshot (a flame dict has no meaningful
+         cross-window blend).
        * game feeds the flame mags to the stand-in before drawing:
          predicted_view / remote_view feed the remote player ship,
          _draw_remote_enemy_hull feeds the enemy stand-in (client), and
@@ -49,10 +50,10 @@ This test proves:
   2. POWER-STATE    — Ship.power_state() bundles the four fields and
                       returns a COPY of flame_mags (mutating the dict does
                       not touch the ship).
-  3. BUFFER-CARRIES — the buffer's ship entry is a 7-tuple (flame_mags at
-                      [6]) and the enemy entry an 11-tuple (flame_mags at
-                      [10]); both taken from the CURRENT snapshot (not
-                      lerp'd).
+  3. BUFFER-CARRIES — the buffer's ship entry is a 9-tuple (flame_mags at
+                      [6]) and the enemy entry a 12-tuple (flame_mags at
+                      [10], shield_charge at [11]); both taken from the
+                      CURRENT snapshot (not lerp'd).
   4. FEEDS-STANDIN  — after predicted_view, the remote player ship's
                       flame_mags match the buffer's entry, and the enemy
                       stand-in's flame_mags match the buffer's enemy entry.
@@ -302,8 +303,9 @@ def main():
 
     # --- 3. BUFFER-CARRIES: the buffer's ship entry is a 9-tuple
     #     (flame_mags at [6], brownout at [7], power_factor at [8] — 10.5)
-    #     and the enemy entry an 11-tuple (flame_mags at [10]); the flame
-    #     mags are taken from the CURRENT snapshot (not lerp'd). ---
+    #     and the enemy entry a 12-tuple (flame_mags at [10], shield_charge
+    #     at [11] — 10.13); the flame mags + shield_charge are taken from
+    #     the CURRENT snapshot (not lerp'd). ---
     prev = make_snap(NO_FLAME, NO_FLAME)
     curr = make_snap(FLAME_FWD, FLAME_FWD)
     P = interp_positions(prev, curr, 0.5, dt=0.1)
@@ -314,14 +316,14 @@ def main():
         "ship flame_mags must be at [6] (from curr, not lerp'd): %r" \
         % (s_entry[6],)
     e_entry = P['enemies'][ENEMY_IDX]
-    assert isinstance(e_entry, tuple) and len(e_entry) == 11, \
-        "enemy entry must be an 11-tuple, got %r" % (e_entry,)
+    assert isinstance(e_entry, tuple) and len(e_entry) == 12, \
+        "enemy entry must be a 12-tuple, got %r" % (e_entry,)
     assert e_entry[10] == FLAME_FWD, \
         "enemy flame_mags must be at [10] (from curr, not lerp'd): %r" \
         % (e_entry[10],)
     print("PASS: BUFFER-CARRIES — ship entry 9-tuple (flame_mags [6], "
-          "brownout [7], power_factor [8]), enemy entry 11-tuple "
-          "(flame_mags [10]), from curr")
+          "brownout [7], power_factor [8]), enemy entry 12-tuple "
+          "(flame_mags [10], shield_charge [11]), from curr")
 
     # --- 4-6. FEEDS-STANDIN + PIXEL: build the client, render a no-flame
     #     baseline frame, then a full-flame frame. ---

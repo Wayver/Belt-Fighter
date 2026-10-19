@@ -558,7 +558,10 @@ def id_oracle(prev_s, curr_s, alpha, dt=None):
                         # 10.6: flame_mags from the CURRENT snapshot (not
                         # lerp'd — a flame dict has no meaningful cross-
                         # window blend).
-                        dict(t[0][23])))
+                        dict(t[0][23]),
+                        # 10.13: shield_charge from the CURRENT snapshot
+                        # (not lerp'd — a state latch, like `dead`).
+                        t[0][5]))
     # Player ships are matched by INDEX (Session 6.1) — ships don't turn
     # over, so slot i of curr_s[0] is the same ship as slot i of prev_s[0].
     # Pose = (x, y, raw angle) (Session 6.8). 10.2: the prev ship also
@@ -1244,10 +1247,11 @@ def main():
                   f"render_t={INTERP_DELAY + i * STEP}")
             break
         # 10.3c: the entry is now a 10-tuple (… + shield_dump, shield_clock,
-        # power_used). 10.6: + flame_mags (11-tuple).
+        # power_used). 10.6: + flame_mags (11-tuple). 10.13: +
+        # shield_charge (12-tuple).
         cur = {eid: ang for (_tag, _x, _y, ang, _vx, _vy, eid,
                              _s_dump, _s_clock, _p_used,
-                             _flame_mags) in P['enemies']}
+                             _flame_mags, _s_charge) in P['enemies']}
         for eid, ang in cur.items():
             if eid in prev_enemy_angles:
                 d = abs((ang - prev_enemy_angles[eid] + math.pi)

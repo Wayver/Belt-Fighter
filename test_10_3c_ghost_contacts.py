@@ -22,7 +22,7 @@ is not synced) — so it is carried on the wire:
          power_used at index 22, before the
     10.6 flame_mags at 23); apply_snapshot restores it.
   * netcode.interp_positions carries power_used through the buffer's
-    enemy entry (11-tuple, index 9), LERP'd across the window like the
+    enemy entry (12-tuple, index 9), LERP'd across the window like the
     shield state (the enemy's power demand eases as it throttles/fires).
   * game._ghost_enemy_proxies fills the proxy's .ship stand-in:
     power_used from the buffer, power_idle_total derived from the tag's
@@ -44,7 +44,7 @@ This test proves it:
                        bullet_seq at [24]); the
                     enemy's nested ship snapshot carries it; JSON
                     round-trip preserves it.
-  2. BUFFER-CARRIES — the buffer's enemy entry is an 11-tuple with
+  2. BUFFER-CARRIES — the buffer's enemy entry is a 12-tuple with
                     power_used at [9], lerp'd across the window
                     (midpoint = average, endpoint-exact at alpha 0/1).
   3. PROXY-POWER  — _ghost_enemy_proxies fills power_used (from the
@@ -326,8 +326,9 @@ def main():
           "[22], bullet_seq at [24]); the enemy's nested ship snapshot "
           "carries it; JSON round-trip preserves it")
 
-    # --- 2. BUFFER-CARRIES: the buffer's enemy entry is an 11-tuple with
-    #     power_used at [9], lerp'd across the window. ---
+    # --- 2. BUFFER-CARRIES: the buffer's enemy entry is a 12-tuple with
+    #     power_used at [9], lerp'd across the window. (10.13 grew it to
+    #     a 12-tuple: + shield_charge at [11], from curr, not lerp'd.) ---
     g = make_client(screen, font, big_font, light_tex, fog_surf, light_surf)
     push_stream(g, ENEMY_POWER_USED)
     g.latency.tick(0.016)
@@ -335,7 +336,7 @@ def main():
     pos = g.snap_buf.positions_at(g.render_point.now())
     assert pos is not None and pos['enemies'], "no buffer window"
     entry = pos['enemies'][ENEMY_IDX]
-    assert len(entry) == 11, "buffer enemy entry must be an 11-tuple, " \
+    assert len(entry) == 12, "buffer enemy entry must be a 12-tuple, " \
         "got %d" % len(entry)
     assert abs(entry[9] - ENEMY_POWER_USED) < 1e-9, \
         "buffer enemy entry must carry power_used at [9]: %r" % (entry[9],)
@@ -353,7 +354,7 @@ def main():
     assert abs(lo - 10.0) < 1e-9 and abs(hi - 30.0) < 1e-9, \
         "power_used must be endpoint-exact at alpha 0/1: %r / %r" \
         % (lo, hi)
-    print("PASS: BUFFER-CARRIES — buffer enemy entry is an 11-tuple "
+    print("PASS: BUFFER-CARRIES — buffer enemy entry is a 12-tuple "
           "(power_used at [9]), lerp'd across the window (midpoint = "
           "average, endpoint-exact at alpha 0/1)")
 

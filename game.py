@@ -1855,15 +1855,29 @@ class Game:
         return False
 
     def _collisions(self):
-        # player bullet vs enemy (swept segment vs hull polygon)
+        # player bullet vs enemy (swept segment vs hull polygon). The shield is
+        # a damage ABSORBER (register_hit routes through it), but the FX
+        # must convey WHERE the hit landed: shield UP -> spark at the
+        # shield boundary (the shield took it), shield DOWN -> small burst
+        # at the hull. Check shield_on BEFORE register_hit (the charge is
+        # not yet decremented) — the same rule the enemy-bullet-vs-player
+        # path uses.
         for b in self.bullets[:]:
             for i, e in enumerate(self.enemies):
                 hit, hit_pt = e.ship.collision_segment(b.prev_pos, b.pos)
                 if hit:
                     self.bullets.remove(b)
                     impact = pygame.Vector2(hit_pt)
+                    _shield_up = e.ship.shield_on
                     if e.register_hit(impact):
-                        burst(self.particles, impact, 6, rng=self.rng)
+                        if _shield_up:
+                            shield_burst(self.particles,
+                                         e.ship.shield_impact_point(impact),
+                                         rng=self.rng)
+                            self._sfx_throttled("shield_hit",
+                                                SFX_SHIELD_HIT_MIN_INTERVAL)
+                        else:
+                            burst(self.particles, impact, 6, rng=self.rng)
                     else:
                         burst(self.particles, e.pos, 20, big=True, rng=self.rng)
                         self._sfx("explosion")
@@ -1893,18 +1907,29 @@ class Game:
                     self.bullets.remove(b)
                     break
 
-        # missile vs enemy (swept segment vs hull polygon)
+        # missile vs enemy (swept segment vs hull polygon). Same shield-FX rule
+        # as the bullet path: shield UP -> spark at the shield boundary,
+        # shield DOWN -> small burst at the hull. Capture shield_on BEFORE
+        # the damage loop (the charge is not yet decremented).
         for m in self.missiles[:]:
             for i, e in enumerate(self.enemies):
                 hit, hit_pt = e.ship.collision_segment(m.prev_pos, m.pos)
                 if hit:
                     self.missiles.remove(m)
                     impact = pygame.Vector2(hit_pt)
+                    _shield_up = e.ship.shield_on
                     alive = True
                     for _ in range(m.dmg):
                         alive = e.register_hit(impact)
                     if alive:
-                        burst(self.particles, impact, 6, rng=self.rng)
+                        if _shield_up:
+                            shield_burst(self.particles,
+                                         e.ship.shield_impact_point(impact),
+                                         rng=self.rng)
+                            self._sfx_throttled("shield_hit",
+                                                SFX_SHIELD_HIT_MIN_INTERVAL)
+                        else:
+                            burst(self.particles, impact, 6, rng=self.rng)
                     else:
                         burst(self.particles, e.pos, 20, big=True, rng=self.rng)
                         self._sfx("explosion")
@@ -2178,9 +2203,9 @@ class Game:
             self._draw_remote_rock(screen, x, y)
         # Remote enemies as their REAL hulls. Buffer entry: (tag, x, y,
         # angle, vx, vy, id, shield_dump, shield_clock, power_used,
-        # flame_mags).
+        # flame_mags, shield_charge).
         for (tag, x, y, ang, vx, vy, _eid, s_dump, s_clock, _p_used,
-             flame_mags) in pos['enemies']:
+             flame_mags, _s_charge) in pos['enemies']:
             self._draw_remote_enemy_hull(screen, tag, x, y, ang,
                                          s_dump, s_clock, flame_mags)
         # Remote projectiles. The entry carries the missile id (mid) too —
@@ -2535,7 +2560,7 @@ class Game:
         # faithfully. Shield state + flame mags feed the stand-in so the
         # impact flash and exhaust render (mirrors the host's model path).
         for (tag, x, y, ang, vx, vy, _eid, s_dump, s_clock, _p_used,
-             flame_mags) in pos['enemies']:
+             flame_mags, _s_charge) in pos['enemies']:
             self._draw_remote_enemy_hull(screen, tag, x, y, ang,
                                          s_dump, s_clock, flame_mags)
         # Remote projectiles: every bullet and missile in the buffer, at its
@@ -2761,20 +2786,32 @@ class Game:
             if i != self.local_index and not dead:
                 _hit_fx_ships.append(
                     (i, x, y, self.players[i].hull.collision_radius))
-        # AI enemies' drawn poses + collision radii (the per-tag stand-in
-        # owns a real Ship -> its collision_radius). These are the
-        # PRIMARY targets in 2P (the player shoots AI enemies, not the
-        # other player) — the first pass of this trigger only tested
-        # pos['ships'], so the target list was empty in normal play and
-        # no spark ever fired (hit_fx_debug.csv: 27 enemy_hit frames,
-        # 0 HIT rows).
+        # AI enemies' drawn poses + collision radii + shield state (the per-tag
+        # stand-in owns a real Ship -> its collision_radius + shield_oval).
+        # These are the PRIMARY targets in 2P (the player shoots AI
+        # enemies, not the other player) — the first pass of this trigger
+        # only tested pos['ships'], so the target list was empty in normal
+        # play and no spark ever fired (hit_fx_debug.csv: 27 enemy_hit
+        # frames, 0 HIT rows). Each entry: (tag, x, y, ang, hull_r,
+        # shield_up, oval) where oval = (a, b, cx, cy) — shield_up from
+        # the buffer's shield_charge (a state latch, like `dead`); the
+        # circle approximation uses max(a, b), and (cx, cy) is the oval's
+        # local center (NOT always (0,0) — shield_oval_from_polygon
+        # centers on the hull bbox, so the mote/dreadnought ovals are
+        # offset).
         _hf_standin = self._get_remote_enemies()
         _hit_fx_enemies = []
         for (_tag, x, y, ang, evx, evy, eid,
-             es_dump, es_clock, es_pu, es_fm) in pos['enemies']:
+             es_dump, es_clock, es_pu, es_fm, es_charge) in pos['enemies']:
             _proxy = _hf_standin.get(_tag)
-            _cr = _proxy.ship.collision_radius if _proxy else 16.0
-            _hit_fx_enemies.append((_tag, x, y, _cr))
+            if _proxy is not None:
+                _cr = _proxy.ship.collision_radius
+                _oval = _proxy.ship.shield_oval
+                _s_up = _proxy.ship.shield_comp is not None \
+                    and es_charge > 0
+            else:
+                _cr, _oval, _s_up = 16.0, (30.0, 22.0, 0.0, 0.0), False
+            _hit_fx_enemies.append((_tag, x, y, ang, _cr, _s_up, _oval))
         # Swept segment-circle test: the bullet's per-frame segment
         # (prev -> present) vs the target's drawn hull radius. Swept (not
         # a point test) so a fast bullet cannot tunnel through between
@@ -2799,20 +2836,69 @@ class Game:
                     break
             if bid in _hit_fx_cull:
                 continue
-            for (et, ex, ey, er) in _hit_fx_enemies:
+            for (et, ex, ey, eang, er, e_shield_up, _oval) \
+                    in _hit_fx_enemies:
+                _ea, _eb, _ecx, _ecy = _oval
+                # Shield UP: test against the shield oval (approximated as
+                # a circle of radius max(a, b) centered on the drawn pos —
+                # the oval is centered on the ship, so this is well-centered)
+                # and spark at the shield BOUNDARY (conveys "the shield
+                # took it"). Shield DOWN: test the hull radius, small burst
+                # at the hull. Mirrors the host's shield-FX rule.
+                _er = max(_ea, _eb) if e_shield_up else er
                 _d = _hftel.seg_point_dist(x0, y0, x1, y1, ex, ey)
                 if _hf_min_enemy is None or _d < _hf_min_enemy[0]:
-                    _hf_min_enemy = (_d, er, et)
-                hit, hx, hy = _seg_circle_hit(x0, y0, x1, y1, ex, ey, er)
+                    _hf_min_enemy = (_d, _er, et)
+                hit, hx, hy = _seg_circle_hit(x0, y0, x1, y1, ex, ey, _er)
                 if hit:
                     _hit_fx_cull[bid] = _hit_fx_now
-                    # Mirrors the host's surviving ENEMY hit: a small
-                    # burst at the impact point (no SFX — the host plays
-                    # none on a surviving enemy hit; the killing hit is
-                    # covered by the existing death burst `delay` later).
-                    burst(self._hit_fx, pygame.Vector2(hx, hy), 6,
-                          rng=random)
-                    _hftel.log_hit(bid, _src, "enemy:%s" % et, hx, hy, _d)
+                    if e_shield_up:
+                        # Point on the shield oval toward the impact (the
+                        # same math as Ship.shield_impact_point, computed
+                        # inline so the shared per-tag stand-in is not
+                        # mutated). The oval's local center (_ecx, _ecy) is
+                        # NOT always (0,0) — shield_oval_from_polygon
+                        # centers on the hull bbox.
+                        _fwd_x = math.cos(eang)
+                        _fwd_y = math.sin(eang)
+                        _rgt_x = -_fwd_y
+                        _rgt_y = _fwd_x
+                        _dx = (hx - ex) * _fwd_x + (hy - ey) * _fwd_y \
+                            - _ecx
+                        _dy = (hx - ex) * _rgt_x + (hy - ey) * _rgt_y \
+                            - _ecy
+                        if _dx * _dx + _dy * _dy < 1e-6:
+                            # Impact at the oval's center (degenerate —
+                            # the bullet's segment passed through the
+                            # ship's center): spark at the impact point
+                            # (mirrors Ship.shield_impact_point's
+                            # length-squared guard).
+                            _ipx, _ipy = hx, hy
+                        else:
+                            _t = 1.0 / math.sqrt((_dx / _ea) ** 2
+                                                 + (_dy / _eb) ** 2)
+                            _ipx = ex + _fwd_x * (_ecx + _t * _dx) \
+                                + _rgt_x * (_ecy + _t * _dy)
+                            _ipy = ey + _fwd_y * (_ecx + _t * _dx) \
+                                + _rgt_y * (_ecy + _t * _dy)
+                        shield_burst(self._hit_fx,
+                                     pygame.Vector2(_ipx, _ipy),
+                                     rng=random)
+                        self._sfx_throttled("shield_hit",
+                                            SFX_SHIELD_HIT_MIN_INTERVAL)
+                    else:
+                        # Mirrors the host's surviving ENEMY hit: a small
+                        # burst at the impact point (no SFX — the host
+                        # plays none on a surviving enemy hit; the killing
+                        # hit is covered by the existing death burst
+                        # `delay` later).
+                        burst(self._hit_fx, pygame.Vector2(hx, hy), 6,
+                              rng=random)
+                    _hftel.log_hit(bid, _src,
+                                   "enemy:%s%s" % (et,
+                                                   ":shield"
+                                                   if e_shield_up else ""),
+                                   hx, hy, _d)
                     break
         _hftel.log_frame(_hf_n_ghost, _hf_n_buf,
                          len(_hit_fx_ships), len(_hit_fx_enemies),
@@ -3466,7 +3552,7 @@ class Game:
         standins = self._get_remote_enemies()
         proxies = []
         for (tag, x, y, ang, vx, vy, eid, _s_dump, _s_clock, power_used,
-             _flame_mags) in pos['enemies']:
+             _flame_mags, _s_charge) in pos['enemies']:
             e = standins.get(tag)
             # power_idle_total is a loadout constant (sum of the fitted
             # components' power_idle). The stand-in's ship is built with
@@ -3495,11 +3581,11 @@ class Game:
         proxies = []
         standins = self._get_remote_enemies()
         # The buffer's enemy entry also carries (shield_dump,
-        # shield_clock, power_used, flame_mags) — unused here (the reticle
-        # only needs the pose), but the unpack must match the 11-tuple
-        # shape.
+        # shield_clock, power_used, flame_mags, shield_charge) — unused
+        # here (the reticle only needs the pose), but the unpack must
+        # match the 12-tuple shape.
         for (tag, x, y, ang, vx, vy, _eid, _s_dump, _s_clock, _p_used,
-             _flame_mags) in pos['enemies']:
+             _flame_mags, _s_charge) in pos['enemies']:
             e = standins.get(tag)
             if e is None:
                 continue

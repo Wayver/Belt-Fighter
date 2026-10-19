@@ -25,7 +25,8 @@ from .config import (WIDTH, HEIGHT, SPAWN_PROTECT, BULLET_POOL_MAX,
                     SCAN_DUMP_DECAY, DEBUG_COLLISION,
                     MISSILE_COLOR, MISSILE_POOL_MAX,
                     SFX_LASER_MIN_INTERVAL, SFX_ENEMY_LASER_MIN_INTERVAL,
-                    SFX_SHIELD_HIT_MIN_INTERVAL, PARTICLE_COLORS)
+                    SFX_SHIELD_HIT_MIN_INTERVAL, PARTICLE_COLORS,
+                    SHIELD_DUMP_DECAY)
 
 from .bullets import Bullet, EnemyBullet, Missile, MissileShot
 
@@ -769,6 +770,16 @@ class Game:
         # than the delay gap) so the set cannot grow unbounded. The draw
         # loops skip any bid in this dict.
         self._hit_fx_cull_bids = {}
+        # Per-tag LOCAL shield glow (tag -> (dump, clock)): when the
+        # option-A trigger fires a shield hit, the client flashes the
+        # stand-in's shield in the SAME frame as the particle burst
+        # (mirrors the host, where the hit + its dump happen together).
+        # The buffer's shield_dump is the host's delayed replay; this
+        # local flash is the immediate one. The draw blends them with
+        # max() so the host's dump (when it arrives) never dims a fresh
+        # local flash. Decayed in _step_hit_fx (SHIELD_DUMP_DECAY, the
+        # host's rate).
+        self._enemy_glow = {}
         # Local ghost's dead state last frame (detects the alive->dead
         # transition so the burst spawns exactly once).
         self._local_was_dead = False
@@ -1855,38 +1866,55 @@ class Game:
         return False
 
     def _collisions(self):
-        # player bullet vs enemy (swept segment vs hull polygon). The shield is
-        # a damage ABSORBER (register_hit routes through it), but the FX
-        # must convey WHERE the hit landed: shield UP -> spark at the
-        # shield boundary (the shield took it), shield DOWN -> small burst
-        # at the hull. Check shield_on BEFORE register_hit (the charge is
-        # not yet decremented) — the same rule the enemy-bullet-vs-player
-        # path uses.
+        # player bullet vs enemy. HIT TEST: shield UP -> point test against
+        # the shield OVAL (shield_contains), shield DOWN -> swept hull
+        # polygon (collision_segment). This matches the enemy-bullet-vs-
+        # player canonical path (below), which also tests the oval when the
+        # shield is up — so "your bullet vs enemy" and "enemy bullet vs you"
+        # use the same criteria. The shield is the outer boundary, so when
+        # it's up a bullet grazing the oval (but missing the hull) is still
+        # a hit the shield absorbs. FX: shield UP -> spark at the shield
+        # boundary (the shield took it), shield DOWN -> small burst at the
+        # hull. Check shield_on BEFORE register_hit (the charge is not yet
+        # decremented).
         for b in self.bullets[:]:
             for i, e in enumerate(self.enemies):
-                hit, hit_pt = e.ship.collision_segment(b.prev_pos, b.pos)
-                if hit:
-                    self.bullets.remove(b)
-                    impact = pygame.Vector2(hit_pt)
-                    _shield_up = e.ship.shield_on
-                    if e.register_hit(impact):
-                        if _shield_up:
-                            shield_burst(self.particles,
-                                         e.ship.shield_impact_point(impact),
-                                         rng=self.rng)
-                            self._sfx_throttled("shield_hit",
-                                                SFX_SHIELD_HIT_MIN_INTERVAL)
-                        else:
-                            burst(self.particles, impact, 6, rng=self.rng)
+                # Shield UP: the hit region is the shield OVAL (point test,
+                # matching the enemy-bullet-vs-player canonical path below).
+                # Shield DOWN: the swept hull polygon. The shield is the outer
+                # boundary, so when it's up a bullet that grazes the oval
+                # (but would miss the hull) is still a hit — the shield
+                # absorbs it. This makes "your bullet vs enemy" consistent
+                # with "enemy bullet vs you".
+                if e.ship.shield_on:
+                    if not e.ship.shield_contains(b.pos):
+                        continue
+                    hit_pt = b.pos
+                else:
+                    hit, hit_pt = e.ship.collision_segment(b.prev_pos, b.pos)
+                    if not hit:
+                        continue
+                self.bullets.remove(b)
+                impact = pygame.Vector2(hit_pt)
+                _shield_up = e.ship.shield_on
+                if e.register_hit(impact):
+                    if _shield_up:
+                        shield_burst(self.particles,
+                                     e.ship.shield_impact_point(impact),
+                                     rng=self.rng)
+                        self._sfx_throttled("shield_hit",
+                                            SFX_SHIELD_HIT_MIN_INTERVAL)
                     else:
-                        burst(self.particles, e.pos, 20, big=True, rng=self.rng)
-                        self._sfx("explosion")
-                        self.enemies.pop(i)
-                        if self.test_mode:
-                            self._setup_test_scene()   # re-arm: fresh rock + target
-                        else:
-                            spawn_enemy(self.enemies, self.ship, rng=self.rng)
-                    break
+                        burst(self.particles, impact, 6, rng=self.rng)
+                else:
+                    burst(self.particles, e.pos, 20, big=True, rng=self.rng)
+                    self._sfx("explosion")
+                    self.enemies.pop(i)
+                    if self.test_mode:
+                        self._setup_test_scene()   # re-arm: fresh rock + target
+                    else:
+                        spawn_enemy(self.enemies, self.ship, rng=self.rng)
+                break
 
         # bullet vs asteroid
         for b in self.bullets[:]:
@@ -1913,32 +1941,40 @@ class Game:
         # the damage loop (the charge is not yet decremented).
         for m in self.missiles[:]:
             for i, e in enumerate(self.enemies):
-                hit, hit_pt = e.ship.collision_segment(m.prev_pos, m.pos)
-                if hit:
-                    self.missiles.remove(m)
-                    impact = pygame.Vector2(hit_pt)
-                    _shield_up = e.ship.shield_on
-                    alive = True
-                    for _ in range(m.dmg):
-                        alive = e.register_hit(impact)
-                    if alive:
-                        if _shield_up:
-                            shield_burst(self.particles,
-                                         e.ship.shield_impact_point(impact),
-                                         rng=self.rng)
-                            self._sfx_throttled("shield_hit",
-                                                SFX_SHIELD_HIT_MIN_INTERVAL)
-                        else:
-                            burst(self.particles, impact, 6, rng=self.rng)
+                # Same shield-oval rule as the bullet path: shield UP ->
+                # point test against the oval; shield DOWN -> swept hull.
+                if e.ship.shield_on:
+                    if not e.ship.shield_contains(m.pos):
+                        continue
+                    hit_pt = m.pos
+                else:
+                    hit, hit_pt = e.ship.collision_segment(m.prev_pos, m.pos)
+                    if not hit:
+                        continue
+                self.missiles.remove(m)
+                impact = pygame.Vector2(hit_pt)
+                _shield_up = e.ship.shield_on
+                alive = True
+                for _ in range(m.dmg):
+                    alive = e.register_hit(impact)
+                if alive:
+                    if _shield_up:
+                        shield_burst(self.particles,
+                                     e.ship.shield_impact_point(impact),
+                                     rng=self.rng)
+                        self._sfx_throttled("shield_hit",
+                                            SFX_SHIELD_HIT_MIN_INTERVAL)
                     else:
-                        burst(self.particles, e.pos, 20, big=True, rng=self.rng)
-                        self._sfx("explosion")
-                        self.enemies.pop(i)
-                        if self.test_mode:
-                            self._setup_test_scene()   # re-arm: fresh rock + target
-                        else:
-                            spawn_enemy(self.enemies, self.ship, rng=self.rng)
-                    break
+                        burst(self.particles, impact, 6, rng=self.rng)
+                else:
+                    burst(self.particles, e.pos, 20, big=True, rng=self.rng)
+                    self._sfx("explosion")
+                    self.enemies.pop(i)
+                    if self.test_mode:
+                        self._setup_test_scene()   # re-arm: fresh rock + target
+                    else:
+                        spawn_enemy(self.enemies, self.ship, rng=self.rng)
+                break
 
         # missile vs asteroid (detonate, same as a bullet)
         for m in self.missiles[:]:
@@ -2845,17 +2881,31 @@ class Game:
             for (et, ex, ey, eang, er, e_shield_up, _oval,
                      es_charge, has_comp) in _hit_fx_enemies:
                 _ea, _eb, _ecx, _ecy = _oval
-                # Shield UP: test against the shield oval (approximated as
-                # a circle of radius max(a, b) centered on the drawn pos —
-                # the oval is centered on the ship, so this is well-centered)
-                # and spark at the shield BOUNDARY (conveys "the shield
-                # took it"). Shield DOWN: test the hull radius, small burst
-                # at the hull. Mirrors the host's shield-FX rule.
+                # Shield UP: point test the bullet's PRESENT position
+                # against the shield oval — the SAME criteria as the host's
+                # `shield_contains` (the enemy-bullet-vs-player canonical
+                # path). The impact point is the present position; the
+                # spark lands on the oval boundary toward it (below).
+                # Shield DOWN: swept hull-circle test, small burst at the
+                # hull. This makes the client's hit region match the host's
+                # exactly (previously the client used a swept circle of
+                # radius max(a,b), which disagreed with the host's oval).
                 _er = max(_ea, _eb) if e_shield_up else er
                 _d = _hftel.seg_point_dist(x0, y0, x1, y1, ex, ey)
                 if _hf_min_enemy is None or _d < _hf_min_enemy[0]:
                     _hf_min_enemy = (_d, _er, et)
-                hit, hx, hy = _seg_circle_hit(x0, y0, x1, y1, ex, ey, _er)
+                if e_shield_up:
+                    _fwd_x = math.cos(eang)
+                    _fwd_y = math.sin(eang)
+                    _rgt_x = -_fwd_y
+                    _rgt_y = _fwd_x
+                    _dx = (x1 - ex) * _fwd_x + (y1 - ey) * _rgt_x - _ecx
+                    _dy = (x1 - ex) * _rgt_x + (y1 - ey) * _rgt_y - _ecy
+                    hit = (_dx / _ea) ** 2 + (_dy / _eb) ** 2 <= 1.0
+                    hx, hy = x1, y1
+                else:
+                    hit, hx, hy = _seg_circle_hit(x0, y0, x1, y1, ex, ey,
+                                                  _er)
                 if hit:
                     _hit_fx_cull[bid] = _hit_fx_now
                     if e_shield_up:
@@ -2892,6 +2942,24 @@ class Game:
                                      rng=random)
                         self._sfx_throttled("shield_hit",
                                             SFX_SHIELD_HIT_MIN_INTERVAL)
+                        # LOCAL GLOW: flash the stand-in's shield in the
+                        # same frame as the particle burst (mirrors the
+                        # host, where the hit + its dump happen together).
+                        # The buffer's shield_dump is the host's DELAYED
+                        # replay; this is the immediate one. Stacks like
+                        # the host's `shield_dump += power_hit` (the clock
+                        # keeps running — it only resets when the dump
+                        # fully decays).
+                        _proxy = _hf_standin.get(et)
+                        if _proxy is not None \
+                                and _proxy.ship.shield_comp is not None:
+                            _ph = _proxy.ship.shield_comp.power_hit
+                            _cur = self._enemy_glow.get(et)
+                            if _cur is None:
+                                self._enemy_glow[et] = (_ph, 0.0)
+                            else:
+                                self._enemy_glow[et] = (_cur[0] + _ph,
+                                                        _cur[1])
                     else:
                         # Mirrors the host's surviving ENEMY hit: a small
                         # burst at the impact point (no SFX — the host
@@ -3324,6 +3392,14 @@ class Game:
             # an unexpected enemy type still renders something.
             self._draw_remote_enemy(screen, x, y)
             return
+        # Blend the buffer's (host's delayed) shield_dump with the LOCAL
+        # immediate glow the option-A trigger set this frame: max() so a
+        # fresh local flash is never dimmed by the (usually 0) buffer
+        # value, and the host's dump still shows once it arrives.
+        _lg = self._enemy_glow.get(tag)
+        if _lg is not None:
+            shield_dump = max(shield_dump, _lg[0])
+            shield_clock = _lg[1]
         e.ship.shield_dump = shield_dump
         e.ship.shield_clock = shield_clock
         e.ship.flame_mags = dict(flame_mags) if flame_mags else {}
@@ -3508,12 +3584,22 @@ class Game:
         """Advance + cull the client-side bullet-impact sparks (presentation
         only). Called once per frame from predicted_view. Mirrors
         _step_death_bursts: each Particle ages by dt and is dropped once its
-        life expires."""
-        if not self._hit_fx:
-            return
-        for p in self._hit_fx:
-            p.update(dt)
-        self._hit_fx = [p for p in self._hit_fx if p.life > 0]
+        life expires. Also decays the per-tag LOCAL shield glow (the
+        immediate flash the option-A trigger sets on a shield hit) at the
+        host's SHIELD_DUMP_DECAY rate, so it fades like the host's own
+        dump."""
+        if self._hit_fx:
+            for p in self._hit_fx:
+                p.update(dt)
+            self._hit_fx = [p for p in self._hit_fx if p.life > 0]
+        if self._enemy_glow:
+            for _tag in list(self._enemy_glow):
+                _dump, _clock = self._enemy_glow[_tag]
+                _dump = max(0.0, _dump - SHIELD_DUMP_DECAY * dt)
+                if _dump <= 0.0:
+                    del self._enemy_glow[_tag]
+                else:
+                    self._enemy_glow[_tag] = (_dump, _clock + dt)
 
     def _draw_hit_fx(self, screen, cam):
         """Draw the client-side bullet-impact sparks (mirrors

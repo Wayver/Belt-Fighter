@@ -199,6 +199,29 @@ def main():
     print("PASS: SHIELD-UP — a shield-up hit spawns a shield_burst "
           "(%d particles) and is culled" % len(g._hit_fx))
 
+    # --- 1b. LOCAL-GLOW: a shield-up hit ALSO flashes the stand-in's
+    #     shield (the immediate glow, same frame as the particle burst —
+    #     the buffer's shield_dump is the host's DELAYED replay). The
+    #     trigger sets _enemy_glow['ai'] to the shield's power_hit;
+    #     _step_hit_fx decays it at SHIELD_DUMP_DECAY until it clears. ---
+    from .config import SHIELD_DUMP_DECAY
+    assert 'ai' in g._enemy_glow, \
+        "a shield-up hit must set the local glow: %r" % (g._enemy_glow,)
+    _glow_dump, _glow_clock = g._enemy_glow['ai']
+    _ph = g._get_remote_enemies()['ai'].ship.shield_comp.power_hit
+    assert abs(_glow_dump - _ph) < 1e-9, \
+        "the local glow must start at the shield's power_hit (%.1f): " \
+        "got %.1f" % (_ph, _glow_dump)
+    # Decay: step the glow enough frames that it reaches zero and clears.
+    _frames = int(_ph / (SHIELD_DUMP_DECAY * 0.016)) + 2
+    for _ in range(_frames):
+        g._step_hit_fx(0.016)
+    assert 'ai' not in g._enemy_glow, \
+        "the local glow must decay to zero and clear: %r" \
+        % (g._enemy_glow,)
+    print("PASS: LOCAL-GLOW — a shield-up hit flashes the stand-in's "
+          "shield (power_hit %.0f) and it decays away" % _ph)
+
     # --- 2. SHIELD-DOWN: shield_charge=0 -> a small `burst` (14 particles)
     #     spawns at the hull, the bullet is culled, and the CSV tags it
     #     'enemy:ai' (no ':shield'). ---

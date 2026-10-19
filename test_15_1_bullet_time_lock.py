@@ -128,6 +128,20 @@ def build_client(bullets=None):
 def main():
     pygame.init()
 
+    # OBSOLETE (plan_15 REVERT): this test asserts the plan_15 render-point
+    # behavior (frozen-at-muzzle, flying-at-full-speed, no pull-forward at
+    # handoff). The plan_15 Stage 1 change was REVERTED because the
+    # render-point shift pinned each bullet at the muzzle for the first D
+    # seconds (the "firing from empty space" + "direction change" — the
+    # ship-vs-bullet time-domain gap). The ghost's own bullets are now
+    # drawn at the PRESENT (b.pos), and the buffer's handed-off copy is
+    # pulled forward by V*delay (see test_10_7 gate 5). Re-enable this
+    # test only if the render-point draw is reintroduced.
+    print("SKIP: 15.1 is OBSOLETE — the plan_15 render-point draw was "
+          "reverted (bullets are drawn at the present, b.pos). The "
+          "handoff pull-forward is covered by test_10_7 gate 5.")
+    return
+
     # --- 1. FROZEN AT MUZZLE: a bullet younger than D (age < D) renders at
     #     the muzzle (b.pos - b.vel*age), NOT at its raw position. The
     #     muzzle is at the origin (b.pos - b.vel*age = (0,0)), so the bullet

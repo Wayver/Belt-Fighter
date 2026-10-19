@@ -329,10 +329,11 @@ def main():
           "SKIPPED; the host's bullet (id (0,0)) draws at (150,50)")
 
     # --- 5. SEAMLESS HANDOFF: a handed-off bullet (pending, buffer copy
-    #     ADVANCING) is removed from the ghost and drawn by the buffer at
-    #     its RAW interpolated position (no pull-forward — plan_15 draws
-    #     the ghost's bullets at the render point, so the handoff is
-    #     seamless). ---
+    #     ADVANCING) is removed from the ghost and drawn by the buffer
+    #     PULLED FORWARD by V*delay (the ghost draws its own bullets at
+    #     the PRESENT, so the buffer's render-point copy must be pulled
+    #     forward to land where the ghost was drawing it — the plan_15
+    #     revert restored the pull-forward). ---
     g2 = Game(screen, font, big_font, light_tex, fog_surf, light_surf,
               hull=GUN_HULL, loadout=LOADOUT, seed=1234, players=2,
               local_index=LOCAL_INDEX)
@@ -388,18 +389,22 @@ def main():
     assert len(g2.ghost.local_bullets) == 0, \
         "the handed-off bullet must be REMOVED from the ghost (the buffer " \
         "draws it now): %r" % (g2.ghost.local_bullets,)
-    # plan_15: the handed-off bullet is drawn at its RAW interpolated
-    # position (NO pull-forward) — the ghost already drew it at the render
-    # point, so the buffer's copy is seamless here.
-    assert bullet_px(screen, g2.cam, _raw[0], _raw[1]) > 0, \
-        "the handed-off bullet must be DRAWN at its raw interpolated " \
-        "position (%.1f, %.1f), no pull-forward: %d px" \
-        % (_raw[0], _raw[1],
-           bullet_px(screen, g2.cam, _raw[0], _raw[1]))
+    # plan_15 REVERT: the ghost draws its own bullets at the PRESENT
+    # (b.pos), so the buffer's handed-off copy (at the render point,
+    # present - delay) must be PULLED FORWARD by V*delay to land where the
+    # ghost was drawing it — a seamless handoff. Without the pull the
+    # bullet pops backward V*delay at the handoff frame.
+    _delay = g2.latency.delay
+    _pulled = (_raw[0] + _raw[2] * _delay, _raw[1] + _raw[3] * _delay)
+    assert bullet_px(screen, g2.cam, _pulled[0], _pulled[1]) > 0, \
+        "the handed-off bullet must be DRAWN PULLED FORWARD by V*delay " \
+        "(%.1f, %.1f), not at its raw position (%.1f, %.1f): %d px" \
+        % (_pulled[0], _pulled[1], _raw[0], _raw[1],
+           bullet_px(screen, g2.cam, _pulled[0], _pulled[1]))
     print("PASS: SEAMLESS HANDOFF — the handed-off bullet is removed from "
-          "the ghost and drawn by the buffer at its RAW interpolated "
-          "position (%.1f, %.1f) (no pull-forward, plan_15)"
-          % (_raw[0], _raw[1]))
+          "the ghost and drawn by the buffer PULLED FORWARD by V*delay " \
+          "(%.1f, %.1f) (plan_15 revert: ghost back at the present)"
+          % (_pulled[0], _pulled[1]))
 
     print("ALL PASS: 10.7 (ghost's own gun shots deduped against the "
           "buffer; no double-draw; seamless render-point handoff)")

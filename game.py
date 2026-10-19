@@ -2661,9 +2661,20 @@ class Game:
                     continue   # drawn from the ghost (predicted) instead
                 _buf_drawn.append(_bid_t)
                 _buf_bdrawn.append(_bid_t)
-                # (plan_15: the local-bullet pull-forward is GONE — the
-                # ghost now draws its own bullets at the render point, so
-                # the buffer's handed-off copy is already seamless here.)
+                # The LOCAL player's handed-off bullet: the ghost was
+                # drawing it at the PRESENT (b.pos), but the buffer's copy
+                # is at the render point (present - delay). Pull it forward
+                # by V*delay so it lands where the ghost was drawing it
+                # (buffer_pos + V*delay == ghost_pos) — a seamless handoff.
+                # (The plan_15 revert: the ghost is back at the present, so
+                # the pull-forward is needed again — without it the bullet
+                # pops backward V*delay at the handoff frame.) The REMOTE
+                # player's bullets (id[0] != local_index) are drawn at the
+                # raw interpolated position (the remote ship is also drawn
+                # from the buffer — same time domain, no pull).
+                if _bid_t[0] == self.local_index:
+                    x += vx * _bdelay
+                    y += vy * _bdelay
             if kind == 'missile' and mid is not None:
                 _mid_t = tuple(mid)
                 _buf_drawn.append(_mid_t)
@@ -2776,15 +2787,21 @@ class Game:
             self.ghost.ship.draw(screen, self.cam, gpos, gangle)
 
         # The player's OWN gun shots: the ghost's predicted bullets, drawn
-        # at the RENDER POINT (rp) — NOT at the ghost's _last_step_time —
-        # so they are phase-locked to the enemy's time domain and strike
-        # the enemy where it is DRAWN (the pass-through / early-disappear
-        # fix, plan_15). The bullet's stored pos is at _last_step_time;
-        # D is the exact gap to the render point. t_off clamps so a bullet
-        # younger than D renders at the muzzle (it had not left yet at the
-        # render point). Drawn the same way the host draws the local
-        # player's bullets (a BULLET_COLOR dot). Presentation only: no
-        # collision, no sim feedback.
+        # at the PRESENT (b.pos) — the ghost's own time domain, the SAME
+        # domain the local ship is drawn in (the ghost's predicted clock).
+        # This is the REVERT of the plan_15 render-point shift: drawing at
+        # the render point (b.pos - b.vel*D) pinned each bullet at the
+        # muzzle for the first D seconds (the "firing from empty space" +
+        # "direction change" — the bullet was frozen at the world-space
+        # muzzle while the ship flew away, then released at b.vel). At
+        # b.pos the bullet flies a clean straight line from the muzzle at
+        # full speed, in the ship's time domain. The cost: the bullet is D
+        # seconds AHEAD of the target (drawn at the render point), so the
+        # impact error is the target's displacement in D seconds (negligible
+        # for the 25 px/s enemies; leadable for the remote player).
+        # Drawn the same way the host draws the local player's bullets (a
+        # BULLET_COLOR dot). Presentation only: no collision, no sim
+        # feedback.
         _D = self.ghost._last_step_time - rp
         # TIME-DOMAIN TELEMETRY (bullet_time_telemetry, F3-gated): collect
         # each bullet's DRAWN position (the same _rx/_ry the circle below
@@ -2794,9 +2811,9 @@ class Game:
         _bttel_rows = []
         for b in self.ghost.local_bullets:
             _a = BULLET_LIFE - b.life
-            _t_off = min(_a, max(_D, 0.0))
-            _rx = b.pos.x - b.vel.x * _t_off
-            _ry = b.pos.y - b.vel.y * _t_off
+            # Present-time draw (the plan_15 revert): b.pos, no t_off shift.
+            _rx = b.pos.x
+            _ry = b.pos.y
             s = self.cam.to_screen(pygame.Vector2(_rx, _ry))
             pygame.draw.circle(screen, BULLET_COLOR, (int(s.x), int(s.y)), 3)
             _bttel_rows.append((b.id, _rx, _ry, b.vel.x, b.vel.y, _a))
@@ -2839,14 +2856,10 @@ class Game:
                                  local_index=self.local_index)
         # The player's OWN gun shots glow too — mirrors the
         # host's _build_lights, which adds a LightSource per player bullet.
-        # Offset by the SAME render-point shift as the sprite (plan_15) so
-        # the glow follows the bullet.
+        # At the PRESENT (b.pos), the SAME position as the sprite (the
+        # plan_15 render-point shift is reverted — the glow follows the dot).
         for b in self.ghost.local_bullets:
-            _a = BULLET_LIFE - b.life
-            _t_off = min(_a, max(_D, 0.0))
-            lights.append(LightSource(
-                pygame.Vector2(b.pos.x - b.vel.x * _t_off,
-                               b.pos.y - b.vel.y * _t_off), 30, 0.5))
+            lights.append(LightSource(b.pos, 30, 0.5))
         # The player's OWN missiles glow too (the buffer's copy of
         # each was skipped above, so light them from the predicted pos).
         for m in self.ghost.local_missiles:
@@ -3052,12 +3065,10 @@ class Game:
         shots — those glow from the ghost's predicted position instead
         (added by the caller), so the same bullet does not light twice.
         A LOCAL bullet the ghost has handed off (its id NOT in
-        local_bullet_ids, id[0] == local_index) is lit at its RAW
-        interpolated position (plan_15 removed the pull-forward — the
-        ghost draws its own bullets at the render point, so the
-        buffer's handed-off copy is already seamless). The REMOTE
-        player's bullets (id[0] != local_index) are lit at their raw
-        position.
+        local_bullet_ids, id[0] == local_index) is lit PULLED FORWARD by
+        V*delay (the closed-form handoff — the same pull the sprite gets),
+        so the glow follows the bullet. The REMOTE player's bullets
+        (id[0] != local_index) are lit at their raw position (no pull).
         `local_index` is the local player's index (the id's first element
         is the firing player's index, so it distinguishes local from
         remote)."""
@@ -3077,9 +3088,18 @@ class Game:
                 _bid_t = tuple(mid)
                 if _bid_t in local_bullet_ids:
                     continue   # glows from the ghost's predicted pos
-                # (plan_15: the local-bullet pull-forward is GONE — the
-                # ghost now draws its own bullets at the render point, so
-                # the buffer's handed-off copy is already seamless here.)
+                # The LOCAL player's handed-off bullet: the ghost was
+                # drawing it at the PRESENT (b.pos), but the buffer's copy
+                # is at the render point (present - delay). Pull it forward
+                # by V*delay so the glow lands where the ghost was drawing
+                # it (the same pull the sprite gets) — a seamless handoff.
+                # (The plan_15 revert: the ghost is back at the present, so
+                # the pull-forward is needed again.) The REMOTE player's
+                # bullets (id[0] != local_index) are lit at their raw
+                # position (no pull).
+                if _bid_t[0] == local_index:
+                    x += vx * delay
+                    y += vy * delay
             # Apply the handoff offset to the fog light (same
             # position as the missile sprite).
             if kind == 'missile' and mid is not None and handoff_offsets:

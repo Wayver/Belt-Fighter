@@ -61,6 +61,8 @@ _COLS = (
     "cull_n", "delay", "D",
     # HIT
     "bid", "src", "tgt", "hx", "hy", "d",
+    # HIT (shield decision inputs — 10.13b: "shield up but no shield FX")
+    "es_charge", "has_comp", "s_up", "oval_a", "oval_b", "hull_r",
 )
 _HEADER = ",".join(_COLS)
 
@@ -171,11 +173,23 @@ def log_frame(n_ghost, n_buf, n_ships, n_enemies,
     _f.flush()
 
 
-def log_hit(bid, src, tgt, hx, hy, d):
+def log_hit(bid, src, tgt, hx, hy, d,
+            es_charge=None, has_comp=None, s_up=None,
+            oval_a=None, oval_b=None, hull_r=None):
     """Log one spark the trigger actually spawned. `src` is 'ghost' or
     'buf' (which bullet source fired it); `tgt` is the target label (ship
     index or enemy tag); (hx, hy) is the impact point; `d` is the distance
-    at impact (should be <= the target radius). No-op when disabled."""
+    at impact (should be <= the target radius).
+
+    The shield-decision inputs (10.13b) let a playtest show WHY a hit took
+    the hull path instead of the shield path when the shield is up:
+      es_charge  the buffer's enemy shield_charge (the wire value)
+      has_comp   1 if the stand-in's ship has a shield component
+      s_up       the computed shield-up flag (has_comp and es_charge>0)
+      oval_a/b   the stand-in's shield oval semi-axes (the circle approx
+                 uses max(a,b))
+      hull_r     the stand-in's hull collision radius (the shield-down test)
+    Ship hits (the other player) leave these blank. No-op when disabled."""
     if not _enabled or _f is None:
         return
     row = {c: "" for c in _COLS}
@@ -187,5 +201,11 @@ def log_hit(bid, src, tgt, hx, hy, d):
     row["hx"] = _fmt(hx)
     row["hy"] = _fmt(hy)
     row["d"] = _fmt(d)
+    row["es_charge"] = _fmt(es_charge)
+    row["has_comp"] = ("" if has_comp is None else str(int(has_comp)))
+    row["s_up"] = ("" if s_up is None else str(int(s_up)))
+    row["oval_a"] = _fmt(oval_a)
+    row["oval_b"] = _fmt(oval_b)
+    row["hull_r"] = _fmt(hull_r)
     _f.write(",".join(row[c] for c in _COLS) + "\n")
     _f.flush()

@@ -2807,11 +2807,17 @@ class Game:
             if _proxy is not None:
                 _cr = _proxy.ship.collision_radius
                 _oval = _proxy.ship.shield_oval
-                _s_up = _proxy.ship.shield_comp is not None \
-                    and es_charge > 0
+                _has_comp = _proxy.ship.shield_comp is not None
+                _s_up = _has_comp and es_charge > 0
             else:
-                _cr, _oval, _s_up = 16.0, (30.0, 22.0, 0.0, 0.0), False
-            _hit_fx_enemies.append((_tag, x, y, ang, _cr, _s_up, _oval))
+                _cr, _oval, _has_comp, _s_up = \
+                    16.0, (30.0, 22.0, 0.0, 0.0), False, False
+            # Entry: (tag, x, y, ang, hull_r, s_up, oval, es_charge,
+            # has_comp). es_charge + has_comp are the shield-decision
+            # inputs, carried so the HIT telemetry row can show WHY a hit
+            # took the hull path instead of the shield path (10.13b).
+            _hit_fx_enemies.append(
+                (_tag, x, y, ang, _cr, _s_up, _oval, es_charge, _has_comp))
         # Swept segment-circle test: the bullet's per-frame segment
         # (prev -> present) vs the target's drawn hull radius. Swept (not
         # a point test) so a fast bullet cannot tunnel through between
@@ -2836,8 +2842,8 @@ class Game:
                     break
             if bid in _hit_fx_cull:
                 continue
-            for (et, ex, ey, eang, er, e_shield_up, _oval) \
-                    in _hit_fx_enemies:
+            for (et, ex, ey, eang, er, e_shield_up, _oval,
+                     es_charge, has_comp) in _hit_fx_enemies:
                 _ea, _eb, _ecx, _ecy = _oval
                 # Shield UP: test against the shield oval (approximated as
                 # a circle of radius max(a, b) centered on the drawn pos —
@@ -2898,7 +2904,12 @@ class Game:
                                    "enemy:%s%s" % (et,
                                                    ":shield"
                                                    if e_shield_up else ""),
-                                   hx, hy, _d)
+                                   hx, hy, _d,
+                                   es_charge=es_charge,
+                                   has_comp=has_comp,
+                                   s_up=e_shield_up,
+                                   oval_a=_oval[0], oval_b=_oval[1],
+                                   hull_r=er)
                     break
         _hftel.log_frame(_hf_n_ghost, _hf_n_buf,
                          len(_hit_fx_ships), len(_hit_fx_enemies),

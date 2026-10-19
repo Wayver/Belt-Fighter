@@ -47,6 +47,7 @@ from . import missile_telemetry as _mtel
 from . import bullet_telemetry as _btel
 from . import bullet_time_telemetry as _bttel
 from . import bullet_handoff_telemetry as _bhtel
+from . import hit_fx_telemetry as _hftel
 from .config import (INTERP_DELAY, SNAPSHOT_INTERVAL, ROCK_FILL, ROCK_EDGE,
                     ENEMY_FILL, ENEMY_EDGE, ENEMY_FLAME,
                     SHIP_COLOR, SHIP_EDGE,
@@ -2733,12 +2734,15 @@ class Game:
                      if _hit_fx_now - t > BULLET_LIFE]:
             del _hit_fx_cull[_bid]
         _hit_fx_bullets = []
+        _hf_n_ghost = 0
         # Ghost-drawn local bullets (at the present, b.pos).
         for b in self.ghost.local_bullets:
             if b.id is not None:
                 _hit_fx_bullets.append((
                     tuple(b.id), b.prev_pos.x, b.prev_pos.y,
-                    b.pos.x, b.pos.y))
+                    b.pos.x, b.pos.y, 'ghost'))
+                _hf_n_ghost += 1
+        _hf_n_buf = 0
         # Buffer-drawn local bullets (pulled forward to the present).
         for (x, y, vx, vy, kind, owner, boost, mid) in pos['bullets']:
             if kind == 'player' and mid is not None \
@@ -2746,7 +2750,8 @@ class Game:
                     and tuple(mid) not in local_bullet_ids:
                 _hit_fx_bullets.append((
                     tuple(mid), x - vx * _bdpull, y - vy * _bdpull,
-                    x, y))
+                    x, y, 'buf'))
+                _hf_n_buf += 1
         # Remote ships' drawn poses + collision radii (live ships only).
         _hit_fx_ships = []
         for i, (x, y, ang, dead, s_dump, s_clock, flame_mags,
@@ -2754,14 +2759,30 @@ class Game:
             if i != self.local_index and not dead:
                 _hit_fx_ships.append(
                     (i, x, y, self.players[i].hull.collision_radius))
+        # TELEMETRY (hit_fx): AI enemies in the buffer. The trigger does
+        # NOT test these (it only tests pos['ships']), so their
+        # closest-approach is logged to expose the missing-target bug.
+        # The per-tag stand-in owns a real Ship -> its collision_radius.
+        _hf_standin = self._get_remote_enemies()
+        _hit_fx_enemies = []
+        for (_tag, x, y, ang, evx, evy, eid,
+             es_dump, es_clock, es_pu, es_fm) in pos['enemies']:
+            _proxy = _hf_standin.get(_tag)
+            _cr = _proxy.ship.collision_radius if _proxy else 16.0
+            _hit_fx_enemies.append((_tag, x, y, _cr))
         # Swept segment-circle test: the bullet's per-frame segment
         # (prev -> present) vs the ship's drawn hull radius. Swept (not a
         # point test) so a fast bullet cannot tunnel through between
         # frames.
-        for (bid, x0, y0, x1, y1) in _hit_fx_bullets:
+        _hf_min_ship = None    # (dist, radius, label) closest remote ship
+        _hf_min_enemy = None   # (dist, radius, label) closest AI enemy
+        for (bid, x0, y0, x1, y1, _src) in _hit_fx_bullets:
             if bid in _hit_fx_cull:
                 continue
             for (si, sx, sy, sr) in _hit_fx_ships:
+                _d = _hftel.seg_point_dist(x0, y0, x1, y1, sx, sy)
+                if _hf_min_ship is None or _d < _hf_min_ship[0]:
+                    _hf_min_ship = (_d, sr, si)
                 hit, hx, hy = _seg_circle_hit(x0, y0, x1, y1, sx, sy, sr)
                 if hit:
                     _hit_fx_cull[bid] = _hit_fx_now
@@ -2769,7 +2790,22 @@ class Game:
                                  rng=random)
                     self._sfx_throttled("shield_hit",
                                         SFX_SHIELD_HIT_MIN_INTERVAL)
+                    _hftel.log_hit(bid, _src, "ship%d" % si, hx, hy, _d)
                     break
+        # TELEMETRY (hit_fx): closest approach to AI enemies (NOT tested by
+        # the trigger). A small min_d_enemy with enemy_hit==1 while
+        # ship_hit==0 confirms the trigger never targets enemies.
+        for (bid, x0, y0, x1, y1, _src) in _hit_fx_bullets:
+            if bid in _hit_fx_cull:
+                continue
+            for (et, ex, ey, er) in _hit_fx_enemies:
+                _d = _hftel.seg_point_dist(x0, y0, x1, y1, ex, ey)
+                if _hf_min_enemy is None or _d < _hf_min_enemy[0]:
+                    _hf_min_enemy = (_d, er, et)
+        _hftel.log_frame(_hf_n_ghost, _hf_n_buf,
+                         len(_hit_fx_ships), len(_hit_fx_enemies),
+                         _hf_min_ship, _hf_min_enemy,
+                         len(_hit_fx_cull), _bdelay, _bdpull)
         # TELEMETRY: the DEDUP ground truth — which buffer projectiles were
         # DRAWN vs SKIPPED this frame, against the ghost's in-flight ids.
         # log_dedup writes a row only when the triple CHANGES, so a

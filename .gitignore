@@ -24,5 +24,6 @@ net_debug_latest.csv
 host_debug_latest.csv
 missile_debug.csv
 bullet_debug.csv
+hit_fx_debug.csv
 error.txt
 

@@ -59,6 +59,13 @@ _COLS = (
     "min_d_ship", "min_r_ship", "ship_hit",
     "min_d_enemy", "min_r_enemy", "enemy_hit",
     "cull_n", "delay", "D",
+    # FRAME (15.3: drawn-position distance — the segment/draw mismatch
+    # signal). min_ddrawn = min distance from a bullet's DRAWN position
+    # (the trigger segment's endpoint) to an enemy center; min_ddrawn_src
+    # is that bullet's source (ghost/buf). If min_ddrawn is small (the
+    # drawn bullet is visually on the enemy) while min_d_enemy (the swept
+    # segment) is large, the segment does not cover the draw.
+    "min_ddrawn", "min_ddrawn_src",
     # HIT
     "bid", "src", "tgt", "hx", "hy", "d",
     # HIT (shield decision inputs — 10.13b: "shield up but no shield FX")
@@ -132,14 +139,17 @@ def seg_point_dist(x0, y0, x1, y1, cx, cy):
 
 
 def log_frame(n_ghost, n_buf, n_ships, n_enemies,
-              min_ship, min_enemy, cull_n, delay, D):
+              min_ship, min_enemy, cull_n, delay, D,
+              mindrawn=None):
     """Log one frame's trigger inputs + closest-approach geometry.
 
     `min_ship` / `min_enemy` are (dist, radius, label) tuples for the
     closest target of each kind, or None when there is no target of that
     kind. `label` is the ship index or the enemy tag (context only — not
-    written, the counts + distances are the diagnostic). No-op when
-    disabled.
+    written, the counts + distances are the diagnostic). `mindrawn` is a
+    (dist, src, label) tuple: the min distance from a bullet's DRAWN
+    position (the trigger segment's endpoint) to an enemy center — the
+    segment/draw mismatch signal (15.3). No-op when disabled.
     """
     if not _enabled or _f is None:
         return
@@ -151,6 +161,8 @@ def log_frame(n_ghost, n_buf, n_ships, n_enemies,
                      else (None, None, None))
     me_d, me_r, _ = (min_enemy if min_enemy is not None
                      else (None, None, None))
+    md_d, md_src, _ = (mindrawn if mindrawn is not None
+                       else (None, None, None))
     row = {c: "" for c in _COLS}
     row["t"] = "%.3f" % time.time()
     row["event"] = "FRAME"
@@ -169,6 +181,8 @@ def log_frame(n_ghost, n_buf, n_ships, n_enemies,
     row["cull_n"] = str(cull_n)
     row["delay"] = _fmt(delay)
     row["D"] = _fmt(D)
+    row["min_ddrawn"] = _fmt(md_d)
+    row["min_ddrawn_src"] = ("" if md_src is None else str(md_src))
     _f.write(",".join(row[c] for c in _COLS) + "\n")
     _f.flush()
 

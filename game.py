@@ -2809,13 +2809,22 @@ class Game:
                 _hf_n_ghost += 1
         _hf_n_buf = 0
         # Buffer-drawn local bullets (pulled forward to the present).
+        # The DRAW is at (x + vx*D, y + vy*D) (the pull-forward, the same
+        # math the sprite draw below uses). The trigger segment must end at
+        # the DRAW: (x, y) -> (x + vx*D, y + vy*D). The old segment
+        # (x - vx*D) -> (x) ended vD BEHIND the draw, so the hit only fired
+        # when the drawn bullet was already ~vD (860*0.15 ~= 130 px) PAST
+        # the target — long-range (buffer) shots never sparked while the
+        # bullet was visually on the enemy. (x, y) is where the bullet was
+        # D seconds ago, so the segment is the path the drawn bullet
+        # actually traversed on screen — the correct swept test.
         for (x, y, vx, vy, kind, owner, boost, mid) in pos['bullets']:
             if kind == 'player' and mid is not None \
                     and tuple(mid)[0] == self.local_index \
                     and tuple(mid) not in local_bullet_ids:
                 _hit_fx_bullets.append((
-                    tuple(mid), x - vx * _bdpull, y - vy * _bdpull,
-                    x, y, 'buf'))
+                    tuple(mid), x, y,
+                    x + vx * _bdpull, y + vy * _bdpull, 'buf'))
                 _hf_n_buf += 1
         # Remote ships' drawn poses + collision radii (live ships only).
         _hit_fx_ships = []
@@ -2865,6 +2874,12 @@ class Game:
         # frames. Ships first (the other player), then AI enemies.
         _hf_min_ship = None    # (dist, radius, label) closest remote ship
         _hf_min_enemy = None   # (dist, radius, label) closest AI enemy
+        # Telemetry: min distance from a bullet's DRAWN position (the
+        # segment endpoint x1,y1) to an enemy center, per frame. If the
+        # drawn bullet visually passes the enemy but the swept segment
+        # misses it, min_ddrawn is small while min_d_enemy (segment) is
+        # large — the signature of a segment/draw mismatch.
+        _hf_mindrawn = None    # (dist, src, label)
         for (bid, x0, y0, x1, y1, _src) in _hit_fx_bullets:
             if bid in _hit_fx_cull:
                 continue
@@ -2899,6 +2914,11 @@ class Game:
                 _d = _hftel.seg_point_dist(x0, y0, x1, y1, ex, ey)
                 if _hf_min_enemy is None or _d < _hf_min_enemy[0]:
                     _hf_min_enemy = (_d, _er, et)
+                # Drawn-position distance (segment endpoint = the drawn
+                # bullet). Compares against _d (segment) in the FRAME row.
+                _dd = math.hypot(x1 - ex, y1 - ey)
+                if _hf_mindrawn is None or _dd < _hf_mindrawn[0]:
+                    _hf_mindrawn = (_dd, _src, et)
                 if e_shield_up:
                     _fwd_x = math.cos(eang)
                     _fwd_y = math.sin(eang)
@@ -3000,7 +3020,8 @@ class Game:
         _hftel.log_frame(_hf_n_ghost, _hf_n_buf,
                          len(_hit_fx_ships), len(_hit_fx_enemies),
                          _hf_min_ship, _hf_min_enemy,
-                         len(_hit_fx_cull), _bdelay, _bdpull)
+                         len(_hit_fx_cull), _bdelay, _bdpull,
+                         mindrawn=_hf_mindrawn)
         # TELEMETRY: the DEDUP ground truth — which buffer projectiles were
         # DRAWN vs SKIPPED this frame, against the ghost's in-flight ids.
         # log_dedup writes a row only when the triple CHANGES, so a

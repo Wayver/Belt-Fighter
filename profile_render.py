@@ -146,9 +146,9 @@ def main():
         for pos, angle, verts in model["asteroids"]:
             _draw_world_asteroid(screen, game.cam, pos, angle, verts)
         for (tag, _id, pos, angle, _vel, _acc, _cr, _poly,
-             s_dump, s_clock) in model["enemies"]:
+             s_dump, s_clock, flame_mags) in model["enemies"]:
             _draw_world_enemy(screen, game.cam, tag, pos, angle, standins,
-                              s_dump, s_clock)
+                              s_dump, s_clock, flame_mags)
         for pos, vel in model["bullets"]:
             _draw_world_bullet(screen, game.cam, pos, (255, 255, 255))
         for pos, vel, boost, life in model["missiles"]:

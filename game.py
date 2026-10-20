@@ -26,7 +26,7 @@ from .config import (WIDTH, HEIGHT, SPAWN_PROTECT, BULLET_POOL_MAX,
                     MISSILE_COLOR, MISSILE_POOL_MAX,
                     SFX_LASER_MIN_INTERVAL, SFX_ENEMY_LASER_MIN_INTERVAL,
                     SFX_SHIELD_HIT_MIN_INTERVAL, PARTICLE_COLORS,
-                    SHIELD_DUMP_DECAY)
+                    SHIELD_DUMP_DECAY, CULL_MARGIN)
 
 from .bullets import Bullet, EnemyBullet, Missile, MissileShot
 
@@ -199,6 +199,26 @@ class _GhostEnemyShip:
 # live draw code exactly. Enemy stand-ins get shield flash + thruster flames
 # fed by _draw_world_enemy (client buffer path does the same); impact sparks
 # and brownout arcs are still not carried in the model.
+
+def _view_bounds(cam):
+    """The world-space rect the camera is looking at, inflated by
+    CULL_MARGIN. A pure function of the camera (no sim state), so it is
+    deterministic and safe for the pixel-parity gate. Used to skip drawing
+    entities that are off-screen (viewport culling — presentation only).
+
+    Returns (min_x, min_y, max_x, max_y) in WORLD coords. An entity at
+    (x, y) is drawn iff min_x <= x <= max_x and min_y <= y <= max_y.
+    """
+    cx, cy = cam.pos.x, cam.pos.y
+    m = CULL_MARGIN
+    return (cx - WIDTH / 2 - m, cy - HEIGHT / 2 - m,
+            cx + WIDTH / 2 + m, cy + HEIGHT / 2 + m)
+
+
+def _in_view(x, y, bounds):
+    """True if world point (x, y) is inside the (inflated) view rect."""
+    return bounds[0] <= x <= bounds[2] and bounds[1] <= y <= bounds[3]
+
 
 def _draw_world_stars(screen, cam, stars):
     """Parallax background: one dim dot per star, offset by 0.2x the camera.
@@ -2099,14 +2119,23 @@ class Game:
         cpos, cvel, cdamp = model["camera"]
         self.cam.update(dt, cpos, cvel, cdamp)
         screen.fill(BG)
+        # Viewport culling (presentation only): skip entities off-screen.
+        # A pure function of the camera — deterministic, parity-safe.
+        bounds = _view_bounds(self.cam)
         _draw_world_stars(screen, self.cam, model["stars"])
         for pos, angle, verts in model["asteroids"]:
+            if not _in_view(pos[0], pos[1], bounds):
+                continue
             _draw_world_asteroid(screen, self.cam, pos, angle, verts)
         standins = self._get_remote_enemies()
-        # ship_id -> model enemy tuple (for beam-target resolution).
+        # ship_id -> model enemy tuple (for beam-target resolution). Built
+        # from ALL enemies (not just on-screen ones) so a beam whose target
+        # is off-screen still resolves its endpoint.
         enemies_by_id = {e[1]: e for e in model["enemies"]}
         for (tag, _id, pos, angle, _vel, _acc, _cr, _poly,
              s_dump, s_clock, flame_mags) in model["enemies"]:
+            if not _in_view(pos[0], pos[1], bounds):
+                continue
             _draw_world_enemy(screen, self.cam, tag, pos, angle, standins,
                               s_dump, s_clock, flame_mags)
         # The LOCAL player's model pack (fog / beams / reticle / contacts / HUD
@@ -2121,8 +2150,12 @@ class Game:
             for e in model["enemies"]:
                 _draw_lead_model(screen, self.cam, e, ship_pos, ship_angle)
         for pos, vel in model["bullets"]:
+            if not _in_view(pos[0], pos[1], bounds):
+                continue
             _draw_world_bullet(screen, self.cam, pos, BULLET_COLOR)
         for pos, vel, boost, life in model["missiles"]:
+            if not _in_view(pos[0], pos[1], bounds):
+                continue
             _draw_world_missile(screen, self.cam, pos, vel, boost, life)
         # Laser beams from the model — drawn BEFORE the ships. Each beam is
         # anchored to its OWNER's interpolated pose (the host's sim runs
@@ -2143,8 +2176,12 @@ class Game:
             _draw_world_beam(screen, self.cam, bpos, bang,
                              beam, enemies_by_id, standins)
         for pos, vel in model["enemy_bullets"]:
+            if not _in_view(pos[0], pos[1], bounds):
+                continue
             _draw_world_bullet(screen, self.cam, pos, ENEMY_BULLET_COLOR)
         for pos, vel, color, life, max_life in model["particles"]:
+            if not _in_view(pos[0], pos[1], bounds):
+                continue
             _draw_world_particle(screen, self.cam, pos, vel, color, life,
                                  max_life)
         # EVERY player ship, each with its own shield ring. The stand-in is
@@ -2579,12 +2616,20 @@ class Game:
         self.cam.update(dt, gpos, self.ghost.ship.vel,
                         self.ghost.ship.dampening)
         screen.fill(BG)
+        # Viewport culling (presentation only): skip off-screen entities.
+        # The client culls against the INTERPOLATED positions (what is
+        # actually drawn at the render point), not the newest snapshot —
+        # a rock off-screen at the render point is skipped even if it is
+        # on-screen at the newest snapshot. Pure function of the camera.
+        bounds = _view_bounds(self.cam)
         for x, y, r in self.stars:
             sx = (x - self.cam.pos.x * 0.2) % WIDTH
             sy = (y - self.cam.pos.y * 0.2) % HEIGHT
             pygame.draw.circle(screen, STAR_COLOR, (sx, sy), r)
 
         for (x, y) in pos['asteroids']:
+            if not _in_view(x, y, bounds):
+                continue
             self._draw_remote_rock(screen, x, y)
         # Remote player's laser beams — T_BEAM events (one per discharge),
         # drawn before the ships. Entry: [local_start, end, age, ttl, owner];
@@ -2616,6 +2661,8 @@ class Game:
         # impact flash and exhaust render (mirrors the host's model path).
         for (tag, x, y, ang, vx, vy, eid, s_dump, s_clock, _p_used,
              flame_mags, _s_charge) in pos['enemies']:
+            if not _in_view(x, y, bounds):
+                continue
             self._draw_remote_enemy_hull(screen, tag, x, y, ang,
                                          s_dump, s_clock, flame_mags,
                                          eid=eid)
@@ -3134,6 +3181,11 @@ class Game:
                 elif _mid_t in _hgo:
                     x += _hgo[_mid_t][0]
                     y += _hgo[_mid_t][1]
+            # Cull the DRAW only — the dedup/handoff/telemetry above already
+            # ran for this projectile, so an off-screen bullet is still
+            # deduped + handed off correctly; only its sprite is skipped.
+            if not _in_view(x, y, bounds):
+                continue
             self._draw_remote_bullet(screen, x, y, vx, vy, kind, boost)
         if (local_missile_ids or local_bullet_ids or _buf_drawn
                 or _buf_skipped):

@@ -138,6 +138,14 @@ FOG_FRONT_RADIUS = 430.0 # reach of the forward lobe
 FOG_SIDE_RADIUS = 200.0  # width of the forward lobe
 FOG_FRONT_OFFSET = 120.0 # how far ahead of the ship the lobe is centered
 
+# --- viewport culling (presentation-only) ---
+# World-space margin (px) added around the screen rect when deciding whether
+# an entity is drawn. Must exceed the largest drawn entity's extent so a
+# rock is never culled while any part of it is visible: largest rock radius
+# 50 + vertex jitter (~12) + edge stroke. 80 covers it with slack and is
+# safe for enemies (~20 px hulls) and projectiles. See PERFORMANCE.md.
+CULL_MARGIN = 80
+
 # collision
 HULL_COLLISION_INSET = 1.0   # scale collision poly toward centroid (1.0 = exact hull)
 DEBUG_COLLISION = False      # draw the collision polygons (presentation-only)

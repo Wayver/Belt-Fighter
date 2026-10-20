@@ -2904,7 +2904,16 @@ class Game:
                     _fwd_y = math.sin(eang)
                     _rgt_x = -_fwd_y
                     _rgt_y = _fwd_x
-                    _dx = (x1 - ex) * _fwd_x + (y1 - ey) * _rgt_x - _ecx
+                    # Local (fwd, right) coords of the bullet: d.dot(fwd) and
+                    # d.dot(right). The fwd dot uses _fwd_y (NOT _rgt_x) — the
+                    # matrix must be the orthonormal rotation [[cos, sin],
+                    # [-sin, cos]] (det 1). Using _rgt_x (-sin) in the first
+                    # row gives [[cos, -sin], [-sin, cos]] (det cos 2θ), which
+                    # is SINGULAR at θ=45/135/225/315: a bullet along the null
+                    # direction (1,1) at ANY distance maps to (0,0) and passes
+                    # the oval test — the "far-away shield hit" bug. This must
+                    # match Ship.shield_contains (the host's canonical path).
+                    _dx = (x1 - ex) * _fwd_x + (y1 - ey) * _fwd_y - _ecx
                     _dy = (x1 - ex) * _rgt_x + (y1 - ey) * _rgt_y - _ecy
                     hit = (_dx / _ea) ** 2 + (_dy / _eb) ** 2 <= 1.0
                     hx, hy = x1, y1

@@ -783,6 +783,14 @@ class Game:
         # Local ghost's dead state last frame (detects the alive->dead
         # transition so the burst spawns exactly once).
         self._local_was_dead = False
+        # The ghost's shield_dump last frame (detects a spike = an incoming
+        # hit). The client never runs the sim, so it never sees the host's
+        # `register_hit` / `shield_burst` for hits on the LOCAL ship — the
+        # flash you see is the authoritative shield_dump re-anchored from
+        # the snapshot at each reconcile (and decayed between). A jump up
+        # from the previous frame is the hit signal; the burst is spawned
+        # in predicted_view (see _local_incoming_hit_fx).
+        self._last_ghost_shield_dump = 0.0
         # Remote player's laser beams, received as T_BEAM events (one per
         # discharge). [start, end, age, ttl] in WORLD space, same shape as
         # the ghost's local_beams. A beam is a 0.15 s flash (BEAM_TTL), too
@@ -2556,6 +2564,16 @@ class Game:
         self._step_hit_fx(dt)
         # Age + cull the remote player's laser beams (T_BEAM events).
         self._step_remote_beams(dt)
+        # INCOMING-HIT FX: the client never runs the sim, so it never sees
+        # the host's `register_hit` / `shield_burst` for a hit on the LOCAL
+        # ship. The flash you already see is the authoritative shield_dump
+        # re-anchored from the snapshot at each reconcile (and decayed
+        # between) — a jump UP in the ghost's shield_dump is the hit
+        # signal. Spawn a shield_burst at the impact point (the nearest
+        # incoming buffer bullet projected onto the shield oval) so the
+        # spark lands on the flash. Runs before the fog/draw so the burst
+        # is aged + drawn this frame.
+        self._local_incoming_hit_fx(pos, gpos, gangle)
 
         screen = self.screen
         self.cam.update(dt, gpos, self.ghost.ship.vel,
@@ -3621,6 +3639,65 @@ class Game:
                 self._death_bursts[index] = parts
             else:
                 del self._death_bursts[index]
+
+    def _local_incoming_hit_fx(self, pos, gpos, gangle):
+        """Spawn a shield_burst when an incoming (enemy) bullet hits the
+        LOCAL ship. The client never runs the sim, so it never sees the
+        host's `register_hit` / `shield_burst` for a hit on the local ship —
+        the flash you already see is the authoritative `shield_dump`
+        re-anchored from the snapshot at each reconcile (and decayed between
+        by the ghost's own `_update_shield`). A jump UP in the ghost's
+        `shield_dump` is therefore the hit signal: it fires in the same frame
+        the flash appears, so the burst is on time with it.
+
+        The impact point is the nearest incoming buffer bullet (kind
+        'enemy', NOT the local index) projected onto the shield oval — the
+        same `shield_impact_point` math the host's `_handle_ship_hit` uses.
+        At the reconcile frame the render point is still ~INTERP_DELAY
+        behind the snapshot, so the hit bullet is still in the buffer (its
+        authoritative cull arrives WITH the dump spike), which is why the
+        nearest-bullet search finds it. Fallback (no bullet in range — a
+        hiccup frame): the oval's front point.
+
+        Presentation only: no sim, no authority (the authoritative hit +
+        damage + cull already come from the host snapshot). SFX is the
+        throttled shield_hit, mirroring the host's `_handle_ship_hit`.
+        """
+        _dump = self.ghost.ship.shield_dump
+        _prev = self._last_ghost_shield_dump
+        self._last_ghost_shield_dump = _dump
+        # A hit spikes the authoritative dump by a full power_hit (25-45);
+        # the ghost re-anchors to it at each reconcile, so the jump from the
+        # previous frame is ~power_hit for a hit and ~0 for a no-hit reconcile
+        # (both the host and the ghost decay at SHIELD_DUMP_DECAY over the
+        # same interval, so they cancel). Threshold at half a power_hit:
+        # well below a real hit, well above clock-drift noise.
+        _comp = self.ghost.ship.shield_comp
+        if _comp is None:
+            return
+        if _dump <= _prev + _comp.power_hit * 0.5:
+            return
+        # Nearest incoming buffer bullet to the local ship's drawn pose.
+        _best = None
+        _best_d2 = None
+        for (x, y, vx, vy, kind, owner, _boost, _mid) in pos['bullets']:
+            if kind != 'enemy' or owner == self.local_index:
+                continue
+            _d2 = (x - gpos.x) ** 2 + (y - gpos.y) ** 2
+            if _best_d2 is None or _d2 < _best_d2:
+                _best_d2 = _d2
+                _best = (x, y)
+        if _best is not None:
+            _impact = self.ghost.ship.shield_impact_point(
+                pygame.Vector2(_best[0], _best[1]))
+        else:
+            # No incoming bullet in the buffer (hiccup): front of the oval.
+            _a, _b, _cx, _cy = self.ghost.ship.shield_oval
+            _fwd = pygame.Vector2(math.cos(gangle), math.sin(gangle))
+            _right = pygame.Vector2(-_fwd.y, _fwd.x)
+            _impact = gpos + _fwd * (_cx + _a) + _right * _cy
+        shield_burst(self._hit_fx, _impact, rng=random)
+        self._sfx_throttled("shield_hit", SFX_SHIELD_HIT_MIN_INTERVAL)
 
     def _step_hit_fx(self, dt):
         """Advance + cull the client-side bullet-impact sparks (presentation

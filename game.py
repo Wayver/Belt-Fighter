@@ -241,6 +241,41 @@ def can_target(attacker, target):
     return target.team != attacker.team and not getattr(target, "dead", False)
 
 
+class _PlayerHomingTarget:
+    """plan_19: a small homing adapter that lets Missile.update's existing
+    `self.target.hp > 0` + `self.target.lead_point(...)` work UNCHANGED for
+    a player-ship target (a player Ship has neither `.hp` nor — before this
+    plan — `.lead_point`). Wraps the live Ship; `.hp` is 1 while the ship is
+    alive (a missile locked on a frozen corpse coasts, like a dead enemy),
+    `.pos` / `.lead_point` delegate to the ship. Host-side only — the
+    client's ghost uses `_GhostPlayerProxy` instead.
+
+    Carries the player's INDEX (`index`) so `Missile.snapshot` can encode
+    the target as `"p<i>"` (a string) and `Game.apply_snapshot` can re-wire
+    it to a fresh adapter over `self.players[i]`."""
+    __slots__ = ("ship", "index")
+
+    def __init__(self, ship, index):
+        self.ship = ship
+        self.index = index
+
+    @property
+    def target_id(self):
+        """The wire id for this target: "p<i>" (the player index)."""
+        return "p%d" % self.index
+
+    @property
+    def hp(self):
+        return 0 if self.ship.dead else 1
+
+    @property
+    def pos(self):
+        return self.ship.pos
+
+    def lead_point(self, shooter_pos, bullet_speed):
+        return self.ship.lead_point(shooter_pos, bullet_speed)
+
+
 class _GhostPlayerProxy:
     """Lightweight REMOTE-PLAYER proxy for the prediction ghost's weapon
     targeting (plan_19).
@@ -1227,8 +1262,8 @@ class Game:
     #            MoteEnemy and TestTarget are AIEnemy subclasses, so they
     #            must be checked first (_enemy_tag)
     #   bullets, enemy_bullets, missiles: pos/vel/owner/life (+ boost);
-    #            a missile's target is the enemy's ship id (re-wired on
-    #            apply)
+    #            a missile's target is the enemy's ship id (int) / "p<i>"
+    #            (a player target, plan_19) / None (re-wired on apply)
     #   asteroids: id/pos/vel/size/angle/spin/verts
     #   rng state: the sim's single rng — without it the peers diverge on
     #              the next roll
@@ -1324,7 +1359,19 @@ class Game:
             self.missiles.append(m)
         id_map = {e.ship.id: e for e in self.enemies}
         for m in self.missiles:
-            m.target = id_map.get(m._target_id)
+            tid = m._target_id
+            if isinstance(tid, str):
+                # plan_19: a "p<i>" player target — re-wire to a fresh
+                # _PlayerHomingTarget adapter over the live ship (the
+                # client's ghost uses _GhostPlayerProxy instead).
+                try:
+                    idx = int(tid[1:])
+                except (ValueError, IndexError):
+                    idx = -1
+                m.target = (_PlayerHomingTarget(self.players[idx], idx)
+                            if 0 <= idx < len(self.players) else None)
+            else:
+                m.target = id_map.get(tid)
 
         # Asteroids: construct minimally (the constructor's throwaway vel comes
         # from the GLOBAL random module, not the sim's rng); apply_snapshot
@@ -1383,8 +1430,9 @@ class Game:
           missiles      [(pos, vel, boost, life), ...]
           beams         [(local_start, target_id, d, vis_end, age, ttl,
                          owner), ...]
-                         target_id = the enemy's ship id (None for a rock
-                         beam); owner = the FIRING player's index — draw()
+                         target_id = the enemy's ship id / "p<i>" (a
+                         player target, plan_19) / None (a rock beam);
+                         owner = the FIRING player's index — draw()
                          anchors each beam to its owner's interpolated pose
                          (the host's sim runs BOTH players, so self.beams
                          holds the remote player's beams too).
@@ -1448,7 +1496,7 @@ class Game:
             # firing player's index (draw() anchors each beam to its
             # owner's pose, not the local ship's) ---
             "beams": [((beam[0],
-                        beam[1].ship.id if beam[1] is not None else None,
+                        beam[7],
                         (beam[2].x, beam[2].y),
                         (beam[3].x, beam[3].y),
                         beam[4], beam[5], beam[6]))
@@ -1679,8 +1727,16 @@ class Game:
                     # key).
                     mid = (i, p.missile_seq)
                     p.missile_seq += 1
+                    # plan_19: a missile locked on the OTHER player's ship
+                    # carries a _PlayerHomingTarget adapter (a raw Ship has
+                    # no .hp / .lead_point for Missile.update). Enemy
+                    # targets (AIEnemy) pass through unchanged.
+                    m_target = m.target
+                    if m_target is not None and not isinstance(
+                            m_target, AIEnemy):
+                        m_target = _PlayerHomingTarget(m_target, i)
                     self.missiles.append(Missile(m.pos, m.vel, owner=m.owner,
-                                                 target=m.target, mid=mid))
+                                                 target=m_target, mid=mid))
                 # Cull-oldest performance safety net (plan_14) — see the
                 # bullet cull above.
                 while len(self.missiles) > MISSILE_POOL_MAX:
@@ -1979,11 +2035,17 @@ class Game:
                                   local_start[0], local_start[1]))
 
     def _resolve_beam(self, beam, owner):
-        """Hitscan: hit the first enemy near the beam's end point.
+        """Hitscan: hit the first target near the beam's end point.
 
         The beam *line* is drawn to the point on the target's shield/hull
         facing the muzzle, so beams from different muzzles land at different
         spots. Each damage point additionally jitters its shield flash.
+
+        plan_19 2P combat: the target can be an AI enemy OR the OTHER
+        player's ship (checked after the enemies, same distance test). The
+        beam entry's LAST field is the target_id (enemy ship id / "p<i>" /
+        None for a rock) — render_model serializes it and draw() resolves
+        the endpoint by plain lookup.
         """
         rock, hit_pt = self._beam_blocked(beam)
         if rock is not None:
@@ -2019,11 +2081,54 @@ class Game:
                               rng=self.rng)
                 # The beam's OWNER (firing player's index) is part of
                 # the entry — draw() anchors each beam to its owner's pose.
+                # target_id (the enemy's ship id) is the LAST entry:
+                # render_model serializes it (no live reference in the
+                # model) and draw() resolves the endpoint by plain lookup.
                 self.beams.append([beam.local_start, e, d,  vis_end, 0.0,
-                                   0.15, owner])
+                                   0.15, owner, e.ship.id])
                 self._emit_beam_event(beam.start, vis_end,
                                       beam.local_start, owner)
                 return
+
+        # plan_19 2P combat: the beam can also hit the OTHER player's
+        # ship. Same distance test as the enemy path (distance to
+        # beam.end < collision_radius + 4); vis_end lands on their shield
+        # oval via shield_impact_point; each damage point goes through
+        # register_hit (shield first — a player has no hull hp, so a hit
+        # with the shield down kills, the same as _handle_ship_hit). A
+        # dead (frozen) ship is not a target. Single-player never enters
+        # (no other slot).
+        if len(self.players) == 2:
+            for i, p in enumerate(self.players):
+                if i == owner or p.dead:
+                    continue
+                if p.pos.distance_to(beam.end) < p.collision_radius + 4:
+                    approach = p.pos - beam.start
+                    if approach.length_squared() < 1e-6:
+                        approach = pygame.Vector2(1, 0)
+                    base_ang = math.atan2(approach.y, approach.x)
+                    d = pygame.Vector2(math.cos(base_ang), math.sin(base_ang))
+                    vis_end = p.shield_impact_point(
+                        p.pos - d * p.collision_radius)
+                    for _ in range(beam.damage):
+                        ang = base_ang + self.rng.uniform(-BEAM_IMPACT_SPREAD,
+                                            BEAM_IMPACT_SPREAD)
+                        d2 = pygame.Vector2(math.cos(ang), math.sin(ang))
+                        impact = p.pos - d2 * p.collision_radius
+                        if not p.register_hit(impact):
+                            self._kill_ship(p)
+                            break
+                        shield_burst(self.particles,
+                                     p.shield_impact_point(impact),
+                                     rng=self.rng)
+                    # target_id "p<i>" marks a PLAYER target (render_model
+                    # serializes it; _draw_world_beam falls back to vis_end
+                    # since it is not in enemies_by_id).
+                    self.beams.append([beam.local_start, p, d, vis_end, 0.0,
+                                       0.15, owner, "p%d" % i])
+                    self._emit_beam_event(beam.start, vis_end,
+                                          beam.local_start, owner)
+                    return
 
 
     def _beam_blocked(self, beam):
@@ -2055,8 +2160,8 @@ class Game:
                                            vel=a.vel * 0.5 + kick,
                                            rng=self.rng))
         self.asteroids.remove(a)
-        # Beam visual: fixed endpoint on the rock's surface. target=None makes
-        # draw() use vis_end (the "target already gone" path).
+        # Beam visual: fixed endpoint on the rock's surface. target_id=None
+        # makes draw() use vis_end (the "target already gone" path).
         d = hit_pt - a.pos
         if d.length_squared() < 1e-6:
             d = beam.end - beam.start
@@ -2064,7 +2169,7 @@ class Game:
         vis_end = a.pos + d * a.collision_radius
         # Owner index on the entry (see _resolve_beam).
         self.beams.append([beam.local_start, None, d, vis_end, 0.0, 0.15,
-                           owner])
+                           owner, None])
         self._emit_beam_event(beam.start, vis_end,
                               beam.local_start, owner)
 
@@ -2119,6 +2224,19 @@ class Game:
         return abs(d_f) <= abs(d_e) + TARGETING_ALIGN_TOL
 
 
+    def _kill_ship(self, ship):
+        """Per-player death (shared by _handle_ship_hit and the 2P
+        player-vs-player paths). The ship is marked dead (frozen — see
+        _step); the game_over flag is set ONLY in single player (where one
+        dead ship ends the game, as before). In 2P the OTHER player keeps
+        playing — the dead player respawns with R (see respawn_player)."""
+        ship.dead = True
+        if len(self.players) == 1:
+            self.game_over = True
+        burst(self.particles, ship.pos, 30, big=True, rng=self.rng)
+        self._sfx("explosion")
+        self._sfx("game_over")
+
     def _handle_ship_hit(self, ship, source_pos):
         """Handle a hit on a player ship (takes the ship).
         Returns True if the ship survives."""
@@ -2128,17 +2246,7 @@ class Game:
             # Throttled: 3 enemies can hit ~20/s; the ping is 0.3 s long.
             self._sfx_throttled("shield_hit", SFX_SHIELD_HIT_MIN_INTERVAL)
             return True
-        # Per-player death. The ship is marked dead (frozen — see
-        # _step); the game_over flag is set ONLY in single player (where
-        # one dead ship ends the game, as before). In 2P the OTHER player
-        # keeps playing — the dead player respawns with R (see
-        # respawn_player).
-        ship.dead = True
-        if len(self.players) == 1:
-            self.game_over = True
-        burst(self.particles, ship.pos, 30, big=True, rng=self.rng)
-        self._sfx("explosion")
-        self._sfx("game_over")
+        self._kill_ship(ship)
         return False
 
     def _collisions(self):
@@ -2191,6 +2299,33 @@ class Game:
                     else:
                         spawn_enemy(self.enemies, self.ship, rng=self.rng)
                 break
+
+        # player bullet vs the OTHER player's ship (plan_19 2P combat).
+        # Same hit criteria as the enemy path above: shield UP -> point test
+        # against the shield oval, shield DOWN -> swept hull polygon. The
+        # bullet's id is (player_index, seq) — the firing player's index
+        # selects the OTHER player's slot (a bullet travels away from its
+        # shooter, so it can only reach the other player; testing the
+        # shooter would self-hit, since a bullet starts at the muzzle,
+        # inside the shooter's shield). A dead (frozen) ship takes no hits.
+        # Single-player never enters (no other slot).
+        if len(self.players) == 2:
+            for b in self.bullets[:]:
+                if b.id is None:
+                    continue
+                p = self.players[1 - b.id[0]]   # the other player
+                if p.dead:
+                    continue
+                if p.shield_on:
+                    if not p.shield_contains(b.pos):
+                        continue
+                    hit_pt = b.pos
+                else:
+                    hit, hit_pt = p.collision_segment(b.prev_pos, b.pos)
+                    if not hit:
+                        continue
+                self.bullets.remove(b)
+                self._handle_ship_hit(p, pygame.Vector2(hit_pt))
 
         # bullet vs asteroid
         for b in self.bullets[:]:
@@ -2251,6 +2386,48 @@ class Game:
                     else:
                         spawn_enemy(self.enemies, self.ship, rng=self.rng)
                 break
+
+        # missile vs the OTHER player's ship (plan_19 2P combat). Same
+        # shield-oval / swept-hull criteria as the enemy path; the missile's
+        # dmg points go through register_hit in a loop (a player's
+        # register_hit takes one shield point per call), exactly like the
+        # enemy missile path. The missile's id is (player_index, seq) — the
+        # firing player's index selects the OTHER player's slot (a missile
+        # flies away from its shooter, so it can only reach the other
+        # player; testing the shooter would self-hit, since a missile starts
+        # at the muzzle, inside the shooter's shield).
+        if len(self.players) == 2:
+            for m in self.missiles[:]:
+                if m.id is None:
+                    continue
+                p = self.players[1 - m.id[0]]   # the other player
+                if p.dead:
+                    continue
+                if p.shield_on:
+                    if not p.shield_contains(m.pos):
+                        continue
+                    hit_pt = m.pos
+                else:
+                    hit, hit_pt = p.collision_segment(m.prev_pos, m.pos)
+                    if not hit:
+                        continue
+                self.missiles.remove(m)
+                impact = pygame.Vector2(hit_pt)
+                _shield_up = p.shield_on
+                alive = True
+                for _ in range(m.dmg):
+                    alive = p.register_hit(impact)
+                if alive:
+                    if _shield_up:
+                        shield_burst(self.particles,
+                                     p.shield_impact_point(impact),
+                                     rng=self.rng)
+                        self._sfx_throttled("shield_hit",
+                                            SFX_SHIELD_HIT_MIN_INTERVAL)
+                    else:
+                        burst(self.particles, impact, 6, rng=self.rng)
+                else:
+                    self._kill_ship(p)
 
         # missile vs asteroid (detonate, same as a bullet)
         for m in self.missiles[:]:

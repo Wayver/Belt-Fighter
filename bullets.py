@@ -120,13 +120,27 @@ class Missile:
         self.id = mid
 
     def snapshot(self):
-        # target is stored as the enemy's ship id (or None); Game
-        # apply_snapshot() re-wires it to the live AIEnemy object.
-        # The id (player_index, seq) is carried too — the client's dedup
-        # key; a 2-tuple (None-safe).
+        # target is stored as a plain id (or None); Game apply_snapshot()
+        # re-wires it to the live object. plan_19: an AI enemy -> its ship
+        # id (int); the other player's ship -> "p<i>" (a string, the player
+        # index — a _PlayerHomingTarget adapter on the host, a
+        # _GhostPlayerProxy on the client); else None. The id
+        # (player_index, seq) is carried too — the client's dedup key; a
+        # 2-tuple (None-safe).
+        target = self.target
+        if target is None:
+            target_id = None
+        elif isinstance(target, str):
+            target_id = target          # already a "p<i>" player id
+        elif hasattr(target, "target_id"):
+            target_id = target.target_id  # _PlayerHomingTarget -> "p<i>"
+        elif hasattr(target, "ship"):
+            target_id = target.ship.id  # AIEnemy (or a proxy with .ship)
+        else:
+            target_id = getattr(target, "id", None)
         return (self.pos.x, self.pos.y, self.vel.x, self.vel.y,
                 self.owner, self.life, self.boost,
-                self.target.ship.id if self.target is not None else None,
+                target_id,
                 self.id)
 
     def apply_snapshot(self, s):

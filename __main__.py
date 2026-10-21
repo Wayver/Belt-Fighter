@@ -1211,7 +1211,8 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
             game.ghost.advance(
                 dt, inp, enemies=game._ghost_enemy_proxies(_pos),
                 real_time=now, host_time=game.host_time,
-                rtt_ow=game._rtt_ow)
+                rtt_ow=game._rtt_ow,
+                rocks=game._ghost_rock_proxies(_pos))
         _advance_ghost()
         # Poll the host: each snapshot feeds the host-time estimator (its
         # wire stamp vs the local arrival time — the estimator's

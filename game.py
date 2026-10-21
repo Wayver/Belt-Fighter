@@ -192,6 +192,31 @@ class _GhostEnemyShip:
         self.power_idle_total = power_idle_total
 
 
+class _GhostRockProxy:
+    """Lightweight asteroid proxy for the prediction ghost's beam
+    occlusion (the client-side mirror of the host's `_beam_blocked`).
+
+    The host's `_resolve_beam` clamps a laser's visual endpoint to the
+    nearest asteroid that intersects the beam segment (the beam stops at
+    the rock's surface, not the target). The client's ghost path
+    (PredictedShip.step) previously stored the beam's raw target
+    endpoint, so the client's OWN beam visually punched THROUGH an
+    asteroid that the host's beam was blocked by. The ghost now runs the
+    same segment-vs-circle test against these proxies, built from the
+    buffer's asteroid entries.
+
+    It exposes only what the occlusion math reads: `.pos` (the
+    interpolated world pos — the buffer's asteroid entry) and
+    `.collision_radius` (the host's beam-block test uses
+    `a.collision_radius`; the client derives it from the wire verts via
+    `self._rock_coll_r`, the same (max|v|+min|v|)/2 estimate the
+    plan_18 hit-fx path uses). Never stepped, never fed to the sim."""
+
+    def __init__(self, pos, collision_radius):
+        self.pos = pos
+        self.collision_radius = collision_radius
+
+
 # --- model-driven WORLD render helpers ------------------------------------
 # Module-level functions that read ONLY the plain-data RenderModel + camera
 # + per-tag presentation stand-ins — never live sim state — so the render
@@ -2454,6 +2479,7 @@ class Game:
             # render point; None (no window yet / bare Game) replays with
             # no targets.
             enemies = None
+            rocks = None
             rp = getattr(self, "render_point", None)
             if rp is not None:
                 rp_now = rp.now()
@@ -2461,6 +2487,10 @@ class Game:
                     pos = self.snap_buf.positions_at(rp_now)
                     if pos is not None:
                         enemies = self._ghost_enemy_proxies(pos)
+                        # Asteroid proxies for the replay's beam occlusion
+                        # (a beam re-fired during the rewind replay is
+                        # clamped to the nearest rock, like the live steps).
+                        rocks = self._ghost_rock_proxies(pos)
             # Measure the ghost's displacement ACROSS the reconcile (the
             # "snap size") for the net debug overlay + log: ~0 with
             # dead-reckoning rewind + identical input; large = the
@@ -2499,7 +2529,8 @@ class Game:
                           if _gun_idx is not None else 0.0)
             self.ghost.reconcile_rewind(
                 local_s, sim_time, sim_time if now is None else now,
-                enemies=enemies, real_time=real_time, rate=rate)
+                enemies=enemies, real_time=real_time, rate=rate,
+                rocks=rocks)
             self.last_snap_px = math.hypot(
                 self.ghost.ship.pos.x - _bx, self.ghost.ship.pos.y - _by)
             # The render pose's displacement across the reconcile.
@@ -2656,6 +2687,13 @@ class Game:
         # (laser target) and reused below for the targeting reticle — one
         # build per frame.
         ghost_enemies = self._ghost_enemy_proxies(pos)
+        # Asteroid proxies for the ghost's beam occlusion (the client-side
+        # mirror of the host's `_beam_blocked`): the ghost's own laser
+        # beam's endpoint is clamped to the nearest rock that intersects
+        # the beam segment, so the client's beam stops at the rock's
+        # surface like the host's instead of punching through to the
+        # target. Built from the same buffer window as the enemy proxies.
+        ghost_rocks = self._ghost_rock_proxies(pos)
 
         inp = ShipInput.from_keys(keys)
         # Pass the client's real time + the HostTimeEstimator + the
@@ -2679,7 +2717,8 @@ class Game:
             dt, inp, enemies=ghost_enemies,
             real_time=real_time,
             host_time=getattr(self, "host_time", None),
-            rtt_ow=getattr(self, "_rtt_ow", 0.0))
+            rtt_ow=getattr(self, "_rtt_ow", 0.0),
+            rocks=ghost_rocks)
         # Frame time of the frame that also ran the reconcile (the log
         # line is written in this same frame) — the snap's timing context.
         self.last_frame_dt = dt
@@ -4031,6 +4070,32 @@ class Game:
             proxies.append(_GhostEnemyProxy(
                 pygame.Vector2(x, y), pygame.Vector2(vx, vy),
                 ang, eid, power_used, idle))
+        return proxies
+
+    def _ghost_rock_proxies(self, pos):
+        """Lightweight asteroid proxies from the buffer's asteroid entries
+        for the prediction ghost's beam occlusion (the client-side mirror
+        of the host's `_beam_blocked`).
+
+        Each buffer asteroid entry is (id, x, y, angle). One
+        _GhostRockProxy per entry, built fresh each frame — presentation
+        only, never stepped, never fed to the sim. The proxy exposes
+        `.pos` (the interpolated world pos) and `.collision_radius` (the
+        host's beam-block test compares the beam's closest point to
+        `a.collision_radius`; the client derives it from the wire verts
+        via `self._rock_coll_r` — the same (max|v|+min|v|)/2 estimate the
+        plan_18 hit-fx path uses). A rock with no registered radius
+        (a registry miss — should be impossible, the verts arrive with
+        the rock's first snapshot) is skipped: without a radius the
+        occlusion test cannot run, and a beam through an un-registered
+        rock is the pre-fix behavior (a rare, sub-0.15 s flash).
+        """
+        proxies = []
+        for (aid, x, y, _ang) in pos['asteroids']:
+            r = self._rock_coll_r.get(aid)
+            if r is None:
+                continue
+            proxies.append(_GhostRockProxy(pygame.Vector2(x, y), r))
         return proxies
 
     def _targeting_proxies(self, pos):

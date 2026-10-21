@@ -633,6 +633,46 @@ def _asteroid_key(a_s):
     return a_s[0]
 
 
+def _beam_blocked_end(beam, rocks):
+    """Client-side mirror of the host's `_beam_blocked` +
+    `_beam_hit_asteroid` visual-endpoint math: clamp a laser beam's
+    endpoint to the nearest asteroid that intersects the beam segment, so
+    the client's OWN beam stops at the rock's surface (matching the host)
+    instead of punching through to the target.
+
+    `beam` is a live `Beam` (`.start` / `.end` world-space Vector2s — the
+    muzzle and the raw target position). `rocks` is a list of
+    `_GhostRockProxy` (`.pos` / `.collision_radius`) built from the
+    buffer's asteroid entries. Returns the beam's visual endpoint as a
+    Vector2: the rock's surface point when a rock blocks the segment (the
+    SAME nearest-by-t + closest-point + surface-point math the host uses),
+    or `beam.end` unchanged when nothing blocks it.
+
+    Presentation only — the ghost is never fed back to the sim, so this
+    only affects what the client draws. Mirrors the host exactly so the
+    client's beam and the host's beam stop at the same point."""
+    seg = beam.end - beam.start
+    seg_len2 = seg.length_squared()
+    if seg_len2 < 1e-6 or not rocks:
+        return beam.end
+    best_t, best_a, best_pt = 1.0, None, None
+    for a in rocks:
+        t = (a.pos - beam.start).dot(seg) / seg_len2
+        t = max(0.0, min(1.0, t))          # clamp: only between muzzle and target
+        closest = beam.start + seg * t
+        if closest.distance_to(a.pos) < a.collision_radius and t < best_t:
+            best_t, best_a, best_pt = t, a, closest
+    if best_a is None:
+        return beam.end
+    # Surface point on the rock facing the beam's closest approach — the
+    # host's `_beam_hit_asteroid` vis_end math.
+    d = best_pt - best_a.pos
+    if d.length_squared() < 1e-6:
+        d = seg
+    d = d.normalize()
+    return best_a.pos + d * best_a.collision_radius
+
+
 def _match_bullets(prev_list, curr_list, dt):
     """Match curr bullets to prev bullets by PREDICTED POSITION. Returns a
     list, one entry per curr bullet: the prev twin's (x, y) or None (a
@@ -1476,7 +1516,7 @@ class PredictedShip:
             self._echo_buffer.pop(0)
 
     def reconcile_rewind(self, ship_s, snap_time, now, enemies=None,
-                     real_time=None, rate=1.0):
+                     real_time=None, rate=1.0, rocks=None):
         """Dead-reckoning reconcile. Apply the authoritative ship snapshot taken
         at sim time `snap_time`, then REPLAY the local inputs the host
         applied between `snap_time` and `now`, so the ghost ends up at
@@ -1489,6 +1529,12 @@ class PredictedShip:
         matches the host's (the host's replayed ticks saw the live enemies
         in the wedge). The caller passes the buffer's enemy proxies at the
         snapshot's render point; a None (tests) replays with no targets.
+
+        `rocks` (a list of lightweight asteroid proxies, see `step`) is
+        fed to each replayed step so a beam re-fired during the replay is
+        clamped to the nearest asteroid that intersects its segment (the
+        client-side mirror of the host's `_beam_blocked`) — the same
+        occlusion the live steps get.
 
         The replay mirrors the host's own tick loop: for each sim tick T
         from snap_time to now (step TICK), the host applies the LATEST
@@ -1611,7 +1657,7 @@ class PredictedShip:
             while j + 1 < len(buf) and buf[j + 1][0] <= t + 1e-9:
                 j += 1
             inp = buf[j][1] if j >= 0 else buf[0][1]
-            self.step(TICK, inp, enemies=enemies)
+            self.step(TICK, inp, enemies=enemies, rocks=rocks)
             self.step_local_bullets(TICK)
             self.step_local_beams(TICK)
             self.step_local_missiles(TICK, enemies)
@@ -1650,13 +1696,21 @@ class PredictedShip:
         # _last_step_time is the same, so the render interpolation phase
         # is _acc = _sim_time - _last_step_time (in [0, TICK)).
 
-    def step(self, dt, inp, enemies=None):
+    def step(self, dt, inp, enemies=None, rocks=None):
         """Advance the ghost ONE fixed step with the LOCAL input.
 
         `dt` is passed by the caller (the sim's TICK) because netcode.py
         must not import it from game.py (game.py imports netcode.py). The
         Game-fed per-tick fields are reset to idle before the step — the
         ghost has no enemy list to target (see class docstring).
+
+        `rocks` (a list of `_GhostRockProxy`, see `advance`) is fed to the
+        beam-occlusion clamp below: the ghost's own laser beam's endpoint
+        is clamped to the nearest asteroid that intersects the beam
+        segment (the client-side mirror of the host's `_beam_blocked`), so
+        the client's beam stops at the rock's surface like the host's
+        instead of punching through to the target. None (tests / no
+        window) leaves the beam's endpoint at the raw target position.
 
         The SHOTS the ghost's gun fires this step are kept as presentation
         `Bullet`s in `self.local_bullets` so the player sees their own
@@ -1785,9 +1839,20 @@ class PredictedShip:
         # the 0.15 s flash the origin was left behind in empty space. A
         # LIST (not tuple) so step_local_beams can age `b[2]` in place
         # (mirrors the host's `self.beams` list-of-lists).
+        #
+        # The END is clamped to the nearest asteroid that intersects the
+        # beam segment (the client-side mirror of the host's
+        # `_beam_blocked` + `_beam_hit_asteroid` vis_end math): the host's
+        # `_resolve_beam` stops the beam at the rock's surface when a rock
+        # is in the way, so the client's own beam must stop there too —
+        # storing the raw beam.end (the target's position) made the client
+        # beam visually punch THROUGH the asteroid to the target. `rocks`
+        # are the buffer's asteroid proxies (None -> no clamp, the raw
+        # target endpoint).
         for beam in beams:
+            end = _beam_blocked_end(beam, rocks)
             self.local_beams.append(
-                [beam.local_start, beam.end.copy(), 0.0, BEAM_TTL])
+                [beam.local_start, end.copy(), 0.0, BEAM_TTL])
         # Keep the ghost's own LAUNCHED missiles as presentation
         # GhostMissiles. The fire decision is INPUT-LOCAL (plan_14 Phase 3):
         # every missile the ghost's weapon state produces is kept — the old
@@ -2144,7 +2209,7 @@ class PredictedShip:
         return {}
 
     def advance(self, dt, inp, enemies=None, real_time=None,
-                host_time=None, rtt_ow=0.0):
+                host_time=None, rtt_ow=0.0, rocks=None):
         """Advance the ghost by real time `dt`.
 
         THE GHOST CLOCK CONTRACT — the single source of truth for how the
@@ -2203,6 +2268,13 @@ class PredictedShip:
         interpolation buffer, fed to every step so the ghost's laser
         target tracks the buffer's enemies and it fires a beam on the same
         tick the host does.
+
+        `rocks`: a list of lightweight asteroid proxies from the
+        interpolation buffer, fed to every step so the ghost's own laser
+        beam's endpoint is clamped to the nearest asteroid that intersects
+        the beam segment (the client-side mirror of the host's
+        `_beam_blocked`) — the client's beam stops at the rock's surface
+        like the host's instead of punching through to the target.
 
         A DEAD ghost does not advance: the host freezes a dead ship, so
         predicting it with the local input would race ahead and every
@@ -2296,7 +2368,7 @@ class PredictedShip:
             # _ship_pose does the same from the model's prev/curr).
             self._prev_pos = pygame.Vector2(self._ship.pos)
             self._prev_angle = self._ship.angle
-            self.step(TICK, inp, enemies=enemies)
+            self.step(TICK, inp, enemies=enemies, rocks=rocks)
             self.step_local_bullets(TICK)   # advance + cull
             self.step_local_beams(TICK)     # age + cull
             self.step_local_missiles(TICK, enemies)   # home + cull

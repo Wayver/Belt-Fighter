@@ -96,10 +96,21 @@ T_RESPAWN = "respawn"
 # in the PAST, so a beam whose age rode the snapshot would be expired (or
 # only a flicker) by the time the render point reached it. Instead the host
 # sends the beam the moment it fires: {"type": T_BEAM, "sim_time": t,
-# "sx":.., "sy":.., "ex":.., "ey":..} (world-space muzzle -> endpoint). The
-# client draws it immediately on receipt, fading over BEAM_TTL — the same
-# way the ghost draws its OWN beams. One-way LAN latency (~10-20 ms) is
-# imperceptible against a 0.15 s flash.
+# "sx":.., "sy":.., "ex":.., "ey":.., "owner":.., "lx":.., "ly":..,
+# "target":..} (world-space muzzle -> endpoint + the firing player's index
+# + the hull-local muzzle + the beam's TARGET id). The client draws it
+# immediately on receipt, fading over BEAM_TTL — the same way the ghost
+# draws its OWN beams. One-way LAN latency (~10-20 ms) is imperceptible
+# against a 0.15 s flash.
+#
+# `target` (plan_19 §2.6) is the beam's target id — the same value the
+# host's beam entry carries as its last field: an enemy ship id (int) when
+# the beam hit an AI enemy, "p<i>" (a string) when it hit the OTHER
+# player's ship, or None when it hit a rock. The client uses it to know
+# WHICH ship the beam landed on — Session 4 fires the local ship's hit FX
+# when target == "p<local_index>" (a beam is hitscan, so there is no
+# in-flight projectile to watch). A missing field reads as None (the rock
+# path) — backward-tolerant.
 T_BEAM = "beam"
 # The input-echo — the input the host ACTUALLY applied to player 1 (the
 # remote player), per sim tick. The client's dead-reckoning rewind

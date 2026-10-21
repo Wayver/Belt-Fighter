@@ -1,34 +1,37 @@
 # Plan 19 — 2P Player-vs-Player Combat (team-based targeting, damage, lock-on, hit FX)
 
-**Status:** Session 2 DONE (commit 075c045). Next: Session 3 (client-side
-lock-on + wire). Session 2 landed: _collisions player-bullet-vs-other-
-player + missile-vs-other-player passes (the projectile's id
-(player_index, seq) selects the OTHER player's slot — a projectile starts
-at the muzzle, inside the shooter's shield, so it can only reach the
-other player; same shield-oval / swept-hull criteria as the enemy path;
-_handle_ship_hit / m.dmg loop / _kill_ship on hit); _resolve_beam extends
-the enemy loop to the other player's ship (distance test, vis_end on
-their shield oval, beam.damage register_hit calls) and the beam entry's
-LAST field is now the target_id (enemy ship id / "p<i>" / None for a
-rock) — render_model serializes it (no live reference in the model);
-_PlayerHomingTarget adapter (lets Missile.update's target.hp>0 +
-target.lead_point work unchanged for a player target) — a player missile
-target is wrapped at launch, Missile.snapshot encodes it as "p<i>"
-(enemy -> ship id int, else None), Game.apply_snapshot re-wires "p<i>"
-to a fresh adapter over self.players[i]; _kill_ship extracted from
-_handle_ship_hit. Single-player bit-identical (all new paths gated on
-len(players)==2; the beam target_id is a render-model-only field, the
-snapshot stays the 11-tuple). Full suite green (4 pre-existing failures
-unchanged: 10_3a, 10_11c, 10_9, test_network).
+**Status:** Session 3 DONE (T_BEAM `target` wire). Next: Session 4
+(client-side hit FX + tests + docs). Session 3 landed: the T_BEAM wire
+message gains a `target` field (None / int enemy ship id / "p<i>"
+player) — host `_emit_beam_event` sets it from the resolved target (the
+3 call sites: enemy -> e.ship.id, other player -> "p<i>", rock -> None),
+the sim thread rides it on the T_BEAM message, and the client's T_BEAM
+receive stores it as the 6th field of the remote_beams entry
+([local_start, end, age, ttl, owner, target]); the draw loop unpacks it
+(unused until Session 4's hit FX). NOTE: the ghost-side lock-on +
+homing (plan §2.5 / Session 3 items 2-3) ALREADY LANDED in Session 1
+(b26ffe6) — _GhostPlayerProxy, the pickers' player_proxy, and
+step_local_missiles' by_id including the proxy — so Session 3's
+remaining work was the T_BEAM target wire + verification. Verified:
+T_BEAM target end-to-end (enemy->int, player->"p1", rock->None); ghost
+laser + missile pick the remote player proxy; a ghost missile homes on
+the proxy (closer than a coasting one) and coasts when it leaves the
+buffer; lockstep preserved (test_14_2/14_3 max drift 0.00). Full
+10.x/14.x/15.x/17.x/18.x suite green (pre-existing failures unchanged:
+10_3a, 10_11c, 10_9, test_network).
 
-NOTE for Session 3: the beam target_id is currently a RENDER-MODEL-only
-field (host draw path). The T_BEAM WIRE message does NOT yet carry it —
-Session 3 adds `target` to the T_BEAM message (net.py / sim_thread.py
-send + __main__.py receive into remote_beams) so the client can know
-"this beam hit me" (Session 4 hit FX) and anchor the endpoint. The
-missile "p<i>" encoding is already on the wire (Missile.snapshot), so
-Session 3's ghost work is to re-resolve the "p<i>" target by id in
-step_local_missiles (the by_id map must include the _GhostPlayerProxy).
+NOTE for Session 4: the beam `target` is now on the WIRE (Session 3) and
+stored in the remote_beams entry (6th field) — Session 4 reads it to fire
+the local ship's hit FX when `target == "p<local_index>"` (a beam is
+hitscan, so there is no in-flight projectile to watch): spawn a
+shield_burst at the beam's endpoint + the throttled `shield_hit` SFX in
+the same frame the beam is drawn. The missile "p<i>" encoding is already
+on the wire (Missile.snapshot) and the ghost re-resolves it by id in
+step_local_missiles (the by_id map includes the _GhostPlayerProxy) —
+both landed in Sessions 1-3. Session 4 also generalizes
+_local_incoming_hit_fx's impact-point search to incoming PLAYER bullets
+(kind=='player', owner==remote_index) and adds test_19_2p_combat.py +
+the ARCHITECTURE.md / PERFORMANCE.md docs.
 **Scope:** let the two human players actually fight each other in 2P. Today the
 game has **no "who can shoot whom" concept** — it is hardcoded to "players
 shoot AI enemies." This plan introduces a **team** field on the ship, a single

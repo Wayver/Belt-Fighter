@@ -287,12 +287,14 @@ class SimThread:
                     # flash. Stays per-wake: a beam is a 0.15 s flash,
                     # not a cadence — one flush per wake covers every
                     # step's beams.
-                    for (sx, sy, ex, ey, t, owner, lx, ly) in g._beam_events:
+                    for (sx, sy, ex, ey, t, owner, lx, ly,
+                         target) in g._beam_events:
                         self._worker.send({"type": T_BEAM, "sim_time": t,
                                            "sx": sx, "sy": sy,
                                            "ex": ex, "ey": ey,
                                            "owner": owner,
-                                           "lx": lx, "ly": ly})
+                                           "lx": lx, "ly": ly,
+                                           "target": target})
                     g._beam_events.clear()
                     # Send the input the host ACTUALLY applied to player 1
                     # (the client's ship) on each tick stepped this

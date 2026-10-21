@@ -1289,11 +1289,18 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
                 # the world-space start is where the muzzle WAS at fire
                 # time, so drawing it directly left the origin behind in
                 # empty space as the ship moved during the 0.15 s flash.
-                # Entry shape: [local_start, end, age, ttl, owner].
+                # Entry shape: [local_start, end, age, ttl, owner, target].
+                # `target` (plan_19 §2.6) is the beam's target id — an
+                # enemy ship id (int), "p<i>" (a string) for the other
+                # player, or None for a rock. A missing field reads as
+                # None (the rock path — backward-tolerant). Session 4
+                # uses it to fire the local ship's hit FX when
+                # target == "p<local_index>"; today it is stored + drawn
+                # through (unused).
                 game.remote_beams.append([
                     (m.get("lx", 0.0), m.get("ly", 0.0)),
                     pygame.Vector2(m["ex"], m["ey"]),
-                    0.0, BEAM_TTL, m.get("owner", 0)])
+                    0.0, BEAM_TTL, m.get("owner", 0), m.get("target")])
             elif m.get("type") == T_ECHO:
                 # The input the host ACTUALLY applied to OUR ship (player 1) on each
                 # tick — one (sim_time, input) pair per entry. Record

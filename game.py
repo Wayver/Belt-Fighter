@@ -1057,10 +1057,14 @@ class Game:
         # in predicted_view (see _local_incoming_hit_fx).
         self._last_ghost_shield_dump = 0.0
         # Remote player's laser beams, received as T_BEAM events (one per
-        # discharge). [start, end, age, ttl] in WORLD space, same shape as
-        # the ghost's local_beams. A beam is a 0.15 s flash (BEAM_TTL), too
-        # short to ride the snapshot window, so it is drawn immediately and
-        # aged here (_step_remote_beams). Presentation only.
+        # discharge). [local_start, end, age, ttl, owner, target] —
+        # local_start is the HULL-LOCAL muzzle offset (re-anchored to the
+        # firing ship's interpolated pose at draw time), end the world
+        # endpoint, owner the firing player's index, target the beam's
+        # target id (enemy ship id / "p<i>" / None for a rock — plan_19
+        # §2.6; stored for Session 4's hit FX). A beam is a 0.15 s flash
+        # (BEAM_TTL), too short to ride the snapshot window, so it is drawn
+        # immediately and aged here (_step_remote_beams). Presentation only.
         self.remote_beams = []
         # Missile handback offset (client-only). At handback the buffer's copy of
         # a ghost missile is INTERP_DELAY behind the ghost's predicted
@@ -2012,7 +2016,7 @@ class Game:
         return best
 
 
-    def _emit_beam_event(self, start, end, local_start, owner):
+    def _emit_beam_event(self, start, end, local_start, owner, target=None):
         """Queue a laser beam for the client (world-space muzzle ->
         endpoint + the sim clock at fire time + the FIRING player's index).
         The sim thread drains `self._beam_events` after each step and sends
@@ -2029,10 +2033,20 @@ class Game:
         left the origin behind in empty space as the ship moved during the
         0.15 s flash. The world-space `start` is still sent (sx, sy) for
         diagnostics; the client anchors on the hull-local muzzle and skips
-        a beam whose owner has no interpolated pose this frame."""
+        a beam whose owner has no interpolated pose this frame.
+
+        `target` (plan_19 §2.6) is the beam's TARGET id — the same value
+        the host's beam entry carries as its last field: an enemy ship id
+        (int) when the beam hit an AI enemy, `"p<i>"` (a string) when it
+        hit the OTHER player's ship, or None when it hit a rock. The sim
+        thread rides it on the T_BEAM message so the client knows WHICH
+        ship the beam landed on — Session 4 uses it to fire the local
+        ship's hit FX when `target == "p<local_index>"` (a beam is
+        hitscan, so there is no in-flight projectile to watch). A missing
+        field reads as None (the rock path) — backward-tolerant."""
         self._beam_events.append((start.x, start.y, end.x, end.y,
                                   self.sim_time, owner,
-                                  local_start[0], local_start[1]))
+                                  local_start[0], local_start[1], target))
 
     def _resolve_beam(self, beam, owner):
         """Hitscan: hit the first target near the beam's end point.
@@ -2087,7 +2101,8 @@ class Game:
                 self.beams.append([beam.local_start, e, d,  vis_end, 0.0,
                                    0.15, owner, e.ship.id])
                 self._emit_beam_event(beam.start, vis_end,
-                                      beam.local_start, owner)
+                                      beam.local_start, owner,
+                                      target=e.ship.id)
                 return
 
         # plan_19 2P combat: the beam can also hit the OTHER player's
@@ -2127,7 +2142,8 @@ class Game:
                     self.beams.append([beam.local_start, p, d, vis_end, 0.0,
                                        0.15, owner, "p%d" % i])
                     self._emit_beam_event(beam.start, vis_end,
-                                          beam.local_start, owner)
+                                          beam.local_start, owner,
+                                          target="p%d" % i)
                     return
 
 
@@ -2170,8 +2186,9 @@ class Game:
         # Owner index on the entry (see _resolve_beam).
         self.beams.append([beam.local_start, None, d, vis_end, 0.0, 0.15,
                            owner, None])
+        # target=None: the beam hit a rock (the wire's "no target" path).
         self._emit_beam_event(beam.start, vis_end,
-                              beam.local_start, owner)
+                              beam.local_start, owner, target=None)
 
     def _draw_targeting(self, screen, e):
         pts = e.predict_path(TARGETING_HORIZON, TARGETING_STEPS)
@@ -3109,12 +3126,15 @@ class Game:
             self._draw_remote_rock(screen, x, y, ang,
                                    self.rock_shapes.get(aid))
         # Remote player's laser beams — T_BEAM events (one per discharge),
-        # drawn before the ships. Entry: [local_start, end, age, ttl, owner];
-        # local_start is the hull-local muzzle offset, end the world endpoint.
-        # The origin is re-anchored to the firing ship's INTERPOLATED pose
-        # each frame (the muzzle is frozen at fire time, so a dead ship's
-        # beam anchors to its death pose). Presentation only.
-        for (local_start, end, age, ttl, owner) in self.remote_beams:
+        # drawn before the ships. Entry: [local_start, end, age, ttl, owner,
+        # target]; local_start is the hull-local muzzle offset, end the world
+        # endpoint, target the beam's target id (enemy ship id / "p<i>" /
+        # None for a rock — plan_19 §2.6). The origin is re-anchored to the
+        # firing ship's INTERPOLATED pose each frame (the muzzle is frozen at
+        # fire time, so a dead ship's beam anchors to its death pose).
+        # Presentation only; `target` is stored for Session 4's hit FX (a
+        # beam whose target is the LOCAL player fires the shield burst).
+        for (local_start, end, age, ttl, owner, _target) in self.remote_beams:
             if not (0 <= owner < len(pos['ships'])):
                 # Firing ship not in the buffer this frame (index out of
                 # range): no pose to anchor to — skip the beam (it is a

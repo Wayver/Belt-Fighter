@@ -155,3 +155,17 @@ identical to the baseline).
 **Regression gate:** `test_render_model.py` (pixel parity + determinism)
 still passes — the cull is a pure function of the camera, so the
 never-stepped shell and the live game render identically.
+
+## Client hit FX (plan_18) — no bandwidth change
+
+The client's option-A hit-FX trigger now covers ROCKS (bullets + missiles
+stop at the rock's circle with an entry-point spark). **No bandwidth
+change**: the wire is untouched (plan_17's format is frozen) — the rock's
+collision radius is DERIVED on the client from the wire verts
+(`(max|v| + min|v|) / 2`), not sent.
+
+**Per-frame cost:** while the local player is firing, the trigger runs a
+swept segment-circle test per (local bullet, rock) pair — ~26 in-flight
+bullets × ~85 rocks ≈ 2k cheap quadratic solves per firing frame (plus the
+same for ghost missiles). Negligible against the fog's ~3 ms. No viewport
+cull on the rock test (the host doesn't cull; the quadratic is cheap).

@@ -271,6 +271,27 @@ re-explaining. History (why a rule changed) lives in git, not here.
   enemy PROXY for its target id (re-resolved each step; a gone target
   coasts), mirroring the host's Missile.update (boost ramp, then
   turn-rate-limited seek toward the lead point).
+- Client hit FX (option-A trigger, plan_18): the trigger (game.py
+  `predicted_view`) now covers ROCKS as a third target class, alongside
+  the remote ship and AI enemies. It mirrors the host's
+  bullet/missile-vs-rock test EXACTLY — a CIRCLE, not the drawn polygon
+  (the host's test is `dist < collision_radius`; the polygon is
+  non-convex, so the convex-poly helpers must not be used on raw verts).
+  R is DERIVED from the wire verts as `(max|v| + min|v|) / 2` (the wire
+  prunes size/radius — plan_17 — so it is not sent; the registry
+  `_rock_coll_r` is filled in `push_snapshot`'s verts loop). The impact
+  is the circle ENTRY point (`_seg_circle_entry`, the first segment
+  crossing), so the spark lands on the rock's near surface, not its
+  center. On a hit the trigger spawns a burst + `small_explosion` SFX and
+  culls the projectile in the SAME persistent cull set the ship/enemy
+  passes use (`_hit_fx_cull_bids` for bullets — ghost + buffer-drawn;
+  `_hit_fx_cull_mids` for ghost missiles, which also culls the buffer's
+  copy + fog light), so the projectile stops at the rock instead of
+  flying through until the host's authoritative cull arrives.
+  Presentation only: the wire is untouched, the ghost's PHYSICS does no
+  rock collision (a predicted clip-through is corrected by the next
+  reconcile), and the authoritative hit/damage/rock death still come from
+  the host snapshot.
 
 ## Misc
 - Enemy proxies: the caller builds lightweight proxies from the buffer's

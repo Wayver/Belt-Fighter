@@ -1,7 +1,7 @@
 # Plan 18 — Client-Side Weapon-vs-Asteroid Hit FX (2P: bullets/missiles stop at rocks)
 
 **Status:** Session 1 (trigger + telemetry) DONE + VERIFIED (2026-10-21).
-Session 2 (tests + docs) PENDING.
+Session 2 (tests + docs) DONE + VERIFIED (2026-10-21).
 **Scope:** the CLIENT's presentation of the LOCAL player's weapons hitting
 asteroids in 2P — the option-A hit-FX trigger in `predicted_view` (game.py)
 gains a third target class (rocks), mirroring how it already handles remote
@@ -229,10 +229,10 @@ callers).
   local_missiles; CSV records a `src='buf'` `rock:<id>` HIT row + a
   FRAME row with `n_rocks=1`/`rock_hit=1`. ALL PASS.
 
-### Session 2 — tests + docs
+### Session 2 — tests + docs (DONE + VERIFIED 2026-10-21)
 
 5. **New test** `test_18_rock_hits.py` (standalone `main()`, the
-   test_15_4 / test_10_7 scratch-client scaffolding):
+   test_15_4 / test_10_7 scratch-client scaffolding) — DONE:
    - **HELPER**: `_seg_circle_entry` — entry point on the boundary
      (|p - c| ≈ r), a clean miss, a start-inside case, a degenerate
      (zero-length) segment.
@@ -261,7 +261,40 @@ callers).
    stop at the rock surface with a spark + small_explosion, no
    pass-through; missiles detonate on rocks; F3 + hit_fx_debug.csv shows
    `rock_hit` rows with `d` ≈ rock radius; sustained fire at a rock field
-   shows no cull-set growth.
+   shows no cull-set growth. — PENDING (in-person playtest; the automated
+   coverage below pins the trigger's behavior).
+
+**Verification (2026-10-21):**
+- `test_18_rock_hits.py` — ALL 7 GATES PASS:
+  - HELPER: `_seg_circle_entry` entry point on the boundary (|p - c| == r),
+    clean miss, start-inside returns p0, degenerate segment point-tests
+    (in + out).
+  - R_EST: known vert set (radii {10, 20}) -> 15.0; a real
+    `Asteroid._make_rock` output -> R_est within [0.72R, 1.25R] of the
+    true R.
+  - E2E BULLET: ghost bullet aimed at a wire rock (push_snapshot x3) ->
+    burst(14) at the circle entry point (|impact - center| == R_est within
+    1 px) + the bullet culled (gone from local_bullets).
+  - E2E BUFFER BULLET: a buffer-drawn local bullet (id not in the ghost's
+    local list) crossing the rock -> burst + cull (the buffer copy stops
+    at the rock too).
+  - MISS: a bullet through the gap beside the rock (y = +60, clear of
+    R_est ~ 26) -> no burst, no cull, still drawn.
+  - MISSILE: a ghost missile on a rock course -> burst + removed from
+    local_missiles (no lingering fog light) + mid in `_hit_fx_cull_mids`.
+  - TTL: cull entries older than BULLET_LIFE / MISSILE_LIFE are pruned,
+    fresh ones kept (the sets are bounded).
+- Required suite green (same set as Session 1): `test_10_7_bullet_dedup`,
+  `test_14_2_ghost_lockstep`, `test_14_3_missile_lockstep`,
+  `test_10_3b_ghost_missiles`, `test_determinism`, `test_snapshot`,
+  `test_net_process`, `test_render_model`, `test_17_rock_shapes`, plus the
+  full 10.x/15.x client-path set (`test_15_2..15_4`, `test_10_13`,
+  `test_10_4`, `test_10_6`, `test_10_12`, `test_10_10`, `test_10_5`,
+  `test_10_2`, `test_10_2b`, `test_10_1`, `test_10_3c`, `test_10_3d`) —
+  all PASS (test_15_1 is obsolete/SKIP by design).
+- Docs: ARCHITECTURE.md ("Ghost presentation entities & handoff" — new
+  "Client hit FX (option-A trigger, plan_18)" bullet) + PERFORMANCE.md
+  ("Client hit FX (plan_18) — no bandwidth change" — per-frame cost note).
 
 ## 4. What is NOT changing (scope boundary)
 

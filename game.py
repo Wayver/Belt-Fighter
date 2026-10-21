@@ -53,7 +53,7 @@ from .config import (INTERP_DELAY, SNAPSHOT_INTERVAL, ROCK_FILL, ROCK_EDGE,
                     ENEMY_FILL, ENEMY_EDGE, ENEMY_FLAME,
                     SHIP_COLOR, SHIP_EDGE,
                     MISSILE_HANDOFF_DECAY, MISSILE_HANDOFF_OFFSET_EPS,
-                    MISSILE_HANDOFF_MAX_SHRINK)
+                    MISSILE_HANDOFF_MAX_SHRINK, MISSILE_LIFE)
 
 STEP = 1 / 60   # fixed simulation timestep
 
@@ -340,6 +340,47 @@ def _seg_circle_hit(p0x, p0y, p1x, p1y, cx, cy, r):
     ex = hx - cx
     ey = hy - cy
     return (ex * ex + ey * ey <= r * r, hx, hy)
+
+
+def _seg_circle_entry(x0, y0, x1, y1, cx, cy, r):
+    """First intersection of segment (p0 -> p1) with circle (cx, cy, r).
+
+    Returns (hit, hx, hy): the ENTRY point on the circle boundary (the
+    first crossing along the segment), or (False, None, None) on a miss.
+    A segment that STARTS inside the circle returns (True, p0) (the
+    impact is where the projectile already is).
+
+    Unlike `_seg_circle_hit` (the CLOSEST point on the segment to the
+    center — right for ships, where the segment ends at the hull), this
+    is for ROCKS: a bullet through a rock's center must spark on the
+    near surface, not at the center. The test region is the host's
+    collision CIRCLE (the host's bullet/missile-vs-rock test is
+    `dist < collision_radius` — a circle, not the drawn polygon, which
+    is non-convex), so the client's cull decision matches the host's
+    hit decision. Pure math — no pygame, trivially testable.
+    """
+    dx = x1 - x0
+    dy = y1 - y0
+    fx = x0 - cx
+    fy = y0 - cy
+    a = dx * dx + dy * dy
+    if a < 1e-9:
+        # Degenerate segment (the projectile did not move this frame):
+        # a plain point test; the impact is the point itself.
+        d2 = fx * fx + fy * fy
+        return (d2 <= r * r, x0, y0)
+    b = fx * dx + fy * dy
+    c = fx * fx + fy * fy - r * r
+    if c <= 0.0:
+        # p0 is inside (or on) the circle: the entry is p0.
+        return (True, x0, y0)
+    disc = b * b - a * c
+    if disc < 0.0:
+        return (False, None, None)
+    t = (-b - math.sqrt(disc)) / a     # smaller root = first crossing
+    if t < 0.0 or t > 1.0:
+        return (False, None, None)
+    return (True, x0 + t * dx, y0 + t * dy)
 
 
 # --- model-driven LOCAL-SHIP render helpers -------------------------------
@@ -731,6 +772,17 @@ class Game:
         # verts). Inert on the host (it draws from its own Asteroid
         # objects).
         self.rock_shapes = {}
+        # Rock collision-radius registry (plan_18, client only): rock id ->
+        # R_est, the rock's collision CIRCLE radius derived from its wire
+        # verts, (max|v| + min|v|) / 2 (the vertex radii are R x U(0.72,
+        # 1.25), so the mid-range is a robust R estimate, ~+/-3%). The
+        # host's bullet/missile-vs-rock test is a circle
+        # (dist < collision_radius), so the client's option-A trigger uses
+        # the same circle instead of the drawn polygon (which is
+        # non-convex — the convex-poly helpers must not be used on raw
+        # verts). Populated in push_snapshot alongside rock_shapes;
+        # cleared on reset. Inert on the host.
+        self._rock_coll_r = {}
         # Local-ship prediction ghost; local_index is its own-bullet bookkeeping.
         self.ghost = PredictedShip(local_index=local_index)
         # Per-tag enemy-hull stand-ins for the remote render (client only,
@@ -801,6 +853,14 @@ class Game:
         # than the delay gap) so the set cannot grow unbounded. The draw
         # loops skip any bid in this dict.
         self._hit_fx_cull_bids = {}
+        # mids (missile ids) already visually hit a ROCK -> wall time of the
+        # hit (plan_18). Same persistent-cull rationale as
+        # _hit_fx_cull_bids: the buffer's copy of a missile stays alive
+        # until the host's authoritative detonation, which arrives with a
+        # snapshot AFTER the visual hit. TTL-pruned at MISSILE_LIFE (far
+        # longer than the delay gap) so the set cannot grow unbounded. The
+        # ghost-missile draw loop skips any mid in this dict.
+        self._hit_fx_cull_mids = {}
         # Per-tag LOCAL shield glow (tag -> (dump, clock)): when the
         # option-A trigger fires a shield hit, the client flashes the
         # stand-in's shield in the SAME frame as the particle burst
@@ -952,6 +1012,7 @@ class Game:
         # (its RockShapeTracker is per-connection), so the stale registry
         # entries are simply overwritten — clear anyway to bound memory.
         self.rock_shapes.clear()
+        self._rock_coll_r.clear()   # plan_18: R estimates are stale too
         self.game_over = False
         self.protect_timer = SPAWN_PROTECT
         self.acc = 0.0
@@ -2368,6 +2429,15 @@ class Game:
             verts = a[-1]
             if verts is not None:
                 self.rock_shapes[a[0]] = [tuple(v) for v in verts]
+                # plan_18: derive the rock's collision CIRCLE radius from
+                # the verts (the host's wire prunes size/radius). The
+                # vertex radii are R x U(0.72, 1.25), so the mid-range
+                # (max + min) / 2 is a robust R estimate (~+/-3% — small
+                # enough that the residual client/host boundary
+                # disagreement is a few px, the same tolerance class as
+                # the ship/enemy passes).
+                _rr = [math.hypot(v[0], v[1]) for v in verts]
+                self._rock_coll_r[a[0]] = (max(_rr) + min(_rr)) / 2.0
         local_s = snap[0][self.local_index]
         if not self.ghost.seeded:
             # Pass the snapshot's sim time so the ghost's physics clock
@@ -2965,12 +3035,36 @@ class Game:
             _hit_fx_enemies.append(
                 (_tag, x, y, ang, _cr, _s_up, _oval, es_charge, _has_comp,
                  eid))
+        # ROCKS (plan_18): the host's bullet/missile-vs-rock test is a
+        # CIRCLE (dist < collision_radius), so the trigger tests the same
+        # circle — NOT the drawn polygon (non-convex; the convex-poly
+        # helpers must not be used on raw verts). R is derived from the
+        # wire verts (push_snapshot's _rock_coll_r, (max|v|+min|v|)/2).
+        # The impact point is the circle ENTRY point (_seg_circle_entry),
+        # so the spark lands on the rock's near surface, not its center.
+        # No viewport cull (the host doesn't cull; the test is a cheap
+        # quadratic). Rocks with no registered R (a registry miss —
+        # should be impossible) are skipped.
+        _hit_fx_rocks = []
+        for (aid, x, y, _ang) in pos['asteroids']:
+            _rr = self._rock_coll_r.get(aid)
+            if _rr is not None:
+                _hit_fx_rocks.append((aid, x, y, _rr))
+        # Missile cull TTL prune (plan_18): same rationale as the bullet
+        # cull above — the buffer's copy of a missile stays alive until
+        # the host's authoritative detonation, which arrives with a
+        # snapshot AFTER the visual hit. TTL bounds the set's growth.
+        _hit_fx_cull_mids = self._hit_fx_cull_mids
+        for _mid in [m for m, t in _hit_fx_cull_mids.items()
+                     if _hit_fx_now - t > MISSILE_LIFE]:
+            del _hit_fx_cull_mids[_mid]
         # Swept segment-circle test: the bullet's per-frame segment
         # (prev -> present) vs the target's drawn hull radius. Swept (not
         # a point test) so a fast bullet cannot tunnel through between
         # frames. Ships first (the other player), then AI enemies.
         _hf_min_ship = None    # (dist, radius, label) closest remote ship
         _hf_min_enemy = None   # (dist, radius, label) closest AI enemy
+        _hf_min_rock = None    # (dist, radius, label) closest rock
         # Telemetry: min distance from a bullet's DRAWN position (the
         # segment endpoint x1,y1) to an enemy center, per frame. If the
         # drawn bullet visually passes the enemy but the swept segment
@@ -3114,11 +3208,60 @@ class Game:
                                    oval_a=_oval[0], oval_b=_oval[1],
                                    hull_r=er)
                     break
+            # ROCKS (plan_18): after ships + enemies (the host's
+            # _collisions order is enemies-then-rocks; a bullet is
+            # consumed by the first hit). The host's rock test is a
+            # circle, so the client tests the same circle (R derived
+            # from the wire verts) and sparks at the ENTRY point (the
+            # near surface, not the center). Mirrors the host's
+            # surviving rock hit: burst + small_explosion SFX.
+            if bid in _hit_fx_cull:
+                continue
+            for (rid, rx, ry, rr) in _hit_fx_rocks:
+                _d = _hftel.seg_point_dist(x0, y0, x1, y1, rx, ry)
+                if _hf_min_rock is None or _d < _hf_min_rock[0]:
+                    _hf_min_rock = (_d, rr, rid)
+                hit, hx, hy = _seg_circle_entry(x0, y0, x1, y1, rx, ry, rr)
+                if hit:
+                    _hit_fx_cull[bid] = _hit_fx_now
+                    burst(self._hit_fx, pygame.Vector2(hx, hy), 20,
+                          rng=random)
+                    self._sfx("small_explosion")
+                    _hftel.log_hit(bid, _src, "rock:%d" % rid, hx, hy, _d)
+                    break
+        # Ghost missiles vs rocks (plan_18): the ghost's local_missiles
+        # (prev -> present segment) vs the same rock circles. The host
+        # detonates a missile on a rock (burst + small_explosion); the
+        # client mirrors that and culls the ghost missile so it stops at
+        # the rock instead of flying through. The buffer's copy is
+        # culled too (the buffer-draw loop + fog lights check
+        # _hit_fx_cull_mids) until the host's authoritative detonation
+        # arrives with a snapshot.
+        for m in self.ghost.local_missiles:
+            if m.id is None or tuple(m.id) in _hit_fx_cull_mids:
+                continue
+            for (rid, rx, ry, rr) in _hit_fx_rocks:
+                hit, hx, hy = _seg_circle_entry(
+                    m.prev_pos.x, m.prev_pos.y, m.pos.x, m.pos.y,
+                    rx, ry, rr)
+                if hit:
+                    _hit_fx_cull_mids[tuple(m.id)] = _hit_fx_now
+                    burst(self._hit_fx, pygame.Vector2(hx, hy), 20,
+                          rng=random)
+                    self._sfx("small_explosion")
+                    _hftel.log_hit(tuple(m.id), 'ghost',
+                                   "rock:%d" % rid, hx, hy,
+                                   _hftel.seg_point_dist(
+                                       m.prev_pos.x, m.prev_pos.y,
+                                       m.pos.x, m.pos.y, rx, ry))
+                    break
         _hftel.log_frame(_hf_n_ghost, _hf_n_buf,
                          len(_hit_fx_ships), len(_hit_fx_enemies),
                          _hf_min_ship, _hf_min_enemy,
                          len(_hit_fx_cull), _bdelay, _bdpull,
-                         mindrawn=_hf_mindrawn)
+                         mindrawn=_hf_mindrawn,
+                         n_rocks=len(_hit_fx_rocks),
+                         min_rock=_hf_min_rock)
         # TELEMETRY: the DEDUP ground truth — which buffer projectiles were
         # DRAWN vs SKIPPED this frame, against the ghost's in-flight ids.
         # log_dedup writes a row only when the triple CHANGES, so a
@@ -3199,6 +3342,11 @@ class Game:
                                   self.ghost.ship.vel.y))
             if kind == 'missile' and mid is not None:
                 _mid_t = tuple(mid)
+                if _mid_t in _hit_fx_cull_mids:
+                    continue   # visually hit a rock (plan_18) — culled
+                    # (not drawn past the rock; the spark is drawn
+                    # instead, mirroring the host which removes the
+                    # missile on the detonation tick).
                 _buf_drawn.append(_mid_t)
                 # Apply the decoupled render offset. On the FIRST
                 # frame the buffer's copy is drawn, compute the offset
@@ -3365,9 +3513,23 @@ class Game:
         # copy of each of these is SKIPPED above (dedup by id), so the
         # same missile never appears twice. Presentation only.
         for m in self.ghost.local_missiles:
+            # HIT FX (plan_18): a missile that visually hit a rock this
+            # frame is culled — not drawn (the spark is drawn instead,
+            # mirroring the host which removes the missile on the
+            # detonation tick).
+            if m.id is not None and tuple(m.id) in _hit_fx_cull_mids:
+                continue
             _draw_world_missile(screen, self.cam,
                                 (m.pos.x, m.pos.y),
                                 (m.vel.x, m.vel.y), m.boost, m.life)
+        # HIT FX (plan_18): remove the culled missiles from
+        # local_missiles NOW (before the fog light loop below) so they
+        # get no lingering glow and the dedup/handoff bookkeeping sees
+        # them gone (the same pattern as the bullet cull above).
+        if _hit_fx_cull_mids:
+            self.ghost.local_missiles = [
+                m for m in self.ghost.local_missiles
+                if m.id is None or tuple(m.id) not in _hit_fx_cull_mids]
 
         # Targeting reticle: the client has no enemy list
         # to target (it never runs the sim), so run the SAME lead math
@@ -3392,7 +3554,8 @@ class Game:
                                  handoff_offsets=self._missile_handoff_offsets,
                                  local_bullet_ids=local_bullet_ids,
                                  pull=_bdpull,
-                                 local_index=self.local_index)
+                                 local_index=self.local_index,
+                                 local_missile_cull=_hit_fx_cull_mids)
         # The player's OWN gun shots glow too — mirrors the
         # host's _build_lights, which adds a LightSource per player bullet.
         # At the PRESENT (b.pos), the SAME position as the sprite (the
@@ -3591,7 +3754,7 @@ class Game:
 
     def _remote_fog_lights(self, pos, local_ship, local_missile_ids=(),
                        handoff_offsets=None, local_bullet_ids=(),
-                       pull=0.0, local_index=0):
+                       pull=0.0, local_index=0, local_missile_cull=()):
         """LightSources for the client's fog of war (
         predicted_view previously skipped draw_fog entirely, so fire did
         not glow through the dark like on the host). Mirrors
@@ -3632,6 +3795,9 @@ class Game:
             if kind == 'missile' and mid is not None \
                     and tuple(mid) in local_missile_ids:
                 continue   # glows from the ghost's predicted pos instead
+            if kind == 'missile' and mid is not None \
+                    and tuple(mid) in local_missile_cull:
+                continue   # visually hit a rock (plan_18) — no glow
             # The ghost's OWN gun shots — same skip as missiles. A bullet the
             # ghost is still drawing is skipped (it glows from the ghost's
             # predicted pos); a LOCAL bullet the ghost has handed off is

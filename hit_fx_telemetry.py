@@ -29,6 +29,9 @@ Key columns (FRAME):
   n_buf       buffer local bullets tested (pulled to the present)
   n_ships     remote PLAYER ships in the target list (alive, non-local)
   n_enemies   AI enemies in the buffer (NOT tested by the trigger)
+  n_rocks     rocks in the target list (plan_18: the trigger's third
+              target class — the host's collision circle, R derived from
+              the wire verts)
   min_d_ship  min segment->center distance to any remote ship ("" if none)
   min_r_ship  that ship's collision radius
   ship_hit    1 if min_d_ship <= min_r_ship (the trigger WOULD fire)
@@ -58,6 +61,8 @@ _COLS = (
     "n_ghost", "n_buf", "n_ships", "n_enemies",
     "min_d_ship", "min_r_ship", "ship_hit",
     "min_d_enemy", "min_r_enemy", "enemy_hit",
+    # FRAME (plan_18: rocks — the trigger's third target class)
+    "n_rocks", "min_d_rock", "min_r_rock", "rock_hit",
     "cull_n", "delay", "D",
     # FRAME (15.3: drawn-position distance — the segment/draw mismatch
     # signal). min_ddrawn = min distance from a bullet's DRAWN position
@@ -140,7 +145,7 @@ def seg_point_dist(x0, y0, x1, y1, cx, cy):
 
 def log_frame(n_ghost, n_buf, n_ships, n_enemies,
               min_ship, min_enemy, cull_n, delay, D,
-              mindrawn=None):
+              mindrawn=None, n_rocks=0, min_rock=None):
     """Log one frame's trigger inputs + closest-approach geometry.
 
     `min_ship` / `min_enemy` are (dist, radius, label) tuples for the
@@ -149,17 +154,21 @@ def log_frame(n_ghost, n_buf, n_ships, n_enemies,
     written, the counts + distances are the diagnostic). `mindrawn` is a
     (dist, src, label) tuple: the min distance from a bullet's DRAWN
     position (the trigger segment's endpoint) to an enemy center — the
-    segment/draw mismatch signal (15.3). No-op when disabled.
+    segment/draw mismatch signal (15.3). `n_rocks` / `min_rock` (plan_18)
+    are the rock target list's size + closest-approach (same shape as the
+    ship/enemy columns). No-op when disabled.
     """
     if not _enabled or _f is None:
         return
     # Only log frames that have something to diagnose: a local bullet in
     # flight, or a target present. (A frame with neither is pure noise.)
-    if (n_ghost + n_buf) == 0 and (n_ships + n_enemies) == 0:
+    if (n_ghost + n_buf) == 0 and (n_ships + n_enemies + n_rocks) == 0:
         return
     ms_d, ms_r, _ = (min_ship if min_ship is not None
                      else (None, None, None))
     me_d, me_r, _ = (min_enemy if min_enemy is not None
+                     else (None, None, None))
+    mr_d, mr_r, _ = (min_rock if min_rock is not None
                      else (None, None, None))
     md_d, md_src, _ = (mindrawn if mindrawn is not None
                        else (None, None, None))
@@ -178,6 +187,11 @@ def log_frame(n_ghost, n_buf, n_ships, n_enemies,
     row["min_r_enemy"] = _fmt(me_r)
     row["enemy_hit"] = ("" if me_d is None or me_r is None
                         else str(1 if me_d <= me_r else 0))
+    row["n_rocks"] = str(n_rocks)
+    row["min_d_rock"] = _fmt(mr_d)
+    row["min_r_rock"] = _fmt(mr_r)
+    row["rock_hit"] = ("" if mr_d is None or mr_r is None
+                       else str(1 if mr_d <= mr_r else 0))
     row["cull_n"] = str(cull_n)
     row["delay"] = _fmt(delay)
     row["D"] = _fmt(D)

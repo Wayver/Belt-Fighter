@@ -1,7 +1,8 @@
 # Plan 19 — 2P Player-vs-Player Combat (team-based targeting, damage, lock-on, hit FX)
 
-**Status:** Session 3 DONE (T_BEAM `target` wire). Next: Session 4
-(client-side hit FX + tests + docs). Session 3 landed: the T_BEAM wire
+**Status:** Session 3 DONE (commit 1bfbddf, T_BEAM `target` wire). Next:
+Session 4 (client-side hit FX + tests + docs). Session 3 landed: the
+T_BEAM wire
 message gains a `target` field (None / int enemy ship id / "p<i>"
 player) — host `_emit_beam_event` sets it from the resolved target (the
 3 call sites: enemy -> e.ship.id, other player -> "p<i>", rock -> None),

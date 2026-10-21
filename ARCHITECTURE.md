@@ -83,8 +83,16 @@ re-explaining. History (why a rule changed) lives in git, not here.
   types: join, welcome, input (carries `tag`), snap, respawn, beam,
   echo, pong (see net.py for shapes).
 - The snapshot is an 11-tuple (game.py `Game.snapshot`); PRUNED on the
-  wire: asteroids -> `[id, x, y]` (1-decimal), rng state -> None
-  placeholder. ~6.4 KB/snapshot, ~370 KB/s at 60 Hz.
+  wire: asteroids -> `[id, x, y, angle, verts]` (x/y 1-decimal, angle
+  3-decimal, `verts` DELTA-COMPRESSED — the rock's 10-vertex shape is sent
+  full-precision the FIRST time its id appears and `None` afterwards, driven
+  by a per-connection `RockShapeTracker` in the send path; the client keeps
+  a persistent id->verts registry, `Game.rock_shapes`, populated in
+  `push_snapshot`), rng state -> None placeholder. ~6.9 KB/snapshot steady
+  state (one angle float per rock over the old `[id, x, y]` form), ~415 KB/s
+  at 60 Hz; a NEW rock (a spawn/split child) costs one extra ~411 B of verts
+  (spawns are capped at 4/tick, splits rare — amortized ~1-2 KB/s). See
+  plan_17_client_rock_shapes.md.
 - The socket I/O + JSON run on the NetWorker daemon thread; the main
   thread only queues/polls it. The worker owns the Connection after
   start(). The host's input sink + pong reflection run on the worker

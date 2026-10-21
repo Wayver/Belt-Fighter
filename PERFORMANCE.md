@@ -32,6 +32,18 @@ machine, and the one that does the software blending) is the one that
 actually feels the fog cost — expect its draw() to be a meaningful multiple
 of the 4.25 ms above.
 
+**Wire note (plan_17, client rock shapes):** the wire rock entry grew from
+`[id, x, y]` to `[id, x, y, angle, verts]`. Steady state adds one angle
+float per rock (~+0.5 KB/snapshot at ~85 rocks — the wire row above was
+measured before this change; expect ~7.9 KB/snap, ~475 KB/s). The rock's
+10-vertex `verts` (~411 B) are DELTA-COMPRESSED: sent full-precision only
+the FIRST time a rock id appears (a spawn/split child), `None` afterwards
+(a per-connection `RockShapeTracker` in the send path). Spawns are capped at
+4/tick and splits are rare, so the verts cost amortizes to ~1-2 KB/s. The
+client keeps a persistent id->verts registry (`Game.rock_shapes`) so a rock's
+shape survives across snapshots — no steady-state growth (the F3 snap-size
+log confirms it). See plan_17_client_rock_shapes.md.
+
 ## The fog breakdown (the 3.05 ms)
 
 - **Final full-res SRCALPHA `screen.blit`: 1.16–1.33 ms** — the single

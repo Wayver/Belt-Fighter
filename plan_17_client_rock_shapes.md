@@ -1,6 +1,6 @@
 # Plan 17 — Client-Side Asteroid Polygons (2P: draw real rocks, not circles)
 
-**Status:** Session 1 (wire + buffer) DONE + VERIFIED. Session 2 (render + tests) pending.
+**Status:** Session 1 (wire + buffer) DONE + VERIFIED. Session 2 (tests + docs) DONE + VERIFIED (2026-09-21).
 **Scope:** the CLIENT's rendering of asteroids in 2P. The authoritative sim,
 the ghost, the reconcile, and the host's render path are untouched. This is
 wire + interpolation-buffer + presentation: it changes WHAT the client
@@ -145,21 +145,37 @@ Pre-existing failures (verified by stashing the changes): test_10_3a
 (beam-origin re-anchor), test_10_9 (ghost lerp/advance), test_network
 (`__main__.Host` import) — all unrelated to this work.
 
-### Session 2 — tests + docs (pending)
+### Session 2 — tests + docs (DONE + VERIFIED 2026-09-21)
 
-7. **New test** (`test_17_rock_shapes.py`):
-   - wire: first snapshot carries verts, second carries None; ids never
-     re-sent; reset re-sends.
-   - interp: angle lerps across the window (incl. a wrap case); x/y
-     behavior identical to today.
-   - pixel parity: one static rock (vel=0, spin=0), locked camera at the
-     same world point — host frame vs client frame pixel diff == 0
-     (same method as test_viewport_culling's pixel-diff harness).
-8. **Docs**: ARCHITECTURE.md wire line (L86: `[id, x, y]` -> new shape),
-   PERFORMANCE.md bandwidth note.
-9. **Manual 2P check**: client sees spinning polygons matching the host;
-   split children pop in with correct shapes; F3 snap-size log shows no
-   steady-state growth.
+7. **New test** (`test_17_rock_shapes.py`) — DONE, 12 checks, exit 0:
+   - wire: first snapshot carries verts, second carries None; a fresh id
+     (split child) carries full verts alongside the None repeat; reset
+     re-sends; the pruned snapshot survives a real JSON round-trip (11-tuple
+     intact, rng slot None). A REAL `Game.snapshot()` is used (not a fake).
+   - interp: angle lerps across the window — a plain case (0.0->1.0, exact
+     endpoints) and a WRAP case (3.0->-3.0 takes the short way to ~pi, not
+     the long way to ~-2.5); plus a format-tolerance check that the SIM
+     9-tuple and WIRE 5-tuple forms interpolate to the same (id, x, y, angle).
+   - pixel parity: one static rock (vel=0, spin=0), locked camera — the
+     client's `_draw_remote_rock` draws it PIXEL-IDENTICALLY to the host's
+     `_draw_world_asteroid` (0 bytes differ on a clean screen).
+     **Deviation from the draft:** a full-frame host-vs-client diff is NOT
+     used — the fog of war is applied in both `draw()` and `predicted_view()`
+     with peer-specific light sources (host lights from its live ship, client
+     from its ghost), so a full frame differs in the fog/ship/HUD regions
+     regardless of the rock. The rock is what this plan changes, so the rock's
+     pixels are the parity subject (the shared `_draw_world_asteroid` helper
+     makes parity by construction; the test makes it concrete). A registry-miss
+     fallback check (verts=None -> coarse circle, no crash) and an end-to-end
+     `push_snapshot` seam check (wire snap -> `rock_shapes` populated with the
+     exact verts; a repeat None snap does not clobber) round it out.
+8. **Docs** — DONE: ARCHITECTURE.md wire line (L86: `[id, x, y]` ->
+   `[id, x, y, angle, verts]` + delta-compression + registry), PERFORMANCE.md
+   bandwidth note (steady-state +0.5 KB/snap for the angle; verts amortize to
+   ~1-2 KB/s; no steady-state growth).
+9. **Manual 2P check** — PENDING (playtesting): client sees spinning polygons
+   matching the host; split children pop in with correct shapes; F3 snap-size
+   log shows no steady-state growth.
 
 ## 4. Deferred follow-up (separate session, agreed 2026-07)
 

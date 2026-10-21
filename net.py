@@ -30,10 +30,12 @@ Pinned decisions (see the pinned plan note — do NOT re-derive):
   * The snapshot is PRUNED on the wire: the remote peer is a
     presentation peer (it never runs the sim / never calls apply_snapshot),
     so `serialize_snapshot` sends only what the interpolation buffer + the
-    prediction ghost read — asteroids as `[id, x, y]` (1-decimal) and the
-    rng state as a `None` placeholder. `deserialize_snapshot` is a
-    passthrough. The host keeps the full snapshot in its sim; this is a
-    send-side serialization only.
+    prediction ghost read — asteroids as `[id, x, y, angle, verts]`
+    (x/y 1-dec, angle 3-dec, verts delta-compressed via a RockShapeTracker:
+    full on first sight of an id, None afterwards) and the rng state as a
+    `None` placeholder. `deserialize_snapshot` is a passthrough. The host
+    keeps the full snapshot in its sim; this is a send-side serialization
+    only.
   * Stream integrity: the send side sends frames in PARTS and
     keeps only the UNSENT remainder when the buffer fills (re-sending a
     partially-sent frame would duplicate bytes and corrupt the stream —
@@ -64,7 +66,7 @@ from .hulls import (PLAYER_HULLS, COMPONENT_CATALOG, DEFAULT_HULL,
 __all__ = [
     "encode_frame", "extract_frames",
     "serialize_input", "deserialize_input",
-    "serialize_snapshot", "deserialize_snapshot",
+    "serialize_snapshot", "deserialize_snapshot", "RockShapeTracker",
     "serialize_hull", "deserialize_hull",
     "serialize_loadout", "deserialize_loadout",
     "Connection", "Host", "connect",
@@ -239,7 +241,41 @@ def deserialize_input(d):
     return ShipInput(**d)
 
 
-def serialize_snapshot(snap):
+class RockShapeTracker:
+    """Tracks which rock ids' shapes have already been sent to a client.
+
+    The wire DELTA-COMPRESSES rock shapes (plan_17): a rock's `verts` are
+    sent only the FIRST time its id appears on the stream, then `None` on
+    every later snapshot. This is exact because a rock's shape is immutable
+    for its lifetime (`Asteroid._make_rock` runs once in `__init__`) and
+    split children get FRESH ids (so a child reads as "new" and carries its
+    own verts). The client keeps a persistent id -> verts registry
+    (`Game.rock_shapes`) so a rock's shape survives across snapshots.
+
+    One tracker per connection (a reconnecting client starts fresh), owned
+    by the send path (the NetWorker thread or the net process). Cleared on
+    a full game reset: ids restart at 1 on a new run, and the host then
+    re-sends full verts (the client's registry is overwritten).
+    """
+    def __init__(self):
+        self._sent = set()
+
+    def take(self, rock_id):
+        """Return True if this rock's verts should be sent NOW (the first
+        time we've seen the id), and record it. False if already sent."""
+        if rock_id in self._sent:
+            return False
+        self._sent.add(rock_id)
+        return True
+
+    def reset(self):
+        self._sent.clear()
+
+    def __len__(self):
+        return len(self._sent)
+
+
+def serialize_snapshot(snap, tracker=None):
     """Game.snapshot() tuple -> the PRUNED wire structure.
 
     The remote peer is a PRESENTATION peer: it never runs the sim and never
@@ -247,16 +283,28 @@ def serialize_snapshot(snap):
     (`netcode.interp_positions`) and the local-ship prediction ghost. So the
     wire carries only what those two actually read, and nothing else:
 
-      * ASTEROIDS (index 5) are pruned to `[id, x, y]` with x/y rounded to
-        1 decimal. `interp_positions` reads only `a_s[0]` (id), `a_s[1]` (x)
-        and `a_s[2]` (y) — the client draws a fixed-size circle and never
-        uses vel/size/angle/spin/verts. This is the bulk of the payload:
-        ~545 B/rock -> ~23 B/rock (the rock's verts alone were ~411 B).
+      * ASTEROIDS (index 5) are pruned to `[id, x, y, angle, verts]`:
+        - id (int) — stable identity for interpolation matching.
+        - x, y — rounded to 1 decimal (the client's render point).
+        - angle — rounded to 3 decimals (the client lerps it with
+          lerp_angle; 0.001 rad is ~0.03 deg, far below a rock's spin).
+        - verts — the rock's 10-vertex shape, sent FULL-PRECISION the first
+          time the id appears and `None` afterwards (delta compression via
+          `tracker`). The client draws the real polygon from these
+          (plan_17) instead of a fixed-size circle.
+        A NEW rock costs ~300 B (the verts); a REPEATED rock costs ~30 B
+        (just id/x/y/angle). The old `[id, x, y]` form was ~23 B/rock but
+        forced the client to draw a coarse circle.
       * RNG STATE (index 6) is replaced with a `None` placeholder. The
         client never restores the sim's rng (it has no sim to restore), so
         the ~7.3 KB Mersenne-Twister state is dropped entirely. The slot is
         kept (as None) so the 11-tuple shape is unchanged and
         `interp_positions`'s index reads are untouched.
+
+    `tracker` (a `RockShapeTracker`, optional) drives the verts delta
+    compression. When None (self-test / single-shot), every rock carries
+    full verts — correct, just not bandwidth-optimal. The production send
+    paths (NetWorker, net process) pass a per-connection tracker.
 
     Everything else (players, enemies, bullets, enemy_bullets, missiles,
     game_over, protect_timer, the two id counters) is passed through —
@@ -270,10 +318,21 @@ def serialize_snapshot(snap):
     state. `deserialize_snapshot` is the (now trivial) inverse.
     """
     s = list(snap)
-    # Prune each rock to [id, x, y] (1-decimal). id stays an int (stable
-    # identity for interpolation matching); x/y are the only fields the
-    # client's render reads.
-    s[5] = [[a[0], round(a[1], 1), round(a[2], 1)] for a in snap[5]]
+    # Prune each rock to [id, x, y, angle, verts]. id stays an int (stable
+    # identity for interpolation matching); x/y are the client's render
+    # point (1-dec); angle is lerp'd on the client (3-dec); verts are the
+    # real rock shape (full precision, delta-compressed via the tracker).
+    rocks = []
+    for a in snap[5]:
+        # a = (id, x, y, vx, vy, size, angle, spin, verts)
+        rid = a[0]
+        if tracker is None or tracker.take(rid):
+            verts = tuple((vx, vy) for (vx, vy) in a[8])
+        else:
+            verts = None
+        rocks.append([rid, round(a[1], 1), round(a[2], 1),
+                      round(a[6], 3), verts])
+    s[5] = rocks
     # Drop the rng state (the client never restores it) — keep the slot.
     s[6] = None
     return s
@@ -286,9 +345,11 @@ def deserialize_snapshot(snap):
     After `json.loads` every tuple is a list — that is fine for everything
     the client reads (unpacking/indexing work identically on lists, and
     `interp_positions` never type-checks). The asteroids are already in the
-    pruned `[id, x, y]` form from `serialize_snapshot`, and the rng slot is
-    the `None` placeholder — neither needs a reverse conversion, so this is
-    a passthrough (the client no longer receives an rng state).
+    pruned `[id, x, y, angle, verts]` form from `serialize_snapshot` (verts
+    a list of [vx, vy] pairs, or None for a rock whose shape was already
+    sent), and the rng slot is the `None` placeholder — neither needs a
+    reverse conversion, so this is a passthrough (the client no longer
+    receives an rng state).
     """
     return snap
 
@@ -703,6 +764,11 @@ class NetWorker:
         # hiccup can't drop a snapshot — it just holds it; the drain-to-
         # newest drops the stale ones so a backlog never bursts out.
         self._snap_queue = queue.Queue()
+        # The host's rock-shape tracker (plan_17): drives the verts
+        # delta-compression in serialize_snapshot. One per connection (a
+        # reconnecting client starts fresh); owned by the worker thread
+        # (the only thread that calls serialize_snapshot).
+        self._rock_tracker = RockShapeTracker()
         # The host's client-input sink — a callable the worker thread invokes the
         # moment a T_INPUT lands (see set_input_sink). None for the
         # client's worker and the tests (the input is just queued).
@@ -857,7 +923,8 @@ class NetWorker:
                     if latest is not None:
                         sim_time, snap = latest
                         conn.send({"type": T_SNAP, "sim_time": sim_time,
-                                   "snap": serialize_snapshot(snap)})
+                                   "snap": serialize_snapshot(
+                                       snap, self._rock_tracker)})
             except OSError:
                 # The socket went away out from under us (a stray close, or
                 # the peer reset in a way recv surfaces as OSError rather
@@ -1116,43 +1183,88 @@ def _self_test():
         g.update(STEP, _Keys())
     snap = g.snapshot()
 
-    # The wire form: a real JSON round-trip of the pruned snapshot.
-    as_json = json.loads(json.dumps(serialize_snapshot(snap)))
+    # The wire form: a real JSON round-trip of the pruned snapshot. Use a
+    # RockShapeTracker so the first snapshot carries full verts (the
+    # production path — the worker owns a per-connection tracker).
+    tracker = RockShapeTracker()
+    as_json = json.loads(json.dumps(serialize_snapshot(snap, tracker)))
     d = deserialize_snapshot(as_json)
 
     # (a) The 11-tuple shape is preserved and the rng slot is the None
     # placeholder (the client never restores the sim's rng).
     shape_ok = (len(d) == 11 and d[6] is None)
-    # (b) Every rock is pruned to [id, x, y]: 3 elements, id an int, x/y
-    # carrying at most 1 decimal (no long float tails).
+    # (b) Every rock is pruned to [id, x, y, angle, verts]: 5 elements, id
+    # an int, x/y carrying at most 1 decimal, angle at most 3 decimals
+    # (no long float tails), and — first sight of every id — full verts
+    # (a list of 10 [vx, vy] pairs).
     rocks_ok = (len(d[5]) == len(snap[5])
-                and all(len(r) == 3 and isinstance(r[0], int)
+                and all(len(r) == 5 and isinstance(r[0], int)
                         and r[1] == round(r[1], 1) and r[2] == round(r[2], 1)
+                        and r[3] == round(r[3], 3)
+                        and isinstance(r[4], list) and len(r[4]) == 10
                         for r in d[5]))
-    # (c) The pruned x/y are the source rock's x/y to 1 decimal, so the
-    # client's render sits within 0.05 px of the authoritative position.
+    # (c) The pruned x/y/angle are the source rock's to 1/1/3 decimals, so
+    # the client's render sits within 0.05 px / 0.001 rad of the
+    # authoritative pose.
     pos_ok = all(abs(r[1] - a[1]) <= 0.051 and abs(r[2] - a[2]) <= 0.051
+                 and abs(r[3] - a[6]) <= 0.0011
                  for r, a in zip(d[5], snap[5]))
-    if shape_ok and rocks_ok and pos_ok:
-        print("PASS: snapshot wire pruning — %d rocks -> [id,x,y] 1-dec, "
-              "rng dropped, 11-tuple intact" % len(d[5]))
+    # (c2) The first-sight verts are the source rock's verts (full
+    # precision — the client draws the real polygon from these). The
+    # snapshot's verts are already (x, y) tuples (Asteroid.snapshot).
+    verts_ok = all(
+        [(vx, vy) for (vx, vy) in r[4]] ==
+        [(vx, vy) for (vx, vy) in a[8]]
+        for r, a in zip(d[5], snap[5]))
+    if shape_ok and rocks_ok and pos_ok and verts_ok:
+        print("PASS: snapshot wire pruning — %d rocks -> "
+              "[id,x,y,angle,verts] (first-sight full verts), rng dropped, "
+              "11-tuple intact" % len(d[5]))
     else:
         ok = False
-        print("FAIL: snapshot wire pruning -> shape=%s rocks=%s pos=%s"
-              % (shape_ok, rocks_ok, pos_ok))
+        print("FAIL: snapshot wire pruning -> shape=%s rocks=%s pos=%s "
+              "verts=%s" % (shape_ok, rocks_ok, pos_ok, verts_ok))
+
+    # (c3) DELTA COMPRESSION: a second snapshot of the SAME rocks (same
+    # ids) carries verts=None for every rock (the tracker already sent
+    # them). A rock with a FRESH id (a split child) carries full verts.
+    snap2 = list(snap)
+    snap2[5] = tuple(snap[5]) + (
+        (9999, 10.0, 20.0, 0.0, 0.0, 'small', 0.5, 0.0,
+         ((1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0),
+          (0.5, 0.5), (-0.5, 0.5), (-0.5, -0.5), (0.5, -0.5),
+          (0.7, 0.0), (0.0, 0.7))),)
+    d2 = deserialize_snapshot(
+        json.loads(json.dumps(serialize_snapshot(snap2, tracker))))
+    delta_ok = (
+        all(r[4] is None for r in d2[5][:len(snap[5])])
+        and isinstance(d2[5][-1][4], list) and len(d2[5][-1][4]) == 10
+        and d2[5][-1][0] == 9999)
+    if delta_ok:
+        print("PASS: rock-shape delta compression — repeated ids -> "
+              "verts=None, fresh id -> full verts")
+    else:
+        ok = False
+        print("FAIL: rock-shape delta compression -> %s"
+              % [r[4] is None for r in d2[5]])
 
     # (d) The client's REAL consumer accepts the pruned snapshot: feed the
     # pruned snapshot through interp_positions (the same one twice, alpha 0)
-    # and confirm it yields one interpolated rock per wire rock. This is the
+    # and confirm it yields one interpolated rock per wire rock, each a
+    # (id, x, y, angle) 4-tuple matching the wire values. This is the
     # contract the client's render actually relies on.
-    n_rocks = interp_positions(d, d, 0.0, dt=0.0)['asteroids']
-    if len(n_rocks) == len(d[5]):
+    rocks_out = interp_positions(d, d, 0.0, dt=0.0)['asteroids']
+    interp_ok = (len(rocks_out) == len(d[5])
+                 and all((ro[0], ro[1], ro[2], ro[3]) ==
+                         (r[0], r[1], r[2], r[3])
+                         for ro, r in zip(rocks_out, d[5])))
+    if interp_ok:
         print("PASS: interp_positions consumes the pruned wire snapshot "
-              "(%d rocks)" % len(n_rocks))
+              "(%d rocks -> (id,x,y,angle))" % len(rocks_out))
     else:
         ok = False
-        print("FAIL: interp_positions on pruned snapshot -> %d rocks, "
-              "expected %d" % (len(n_rocks), len(d[5])))
+        print("FAIL: interp_positions on pruned snapshot -> %s"
+              % (rocks_out[:2],))
 
     # --- 4. loopback TCP: handshake + one snapshot over a real socket ---
     host = Host(0)                      # OS picks a free ephemeral port
@@ -1189,7 +1301,7 @@ def _self_test():
         hconn.set_nonblocking()
         client.set_nonblocking()
         hconn.send({"type": T_SNAP, "sim_time": g.sim_time,
-                    "snap": serialize_snapshot(snap)})
+                    "snap": serialize_snapshot(snap, tracker)})
         hconn.drain_send()
 
         got = None
@@ -1201,13 +1313,13 @@ def _self_test():
                 break
             time.sleep(0.005)
         if got is not None:
-            d2 = deserialize_snapshot(got["snap"])
+            d3 = deserialize_snapshot(got["snap"])
             # Integrity: the sim_time stamp matches and the wire carried the
             # same rocks (by id) the host snapshotted. (The rng state is no
             # longer on the wire — so the rock ids are the
             # meaningful integrity check.)
             if (got["sim_time"] == g.sim_time
-                    and [r[0] for r in d2[5]] == [a[0] for a in snap[5]]):
+                    and [r[0] for r in d3[5]] == [a[0] for a in snap[5]]):
                 print("PASS: loopback snapshot host->client round-trip")
             else:
                 ok = False

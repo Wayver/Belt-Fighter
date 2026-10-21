@@ -720,6 +720,17 @@ class Game:
         self.sim_time = 0.0
         self._snap_tick = 0        # sim ticks since the last snapshot stamp
         self.snap_buf = SnapshotBuffer()
+        # Rock-shape registry (plan_17, client only): rock id -> verts
+        # ([(vx, vy), ...]). The wire delta-compresses rock shapes — a
+        # rock's verts ride the snapshot only the FIRST time its id
+        # appears (RockShapeTracker on the host), then None — so the
+        # client keeps the shape here, populated in push_snapshot. The
+        # remote render (_draw_remote_rock) looks the shape up by id and
+        # draws the real polygon; a miss (should be impossible) falls back
+        # to a coarse circle. Cleared on reset (a new run re-sends full
+        # verts). Inert on the host (it draws from its own Asteroid
+        # objects).
+        self.rock_shapes = {}
         # Local-ship prediction ghost; local_index is its own-bullet bookkeeping.
         self.ghost = PredictedShip(local_index=local_index)
         # Per-tag enemy-hull stand-ins for the remote render (client only,
@@ -937,6 +948,10 @@ class Game:
         self.particles.clear()
         self.asteroids.clear()
         self.enemies.clear()
+        # A new run restarts rock ids at 1; the host re-sends full verts
+        # (its RockShapeTracker is per-connection), so the stale registry
+        # entries are simply overwritten — clear anyway to bound memory.
+        self.rock_shapes.clear()
         self.game_over = False
         self.protect_timer = SPAWN_PROTECT
         self.acc = 0.0
@@ -2277,11 +2292,14 @@ class Game:
             # remote entities (the caller may show a waiting state).
             return None
 
-        # Asteroids: fill + edge polygon at the interpolated center (the shape
-        # and spin come from the latest snapshot; only the center is
-        # interpolated).
-        for (x, y) in pos['asteroids']:
-            self._draw_remote_rock(screen, x, y)
+        # Asteroids: the real rock polygon at the interpolated (x, y, angle) —
+        # the shape (verts) is looked up in the rock-shape registry by id
+        # (plan_17; the wire delta-compresses verts, so the registry is
+        # the persistent store). A registry miss falls back to a coarse
+        # circle inside _draw_remote_rock.
+        for (aid, x, y, ang) in pos['asteroids']:
+            self._draw_remote_rock(screen, x, y, ang,
+                                   self.rock_shapes.get(aid))
         # Remote enemies as their REAL hulls. Buffer entry: (tag, x, y,
         # angle, vx, vy, id, shield_dump, shield_clock, power_used,
         # flame_mags, shield_charge).
@@ -2337,6 +2355,19 @@ class Game:
         is None (tests / v1 fallback) it defaults to `sim_time`, so the
         replay span is 0 and this is a pure full snap."""
         self.snap_buf.push(sim_time, snap)
+        # Rock-shape registry (plan_17): the wire carries a rock's verts
+        # only the FIRST time its id appears (the host's RockShapeTracker
+        # delta-compresses), so store any non-None verts here. The buffer
+        # itself stays a pure plain-snapshot store — the registry is
+        # presentation state owned by the client Game. The rock entry is
+        # the wire 5-tuple [id, x, y, angle, verts] (verts None for a
+        # repeat id) on the network, or the sim 9-tuple (verts always
+        # present) in loopback/tests — both have verts at the END, so the
+        # same read works for either.
+        for a in snap[5]:
+            verts = a[-1]
+            if verts is not None:
+                self.rock_shapes[a[0]] = [tuple(v) for v in verts]
         local_s = snap[0][self.local_index]
         if not self.ghost.seeded:
             # Pass the snapshot's sim time so the ghost's physics clock
@@ -2627,10 +2658,11 @@ class Game:
             sy = (y - self.cam.pos.y * 0.2) % HEIGHT
             pygame.draw.circle(screen, STAR_COLOR, (sx, sy), r)
 
-        for (x, y) in pos['asteroids']:
+        for (aid, x, y, ang) in pos['asteroids']:
             if not _in_view(x, y, bounds):
                 continue
-            self._draw_remote_rock(screen, x, y)
+            self._draw_remote_rock(screen, x, y, ang,
+                                   self.rock_shapes.get(aid))
         # Remote player's laser beams — T_BEAM events (one per discharge),
         # drawn before the ships. Entry: [local_start, end, age, ttl, owner];
         # local_start is the hull-local muzzle offset, end the world endpoint.
@@ -3863,20 +3895,24 @@ class Game:
             proxies.append(e)
         return proxies
 
-    def _draw_remote_rock(self, screen, x, y):
-        """Draw a remote asteroid at an interpolated world position.
+    def _draw_remote_rock(self, screen, x, y, angle, verts):
+        """Draw a remote asteroid at its interpolated (x, y, angle).
 
-        The buffer only interpolates the CENTER (x, y); the rock's shape and
-        orientation are presentation detail. We draw a simple filled circle
-        sized by the latest snapshot's rock — good enough for the remote
-        view, and it keeps this hook free of per-rock state it does not own.
+        `verts` (the rock's [(vx, vy), ...] shape, looked up by id in the
+        rock-shape registry by the caller) is the real polygon — drawn via
+        `_draw_world_asteroid`, the SAME plain-data helper the host's model
+        path uses, so host/client parity is by construction (same rotation
+        + ROCK_FILL/ROCK_EDGE). When `verts` is None (a registry miss —
+        should be impossible: the wire sends full verts on first sight of
+        every id) fall back to a coarse circle so a missing shape never
+        crashes the frame.
         """
+        if verts is not None:
+            _draw_world_asteroid(screen, self.cam, (x, y), angle, verts)
+            return
         s = self.cam.to_screen(pygame.Vector2(x, y))
-        # Latest rock snapshot for the size (first rock; the remote view is
-        # a coarse stand-in, not a pixel-faithful replica).
-        r = 20
-        pygame.draw.circle(screen, ROCK_FILL, (int(s.x), int(s.y)), r)
-        pygame.draw.circle(screen, ROCK_EDGE, (int(s.x), int(s.y)), r, 2)
+        pygame.draw.circle(screen, ROCK_FILL, (int(s.x), int(s.y)), 20)
+        pygame.draw.circle(screen, ROCK_EDGE, (int(s.x), int(s.y)), 20, 2)
 
     def _draw_remote_enemy(self, screen, x, y):
         """Draw a remote enemy at an interpolated world position (coarse)."""

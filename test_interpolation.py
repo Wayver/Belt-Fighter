@@ -524,7 +524,15 @@ def id_oracle(prev_s, curr_s, alpha, dt=None):
     for _tag, p in prev_s[1]:
         es = p[0]
         prev_e[_eid(p)] = (es[0], es[1], es[4], es[6], es[7], es[22])
-    prev_r = {_akey(t): (t[1], t[2]) for t in prev_s[5]}
+    # plan_17: the rock entry is read in EITHER form (sim 9-tuple or wire
+    # 5-tuple — the buffer is fed the sim snapshot in tests, the pruned
+    # wire snapshot on the network). id/x/y are at the same indices in
+    # both; the angle is [6] in the sim form and [3] in the wire form
+    # (detected by len — the two forms differ only in which fields the
+    # wire keeps). Written independently of netcode's _rock_angle.
+    def _rock_angle(r):
+        return r[6] if len(r) > 6 else r[3]
+    prev_r = {_akey(t): (t[1], t[2], _rock_angle(t)) for t in prev_s[5]}
 
     def mix_enemy_angle(pp, cp):
         # pp = prev angle (or None), cp = curr angle. Same endpoint rules
@@ -614,8 +622,19 @@ def id_oracle(prev_s, curr_s, alpha, dt=None):
         'ships': [mix_ship(prev_ships.get(i), c)
                   for i, c in enumerate(curr_s[0])],
         'enemies': enemies,
-        'asteroids': [mix(prev_r.get(_akey(t)), (t[1], t[2]))
-                      for t in curr_s[5]],
+        # plan_17: each asteroid entry is (id, x, y, angle). x/y via mix
+        # (endpoint-exact), angle via mix_enemy_angle (wrapped delta) —
+        # both read the rock in either form (sim 9-tuple / wire 5-tuple)
+        # through _rock_angle. id from curr (membership follows curr).
+        'asteroids': [
+            (_akey(t),
+             *mix((prev_r[_akey(t)][:2] if _akey(t) in prev_r else None),
+                  (t[1], t[2])),
+             mix_enemy_angle(
+                 prev_r[_akey(t)][2] if _akey(t) in prev_r else None,
+                 _rock_angle(t)))
+            for t in curr_s[5]
+        ],
         'bullets': bullets,
     }
 

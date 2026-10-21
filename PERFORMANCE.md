@@ -64,8 +64,14 @@ asteroids/stars/enemies/projectiles saves ~0.3 ms/frame now (measured:
 **Implemented** (see below).
 
 ### C. GC tuning in the render loop
-`gc.freeze()` (or disable) after warmup: measured draw max 5.63→5.11 ms,
-p99 4.44→4.26 ms. Modest but free. Not yet applied.
+`gc.freeze()` after warmup: measured draw max 5.63→5.11 ms, p99
+4.44→4.26 ms. Modest but free. **Implemented** — `gc.freeze()` is called
+once at the start of each render loop in `__main__.py` (host, client, and
+single-player), after the Game + surfaces + fonts + textures are built.
+The long-lived baseline becomes permanent; the cyclic GC then only scans
+the small set of per-frame temporaries. Reference counting is untouched,
+and objects allocated after the freeze are still collected normally (no
+leak risk — unlike `gc.disable()`).
 
 ## Tested and rejected (do not re-test)
 

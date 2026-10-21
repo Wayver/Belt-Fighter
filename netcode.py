@@ -54,8 +54,17 @@ Snapshot layout (see Game.snapshot in game.py):
                        the ghost only dedups its OWN shots)
                   m_s = (pos.x, pos.y, vel.x, vel.y, owner, life, boost,
                          target_id, id)
-    [5] asteroids_s  tuple of Asteroid.snapshot() =
-                     (id, pos.x, pos.y, vel.x, vel.y, size, angle, spin, verts)
+    [5] asteroids_s  tuple of rock entries. TWO FORMS are accepted (the
+                     buffer is a presentation store fed either the
+                     authoritative sim snapshot — loopback/tests — or the
+                     pruned wire snapshot — the network):
+                       SIM  (9-tuple): (id, x, y, vel.x, vel.y, size,
+                                       angle, spin, verts)
+                       WIRE (5-tuple): [id, x, y, angle, verts_or_None]
+                     (net.py serialize_snapshot). interp_positions reads
+                     id=[0], x=[1], y=[2], angle=[6] sim / [3] wire —
+                     detected by len (the two forms differ only in which
+                     fields the wire keeps).
     [6] rng_state, [7] game_over, [8] protect_timer, [9] next_id,
     [10] rock_next_id
 """
@@ -681,9 +690,9 @@ def _match_bullets(prev_list, curr_list, dt):
 
 def interp_positions(prev_s, curr_s, alpha, dt=None):
     """Interpolated poses for each player ship ((x, y, angle)), each enemy
-    ((tag, x, y, angle, vx, vy, id)), each asteroid ((x, y)), and each
-    projectile ((x, y, vx, vy, kind, owner, boost, mid)), between two
-    Game snapshots.
+    ((tag, x, y, angle, vx, vy, id)), each asteroid ((id, x, y, angle)),
+    and each projectile ((x, y, vx, vy, kind, owner, boost, mid)), between
+    two Game snapshots.
 
     prev_s / curr_s are the 11-tuples from Game.snapshot(); alpha in [0, 1]
     is clamped (never extrapolate into the future). Returns a plain dict —
@@ -694,7 +703,7 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
          'enemies': [(tag, x, y, angle, vx, vy, id,
                       shield_dump, shield_clock, power_used,
                       flame_mags, shield_charge), ...],
-         'asteroids': [(x, y), ...],
+         'asteroids': [(id, x, y, angle), ...],
          'bullets': [(x, y, vx, vy, kind, owner, boost, mid), ...]}
 
     LERP'd across the window: pose, angle (via `lerp_angle` — the wrapped
@@ -726,6 +735,16 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
     is wrong — the sim's lists slide). Membership follows the CURRENT
     snapshot: a new entity pops in at its curr position, a dead one drops
     out. Output order is curr_s's order.
+
+    Asteroids: the rock entry is read in EITHER form (see the module
+    docstring's [5] note) — the authoritative sim 9-tuple (loopback/tests)
+    or the pruned wire 5-tuple (the network). id/x/y are at the same
+    indices in both; the angle is [6] in the sim form and [3] in the wire
+    form (detected by len). The angle is lerp'd with lerp_angle (the same
+    wrapped-delta rule as ships/enemies) so the client's rock spins
+    smoothly; x/y are lerp'd as before. The client's rock-shape registry
+    (Game.rock_shapes) is populated separately from the wire verts —
+    interp_positions never touches verts.
     """
     a = min(1.0, max(0.0, alpha))
 
@@ -792,16 +811,27 @@ def interp_positions(prev_s, curr_s, alpha, dt=None):
                             dict(ce[23]),
                             ce[5]))
 
-    prev_rocks = {_asteroid_key(p): (p[1], p[2]) for p in prev_s[5]}
+    # Asteroids: the rock entry is read in EITHER form (sim 9-tuple or wire
+    # 5-tuple — see the module docstring's [5] note). id/x/y are at the
+    # same indices in both; the angle is [6] in the sim form and [3] in
+    # the wire form (detected by len). The prev rock carries (x, y, angle);
+    # a new rock pops in at its curr values. x/y lerp'd, angle via
+    # lerp_angle (the same wrapped-delta rule as ships/enemies).
+    def _rock_angle(r):
+        return r[6] if len(r) > 6 else r[3]
+    prev_rocks = {_asteroid_key(p): (p[1], p[2], _rock_angle(p))
+                  for p in prev_s[5]}
     asteroids = []
     for c in curr_s[5]:
-        cp = (c[1], c[2])
+        cp = (c[1], c[2], _rock_angle(c))
         pp = prev_rocks.get(_asteroid_key(c))
         if pp is None:
-            asteroids.append(cp)
+            asteroids.append((c[0], cp[0], cp[1], cp[2]))
         else:
-            asteroids.append((lerp(pp[0], cp[0], a),
-                              lerp(pp[1], cp[1], a)))
+            asteroids.append((c[0],
+                              lerp(pp[0], cp[0], a),
+                              lerp(pp[1], cp[1], a),
+                              lerp_angle(pp[2], cp[2], a)))
 
     # Projectiles: all three kinds, matched by predicted position within a
     # kind (see _match_bullets). `dt` is the time BETWEEN the two
@@ -922,7 +952,7 @@ class SnapshotBuffer:
         'enemies': [(tag, x, y, angle, vx, vy, id,
                      shield_dump, shield_clock, power_used,
                      flame_mags), ...],
-        'asteroids': [(x, y), ...],
+        'asteroids': [(id, x, y, angle), ...],
         'bullets': [(x, y, vx, vy, kind, owner, boost, mid), ...]}) or None
         when there is not yet a window to interpolate between (fewer than
         two snapshots, or render_t before the first snapshot).

@@ -13,6 +13,7 @@ Three modes (chosen on the menu's mode screen):
            ship, interpolate the remote entities), send input every
            frame, push each snapshot, render via predicted_view.
 """
+import gc
 import multiprocessing
 import os
 import queue as _queue
@@ -506,6 +507,13 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
         # thread; the child-side per-step stamps are the authoritative
         # cadence measure, M1).
         _models_window = 0
+        # GC tuning (PERFORMANCE.md rec C): freeze the long-lived baseline
+        # (surfaces, hulls, the shell Game, fonts, textures) so the cyclic
+        # GC only scans the small set of per-frame temporaries. Trims the
+        # draw max/p99 tail (measured 5.63->5.11 ms max, 4.44->4.26 p99).
+        # Reference counting is untouched; objects allocated after this are
+        # still collected normally.
+        gc.freeze()
         while True:
             # Capture the RAW frame time before the clamp (the clamp hides
             # hiccups from the sim, but a raw frame > 50 ms is exactly
@@ -1075,6 +1083,12 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
         elif name == "reset":
             game.reset()
 
+    # GC tuning (PERFORMANCE.md rec C): freeze the long-lived baseline
+    # (surfaces, hulls, the Game, ghost, buffer, fonts, textures) so the
+    # cyclic GC only scans the small set of per-frame temporaries. Trims
+    # the draw max/p99 tail. Reference counting is untouched; objects
+    # allocated after this are still collected normally.
+    gc.freeze()
     while True:
         # Capture the RAW frame time before the
         # clamp — the clamp hides hiccups from the sim, but the render
@@ -1451,6 +1465,12 @@ def main():
         sim_thread = SimThread(game)
         sim_thread.start()
         render_clock = _HostRenderClock()
+        # GC tuning (PERFORMANCE.md rec C): freeze the long-lived baseline
+        # (surfaces, hulls, the Game, fonts, textures) so the cyclic GC
+        # only scans the small set of per-frame temporaries. Trims the
+        # draw max/p99 tail. Reference counting is untouched; objects
+        # allocated after this are still collected normally.
+        gc.freeze()
         running = True
         try:
             while running:

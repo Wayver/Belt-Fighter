@@ -52,12 +52,18 @@ def _free_port():
 
 
 def _fake_snapshot():
-    """A minimal 11-tuple snapshot with 2 rocks at index 5 (the pruned slot).
+    """A minimal 11-tuple snapshot with 2 rocks at index 5 (the SIM form).
 
-    Enough for serialize_snapshot (list(snap); prune snap[5]; snap[6]=None)
-    and for the client-side deserialize_snapshot to round-trip."""
+    serialize_snapshot reads the SIM 9-tuple rock (id, x, y, vx, vy, size,
+    angle, spin, verts) and prunes it to the wire [id, x, y, angle, verts]
+    (plan_17). Enough for serialize_snapshot (list(snap); prune snap[5];
+    snap[6]=None) and for the client-side deserialize_snapshot to
+    round-trip."""
     return [0.0, [], [], [], [],
-            [[1, 10.0, 20.0], [2, 30.0, 40.0]],
+            [(1, 10.0, 20.0, 0.0, 0.0, 'small', 0.0, 0.0,
+              ((1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0))),
+             (2, 30.0, 40.0, 0.0, 0.0, 'small', 0.5, 0.0,
+              ((1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0)))],
             None, False, 0.0, 0, 0]
 
 
@@ -182,10 +188,15 @@ def test_net_process():
                         got_snap["sim_time"] == 1.5,
                         repr(got_snap.get("sim_time")))
             d = deserialize_snapshot(got_snap["snap"])
+            # plan_17: the wire rock is [id, x, y, angle, verts]; the net
+            # process's tracker is fresh, so first sight of both rocks ->
+            # full verts (a list, not None).
             pruned = (len(d) == 11 and d[6] is None
-                      and all(len(r) == 3 for r in d[5]))
+                      and all(len(r) == 5 and isinstance(r[4], list)
+                              for r in d[5]))
             ok &= check("snap: the snapshot is pruned on the wire",
-                        pruned, "len=%d rng=%r" % (len(d), d[6]))
+                        pruned, "len=%d rng=%r rocks=%r"
+                        % (len(d), d[6], d[5]))
 
         # --- 3. the net process forwards a beam verbatim -------------------
         beam = {"type": T_BEAM, "sim_time": 1.6, "sx": 0, "sy": 0,

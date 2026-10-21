@@ -96,6 +96,7 @@ def net_process_main(status_conn, net_queue, remote_input_conn,
 
     from .net import (Host, do_handshake_host, serialize_hull,
                       serialize_loadout, serialize_snapshot,
+                      RockShapeTracker,
                       deserialize_input, T_SNAP, T_INPUT, T_RESPAWN, T_PONG)
 
     def _status(msg):
@@ -117,6 +118,13 @@ def net_process_main(status_conn, net_queue, remote_input_conn,
     # (the F3 edge).
     snap_log_f = None
     snap_seq = 0
+
+    # Rock-shape tracker (plan_17): drives the verts delta-compression in
+    # serialize_snapshot. One per connection; the net process is 2P-only
+    # (accepts ONE client, no re-accept loop), so one tracker per process
+    # lifetime is correct. Owned by this process (the only one that calls
+    # serialize_snapshot).
+    rock_tracker = RockShapeTracker()
 
     def _snap_log(path):
         nonlocal snap_log_f
@@ -188,7 +196,8 @@ def net_process_main(status_conn, net_queue, remote_input_conn,
                 kind = m[0]
                 if kind == "snap":
                     conn.send({"type": T_SNAP, "sim_time": m[1],
-                               "snap": serialize_snapshot(m[2])})
+                               "snap": serialize_snapshot(
+                                   m[2], rock_tracker)})
                     if snap_log_f is not None:
                         snap_seq += 1
                         snap_log_f.write("%.3f,%.3f,%.4f,%d\n" % (

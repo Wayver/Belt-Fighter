@@ -81,7 +81,11 @@ re-explaining. History (why a rule changed) lives in git, not here.
 ## Wire
 - TCP, non-blocking, 4-byte big-endian length prefix + JSON. Message
   types: join, welcome, input (carries `tag`), snap, respawn, beam,
-  echo, pong (see net.py for shapes).
+  echo, pong (see net.py for shapes). The `beam` (T_BEAM) message carries a
+  `target` field (plan_19) — `None` (rock) / an enemy ship id (int) /
+  `"p<i>"` (the other player) — so the client knows which ship a beam hit
+  (it fires the local ship's hit FX when `target == "p<local_index>"`).
+  A missing field reads as None (the rock path) — backward-tolerant.
 - The snapshot is an 11-tuple (game.py `Game.snapshot`); PRUNED on the
   wire: asteroids -> `[id, x, y, angle, verts]` (x/y 1-decimal, angle
   3-decimal, `verts` DELTA-COMPRESSED — the rock's 10-vertex shape is sent
@@ -292,6 +296,71 @@ re-explaining. History (why a rule changed) lives in git, not here.
   rock collision (a predicted clip-through is corrected by the next
   reconcile), and the authoritative hit/damage/rock death still come from
   the host snapshot.
+
+## 2P player combat (plan_19)
+The two human players can fight each other. The core abstraction is a
+`team` field on the ship + a single team-based targeting predicate, which
+replaces the old hardcoded "loop over `self.enemies`".
+
+- **Team model** — `Ship.team: int`. Player `i`'s ship -> `TEAM_i` (== its
+  index, set by `Game` in `reset()` / `set_player_ship()`); AI enemies ->
+  `TEAM_NEUTRAL` (-1, set in `AIEnemy.__init__`). `team` is NOT serialized —
+  the client derives the same assignment from its player index, so the ship
+  snapshot stays 25 fields.
+- **One predicate** — `can_target(attacker, target)` (game.py): True iff the
+  target is ALIVE and off-team (`target.team != attacker.team and not
+  getattr(target, "dead", False)`). Enemies have no `.dead` (always
+  targetable); a frozen corpse is not a target. Single-player reduces to
+  "enemies only" (the other player does not exist) — bit-identical.
+- **Unified targetable surface** — an AI enemy and a player ship both expose
+  `.pos/.vel/.angle/.team/.dead/.collision_radius/.shield_on/.shield_contains/
+  .shield_impact_point/.register_hit/.lead_point`. The one new piece was
+  `Ship.lead_point` (constant-velocity intercept, the same math as
+  `AIEnemy.lead_point`). Host targeting (`_pick_laser_target` /
+  `_pick_missile_target`) loops `_targetable_candidates(ship)` (enemies + the
+  other player, filtered by `can_target`); host damage (`_collisions` /
+  `_resolve_beam`) tests the other player's ship with the SAME shield-oval /
+  swept-hull criteria as the enemy path, routing hits through
+  `_handle_ship_hit` (per-player death + respawn already exist).
+- **Client lock-on** — the ghost sees the remote player via a
+  `_GhostPlayerProxy` (built from `pos['ships'][remote_index]`, `.id` =
+  `"p<index>"`, `.team` = the remote index, `.lead_point` = constant-velocity
+  intercept). `PredictedShip._pick_*` / `step_local_missiles` take the proxy
+  alongside the enemy proxies (the `by_id` map includes it), so the ghost
+  locks + charges + launches + homes on the other player on the same tick the
+  host does (lockstep preserved).
+- **Two additive wire changes** (the snapshot is untouched):
+  1. **T_BEAM gains `target`** — `None` (rock) / an enemy ship id (int) /
+     `"p<i>"` (the other player). The host's `_emit_beam_event` sets it from
+     the resolved target; the client stores it as the 6th field of the
+     `remote_beams` entry. A missing field reads as None (the rock path) —
+     backward-tolerant.
+  2. **Missile snapshot target encoding** — `Missile.snapshot` stores the
+     target as an enemy ship id (int) / `"p<i>"` (a string) / None.
+     `Game.apply_snapshot` re-wires it: int -> the enemy via `id_map`;
+     `"p<i>"` -> a `_PlayerHomingTarget` adapter over `self.players[i]`
+     exposing `.hp/.pos/.lead_point` (so `Missile.update`'s existing
+     `target.hp > 0` + `target.lead_point(...)` work unchanged). Host-side
+     only — the client's ghost uses `_GhostPlayerProxy` instead.
+- **Client hit FX** — the other player's weapons impact the local ship with
+  shield flash + burst + SFX, on the client:
+  - **Bullets + missiles** — the existing shield_dump-jump detection
+    (`_local_incoming_hit_fx`) is weapon-agnostic, so it already fires for the
+    other player's bullets + missiles. The impact-point search was generalized
+    to also consider incoming PLAYER bullets (`kind == 'player'`,
+    `owner == remote_index`), so the spark lands on the true impact point
+    (missiles have no buffer bullet to project from — the oval-front fallback
+    applies, same as today's enemy-missile case).
+  - **Beams** — a T_BEAM whose `target` is the local player
+    (`"p<local_index>"`) fires the local ship's hit FX in `_remote_beam_hit_fx`
+    (called from `predicted_view`): a shield_burst at the beam's endpoint (the
+    `end` the host computed on the local ship's shield oval) + the throttled
+    `shield_hit` SFX, in the same frame the beam is drawn. A beam is hitscan —
+    there is no in-flight projectile for the shield_dump-jump detection to
+    watch, so this is the one new detection. Each beam fires its FX exactly
+    once (a `_beam_fx_fired` id-set, pruned to the live beams each frame).
+  Presentation only: no sim, no authority (the authoritative hit + damage
+  already come from the host snapshot).
 
 ## Misc
 - Enemy proxies: the caller builds lightweight proxies from the buffer's

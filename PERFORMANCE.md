@@ -169,3 +169,25 @@ swept segment-circle test per (local bullet, rock) pair — ~26 in-flight
 bullets × ~85 rocks ≈ 2k cheap quadratic solves per firing frame (plus the
 same for ghost missiles). Negligible against the fog's ~3 ms. No viewport
 cull on the rock test (the host doesn't cull; the quadratic is cheap).
+
+## 2P player combat (plan_19) — no snapshot bandwidth change
+
+2P player-vs-player combat (team-based targeting, host-side damage, client
+lock-on, client hit FX) adds **no snapshot bandwidth**: the ship snapshot
+stays 25 fields (`team` is derived locally from the player index, not
+serialized). The only wire additions are two ADDITIVE event fields:
+
+- **T_BEAM `target`** — one small field (`None` / int enemy id / `"p<i>"`)
+  on the beam EVENT message. A beam is a rare event (one per laser
+  discharge, a 0.15 s flash), so the cost is negligible.
+- **Missile target id** — the missile snapshot's target field already
+  existed (an enemy ship id or None); it now also encodes `"p<i>"` (a short
+  string) for a player target. One small field, no new entity.
+
+**Per-frame cost:** the client's hit-FX generalization adds a trivial
+filter to the existing `_local_incoming_hit_fx` bullet scan (a `kind` /
+`owner` check — the scan was already O(bullets)) and a one-shot
+`_remote_beam_hit_fx` pass over `remote_beams` (≤ a handful of 0.15 s
+beams, an id-set membership test each). Host-side, `_targetable_candidates`
+adds at most ONE extra candidate (the other player) to the existing
+nearest-in-range loop. All negligible against the fog's ~3 ms.

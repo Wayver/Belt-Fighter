@@ -1066,6 +1066,12 @@ class Game:
         # (BEAM_TTL), too short to ride the snapshot window, so it is drawn
         # immediately and aged here (_step_remote_beams). Presentation only.
         self.remote_beams = []
+        # plan_19: ids of remote beams that have already fired the local
+        # ship's hit FX (a beam whose target is the local player). Pruned to
+        # the live beams each frame in _remote_beam_hit_fx (a culled beam's
+        # id is dropped, so a later beam reusing the address is not
+        # suppressed). Presentation only.
+        self._beam_fx_fired = set()
         # Missile handback offset (client-only). At handback the buffer's copy of
         # a ghost missile is INTERP_DELAY behind the ghost's predicted
         # position, so draw it with offset (ghost_pos - interp_pos) and
@@ -3094,6 +3100,13 @@ class Game:
         self._step_hit_fx(dt)
         # Age + cull the remote player's laser beams (T_BEAM events).
         self._step_remote_beams(dt)
+        # plan_19: a remote beam whose target is the LOCAL player fires the
+        # local ship's hit FX (shield_burst at the beam endpoint + throttled
+        # shield_hit SFX) — the one new hit-FX detection (a beam is hitscan,
+        # so there is no in-flight projectile for the shield_dump-jump
+        # detection to watch). Runs before the fog/draw so the burst is
+        # aged + drawn this frame.
+        self._remote_beam_hit_fx()
         # INCOMING-HIT FX: the client never runs the sim, so it never sees
         # the host's `register_hit` / `shield_burst` for a hit on the LOCAL
         # ship. The flash you already see is the authoritative shield_dump
@@ -4270,6 +4283,40 @@ class Game:
             b[2] += dt
         self.remote_beams = [b for b in self.remote_beams if b[2] < b[3]]
 
+    def _remote_beam_hit_fx(self):
+        """plan_19: fire the LOCAL ship's hit FX for a remote beam whose
+        target is the local player. A beam is hitscan — there is no
+        in-flight projectile to watch (unlike bullets/missiles, which the
+        shield_dump-jump detection in `_local_incoming_hit_fx` covers) — so
+        the T_BEAM's `target` field (plan_19 §2.6) is the signal: when
+        `target == "p<local_index>"`, the host's beam landed on the LOCAL
+        ship's shield oval, so spawn a shield_burst at the beam's endpoint
+        (the `end` the host computed on the local ship's shield oval) + the
+        throttled shield_hit SFX, in the same frame the beam is drawn (a
+        beam is a 0.15 s flash; one-way LAN latency ~10-20 ms is
+        imperceptible against it).
+
+        Each beam fires its FX exactly ONCE (on the frame it is first
+        drawn): a beam stays in `remote_beams` for BEAM_TTL (~9 frames), so
+        a fired-set keyed on the beam's id() prevents re-firing. The set is
+        pruned to the live beams each call (a culled beam's id is dropped,
+        so a later beam that reuses the address cannot be suppressed).
+        Presentation only: no sim, no authority (the authoritative hit +
+        damage already came from the host snapshot — this is the
+        client-side flash + spark + SFX)."""
+        _local_id = "p%d" % self.local_index
+        _fired = self._beam_fx_fired
+        # Prune ids of beams that have been culled (age >= ttl).
+        _fired &= {id(b) for b in self.remote_beams}
+        for b in self.remote_beams:
+            if b[5] != _local_id or id(b) in _fired:
+                continue
+            _fired.add(id(b))
+            # b[1] is the world endpoint the host computed on the LOCAL
+            # ship's shield oval (vis_end) — spawn the burst there.
+            shield_burst(self._hit_fx, b[1], rng=random)
+            self._sfx_throttled("shield_hit", SFX_SHIELD_HIT_MIN_INTERVAL)
+
     def _step_death_bursts(self, dt):
         """Advance + cull the client-side death bursts (presentation only).
         Called once per frame from predicted_view."""
@@ -4286,18 +4333,27 @@ class Game:
                 del self._death_bursts[index]
 
     def _local_incoming_hit_fx(self, pos, gpos, gangle):
-        """Spawn a shield_burst when an incoming (enemy) bullet hits the
-        LOCAL ship. The client never runs the sim, so it never sees the
-        host's `register_hit` / `shield_burst` for a hit on the local ship —
-        the flash you already see is the authoritative `shield_dump`
+        """Spawn a shield_burst when an incoming bullet hits the LOCAL ship.
+        The client never runs the sim, so it never sees the host's
+        `register_hit` / `shield_burst` for a hit on the local ship — the
+        flash you already see is the authoritative `shield_dump`
         re-anchored from the snapshot at each reconcile (and decayed between
         by the ghost's own `_update_shield`). A jump UP in the ghost's
         `shield_dump` is therefore the hit signal: it fires in the same frame
         the flash appears, so the burst is on time with it.
 
-        The impact point is the nearest incoming buffer bullet (kind
-        'enemy', NOT the local index) projected onto the shield oval — the
-        same `shield_impact_point` math the host's `_handle_ship_hit` uses.
+        The impact point is the nearest incoming buffer bullet projected onto
+        the shield oval — the same `shield_impact_point` math the host's
+        `_handle_ship_hit` uses. "Incoming" is an enemy bullet (kind 'enemy',
+        NOT the local index) OR, in 2P (plan_19), the OTHER player's bullet
+        (kind 'player', owner == the remote index). The shield_dump-jump
+        detection is weapon-agnostic, so the impact search must consider the
+        other player's bullets too, or the spark would fall back to the oval
+        front instead of the true impact point. Missiles (kind 'missile') are
+        NOT projected — same as today's enemy-missile case, the shield_dump
+        jump + oval-front fallback is sufficient (a missile has no buffer
+        bullet entry to project from).
+
         At the reconcile frame the render point is still ~INTERP_DELAY
         behind the snapshot, so the hit bullet is still in the buffer (its
         authoritative cull arrives WITH the dump spike), which is why the
@@ -4323,11 +4379,23 @@ class Game:
         if _dump <= _prev + _comp.power_hit * 0.5:
             return
         # Nearest incoming buffer bullet to the local ship's drawn pose.
+        # plan_19: "incoming" is an enemy bullet (kind 'enemy', NOT the
+        # local index) OR the OTHER player's bullet (kind 'player', owner ==
+        # the remote index). The other player's bullets carry owner ==
+        # remote_index (the player index), so `owner != self.local_index`
+        # keeps them and drops the local ship's own (outgoing) bullets.
+        _remote = 1 - self.local_index
         _best = None
         _best_d2 = None
         for (x, y, vx, vy, kind, owner, _boost, _mid) in pos['bullets']:
-            if kind != 'enemy' or owner == self.local_index:
-                continue
+            if kind == 'enemy':
+                if owner == self.local_index:
+                    continue
+            elif kind == 'player':
+                if owner != _remote:
+                    continue
+            else:
+                continue   # missiles: no buffer bullet to project from
             _d2 = (x - gpos.x) ** 2 + (y - gpos.y) ** 2
             if _best_d2 is None or _d2 < _best_d2:
                 _best_d2 = _d2

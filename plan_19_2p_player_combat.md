@@ -1,38 +1,44 @@
 # Plan 19 — 2P Player-vs-Player Combat (team-based targeting, damage, lock-on, hit FX)
 
-**Status:** Session 3 DONE (commit 1bfbddf, T_BEAM `target` wire). Next:
-Session 4 (client-side hit FX + tests + docs). Session 3 landed: the
-T_BEAM wire
-message gains a `target` field (None / int enemy ship id / "p<i>"
-player) — host `_emit_beam_event` sets it from the resolved target (the
-3 call sites: enemy -> e.ship.id, other player -> "p<i>", rock -> None),
-the sim thread rides it on the T_BEAM message, and the client's T_BEAM
-receive stores it as the 6th field of the remote_beams entry
-([local_start, end, age, ttl, owner, target]); the draw loop unpacks it
-(unused until Session 4's hit FX). NOTE: the ghost-side lock-on +
-homing (plan §2.5 / Session 3 items 2-3) ALREADY LANDED in Session 1
-(b26ffe6) — _GhostPlayerProxy, the pickers' player_proxy, and
-step_local_missiles' by_id including the proxy — so Session 3's
-remaining work was the T_BEAM target wire + verification. Verified:
-T_BEAM target end-to-end (enemy->int, player->"p1", rock->None); ghost
-laser + missile pick the remote player proxy; a ghost missile homes on
-the proxy (closer than a coasting one) and coasts when it leaves the
-buffer; lockstep preserved (test_14_2/14_3 max drift 0.00). Full
+**Status:** ALL SESSIONS DONE. Session 4 (commit 68ec8f8, client-side hit
+FX + tests + docs) landed last. Session 4: the client now fires the LOCAL
+ship's hit FX when the other player's weapons impact it — (a)
+`_local_incoming_hit_fx`'s
+impact-point search was generalized to incoming PLAYER bullets
+(kind=='player', owner==remote_index) so the spark lands on the true
+impact point (the shield_dump-jump detection already covered the other
+player's bullets + missiles — it is weapon-agnostic; missiles use the
+oval-front fallback, same as today's enemy-missile case); (b) a NEW
+`_remote_beam_hit_fx` (called from predicted_view) fires a shield_burst at
+the beam endpoint + the throttled `shield_hit` SFX when a T_BEAM's `target`
+is the local player ("p<local_index>") — the one new detection (a beam is
+hitscan, so there is no in-flight projectile for the shield_dump-jump
+detection to watch); each beam fires its FX exactly once (a `_beam_fx_fired`
+id-set, pruned to the live beams each frame). Added test_19_2p_combat.py
+(14 gates: TEAM can_target + Ship.lead_point; HOST TARGETING both-pick-each-
+other + single-player bit-identical; HOST DAMAGE bullet/missile/beam reduce
+shield then hull + kill + no-self-hit + T_BEAM target "p1"; GHOST LOCK-ON
+picks the _GhostPlayerProxy + a ghost missile homes on it; CLIENT HIT FX
+bullet/missile/beam each trigger the local shield flash + burst). Docs:
+ARCHITECTURE.md "2P player combat (plan_19)" section (team model +
+can_target, unified targetable surface, the two additive wire changes, the
+client hit-FX generalization) + a Wire-section note on the T_BEAM `target`
+field; PERFORMANCE.md "2P player combat (plan_19) — no snapshot bandwidth
+change" note. Verified: test_19_2p_combat.py all 14 gates pass; full
 10.x/14.x/15.x/17.x/18.x suite green (pre-existing failures unchanged:
-10_3a, 10_11c, 10_9, test_network).
+10_3a, 10_11c, 10_9, test_network; 15_1 is an obsolete SKIP) +
+test_determinism + test_snapshot + test_net_process + test_render_model.
+Manual 2P playtest still recommended (two players lock on, shoot, and see
+shield flash + burst on each other's ships; a kill respawns the dead player
+while the other keeps playing).
 
-NOTE for Session 4: the beam `target` is now on the WIRE (Session 3) and
-stored in the remote_beams entry (6th field) — Session 4 reads it to fire
-the local ship's hit FX when `target == "p<local_index>"` (a beam is
-hitscan, so there is no in-flight projectile to watch): spawn a
-shield_burst at the beam's endpoint + the throttled `shield_hit` SFX in
-the same frame the beam is drawn. The missile "p<i>" encoding is already
-on the wire (Missile.snapshot) and the ghost re-resolves it by id in
-step_local_missiles (the by_id map includes the _GhostPlayerProxy) —
-both landed in Sessions 1-3. Session 4 also generalizes
-_local_incoming_hit_fx's impact-point search to incoming PLAYER bullets
-(kind=='player', owner==remote_index) and adds test_19_2p_combat.py +
-the ARCHITECTURE.md / PERFORMANCE.md docs.
+Session history: S1 (b26ffe6) team foundation + unified targeting (host +
+ghost lock-on); S2 (075c045) host-side 2P damage (bullet/missile/beam vs the
+other player); S3 (1bfbddf) T_BEAM `target` wire (client knows which ship a
+beam hit). NOTE: the ghost-side lock-on + homing (plan §2.5) landed in S1
+(_GhostPlayerProxy, the pickers' player_proxy, step_local_missiles' by_id
+including the proxy), so S3's remaining work was the T_BEAM target wire +
+verification.
 **Scope:** let the two human players actually fight each other in 2P. Today the
 game has **no "who can shoot whom" concept** — it is hardcoded to "players
 shoot AI enemies." This plan introduces a **team** field on the ship, a single

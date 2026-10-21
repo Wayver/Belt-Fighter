@@ -226,6 +226,17 @@ TARGETING_POWER = 8.0              # power draw while the reticle is on
 TARGETING_COMPUTE_BASE = 6.0       # compute for the targeting system itself
 TARGETING_COMPUTE_PER_TARGET = 4.0 # extra compute per tracked enemy
 
+# --- teams (plan_19: 2P player-vs-player combat) ---
+# A ship's `team` (int) is the single piece of id information the game uses
+# to derive viable weapon targets: a ship may target any ALIVE ship whose
+# team != its own. Player i's ship -> TEAM_i (== the player index); AI
+# enemies -> TEAM_NEUTRAL (not a team member, so always targetable). The
+# client derives the same assignment locally from its player index — `team`
+# is NOT serialized (the ship snapshot stays 25 fields).
+TEAM_NEUTRAL = -1   # AI enemies (and any ship with no team)
+TEAM_0 = 0          # player 0's ship (the host)
+TEAM_1 = 1          # player 1's ship (the client)
+
 # --- homing missile ---
 MISSILE_SPEED = 460.0      # cruise: below bullet (860), way above enemy (25)
 MISSILE_LAUNCH_SPEED = 150.0  # muzzle speed (the boost ramp in

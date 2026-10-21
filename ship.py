@@ -38,6 +38,7 @@ from .collision import HullCollision, convex_hull
 from .config import (WIDTH, HEIGHT, ROT_SPEED, MAX_SPEED,
                      STOP_GAIN, MAX_STOP_ACCEL, STOP_DEADBAND,
                      SHIP_COLOR, SHIP_EDGE, FLAME_OUT, FLAME_IN,
+                     TEAM_NEUTRAL, TARGETING_MAX_LEAD,
                      POWER_HYSTERESIS, AUTO_STOP_COMPUTE, SHIELD_DUMP_DECAY,
                      SHIELD_OVAL_A, SHIELD_OVAL_B, SHIELD_COLOR_DIM,
                      SHIELD_COLOR_BRIGHT, SHIELD_OFFLINE_FACTOR, SHIELD_OFFLINE_DRAIN,
@@ -102,8 +103,15 @@ def _dim_color(c, f):
     return tuple(int(ch * f) for ch in c)
 
 class Ship:
-    def __init__(self, ship_id=0, hull=None, loadout=None):
+    def __init__(self, ship_id=0, hull=None, loadout=None, team=TEAM_NEUTRAL):
         self.id = ship_id
+        # Team (plan_19): the single id field the game uses to derive viable
+        # weapon targets — a ship may target any ALIVE ship whose
+        # `team != self.team`. Player i's ship -> TEAM_i (set by Game); AI
+        # enemies -> TEAM_NEUTRAL (the default). NOT serialized: the client
+        # derives the same assignment from its player index, so the ship
+        # snapshot stays 25 fields.
+        self.team = team
         self.hull = hull or DEFAULT_HULL
         # per-hull shield oval (a, b, cx, cy) in local coords; None = config default
         self.shield_oval = self.hull.shield_oval or (SHIELD_OVAL_A, SHIELD_OVAL_B, 0.0, 0.0)
@@ -322,6 +330,37 @@ class Ship:
         fwd, right = self.axes()
         lx, ly = d.dot(fwd) - cx, d.dot(right) - cy
         return (lx / a) ** 2 + (ly / b) ** 2 <= 1.0
+
+    def lead_point(self, shooter_pos, bullet_speed):
+        """Intercept solution: the world point a projectile of
+        `bullet_speed` fired from `shooter_pos` should aim at to meet this
+        ship. Solves |E(T) - shooter| = bullet_speed * T with E(T) =
+        pos + vel*T (CONSTANT VELOCITY — a player ship's accel is not
+        synced to the client, and constant-velocity lead is the right
+        order of accuracy, the same as the ghost's enemy proxies).
+        Iterates to convergence (a contraction whenever the bullet can
+        catch the ship); returns None when there is no valid solution
+        (target outrunning the bullet, or lead time out of range).
+
+        plan_19: the unified targetable surface — AIEnemy.lead_point and
+        Ship.lead_point let the SAME missile-homing / targeting code aim at
+        an AI enemy or the other player's ship."""
+        e0 = self.pos
+        v = self.vel
+        d0 = (e0 - shooter_pos).length()
+        if d0 < 1:
+            return None
+        T = d0 / bullet_speed
+        for _ in range(6):
+            eT = e0 + v * T
+            T_new = (eT - shooter_pos).length() / bullet_speed
+            if T_new > TARGETING_MAX_LEAD:
+                return None
+            if abs(T_new - T) < 1e-3:
+                T = T_new
+                break
+            T = T_new
+        return e0 + v * T
 
     def reset_lasers(self):
         self.laser_target = None

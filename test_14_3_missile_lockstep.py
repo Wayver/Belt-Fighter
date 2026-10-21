@@ -68,7 +68,7 @@ import pygame
 
 from .config import (WIDTH, HEIGHT, TICK, MISSILE_LIFE, MISSILE_POOL_MAX)
 from .fog import make_light_texture
-from .game import Game, STEP, _GhostEnemyProxy
+from .game import Game, STEP, _GhostEnemyProxy, _GhostPlayerProxy
 from .hulls import (HullType,
                     FORWARD_S, FORWARD_P, REVERSE, RCS_LEFT, RCS_RIGHT,
                     GUN, MISSILE, REACTOR, COMPUTER, SHIELD, SENSOR,
@@ -147,6 +147,12 @@ def make_host(res):
     g.enemies.clear()
     g.enemies.append(TestTarget(
         pygame.Vector2(WIDTH / 2, HEIGHT / 2 - 300.0), rng=g.rng))
+    # plan_19: in 2P the other player's ship is a targeting candidate
+    # (team 0 != team 1), and both ships spawn at center (d=0) — p1's
+    # nearest candidate would be p0, not the TestTarget. Move p0 2000 px
+    # out of the 900 px lock range so the TestTarget is the nearest
+    # candidate on BOTH peers (p0 is idle — no input — so it stays).
+    g.players[0].pos = pygame.Vector2(WIDTH / 2 - 2000.0, HEIGHT / 2)
     return g
 
 
@@ -193,6 +199,15 @@ def main():
     target = host.enemies[0]
     proxy = _GhostEnemyProxy(target.pos, target.ship.vel, target.ship.angle,
                              target.ship.id, 0.0, 0.0)
+    # plan_19: the remote-player proxy (p0 — the host's own ship, 2000 px
+    # out of lock range). The ghost's candidate set must match the
+    # host's (enemies + the other player's ship), so the direct step
+    # below feeds it alongside the enemy proxy — exactly as the buffer
+    # would in live play. p0 is idle + stationary, so its pose is
+    # constant.
+    p0 = host.players[0]
+    p_proxy = _GhostPlayerProxy(p0.pos, p0.vel, p0.angle, 0, p0.dead,
+                                p0.shield_oval)
 
     # Seed the ghost at the host's INITIAL state (t=0), so the prediction
     # runs from the same origin as the host. snaps[t] is the host's
@@ -245,8 +260,8 @@ def main():
         # --- GHOST tick: the prediction, the same input at the same step,
         # the same target (the proxy the buffer would hand it).
         g_seq_before = ghost.ship.missile_seq
-        ghost.step(STEP, FIRE, enemies=[proxy])
-        ghost.step_local_missiles(STEP, [proxy])
+        ghost.step(STEP, FIRE, enemies=[proxy], player_proxy=p_proxy)
+        ghost.step_local_missiles(STEP, [proxy], player_proxy=p_proxy)
         g_fired = ghost.ship.missile_seq - g_seq_before
         ghost_launched += g_fired
         ghost_max_list = max(ghost_max_list, len(ghost.local_missiles))

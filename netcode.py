@@ -1204,6 +1204,12 @@ class PredictedShip:
         # weapons/shield/sensors/collision from the hull+loadout and holds
         # no reference to Game, so it can be stepped in isolation.
         self._ship = Ship(hull=hull, loadout=loadout)
+        # plan_19: the ghost's team == the local player's index — the
+        # team predicate (can_target) needs it to tell the remote player
+        # (off-team, targetable) from the ghost's own ship (same team,
+        # never a target). The host's player ships get the same
+        # assignment in Game (team == index); the ghost mirrors it.
+        self._ship.team = local_index
         self._seeded = False
         # The render interpolation phase: _sim_time - _last_step_time, in
         # [0, TICK). advance() recomputes it each call from the clock
@@ -1516,7 +1522,8 @@ class PredictedShip:
             self._echo_buffer.pop(0)
 
     def reconcile_rewind(self, ship_s, snap_time, now, enemies=None,
-                     real_time=None, rate=1.0, rocks=None):
+                     real_time=None, rate=1.0, rocks=None,
+                     player_proxy=None):
         """Dead-reckoning reconcile. Apply the authoritative ship snapshot taken
         at sim time `snap_time`, then REPLAY the local inputs the host
         applied between `snap_time` and `now`, so the ghost ends up at
@@ -1535,6 +1542,12 @@ class PredictedShip:
         clamped to the nearest asteroid that intersects its segment (the
         client-side mirror of the host's `_beam_blocked`) — the same
         occlusion the live steps get.
+
+        `player_proxy` (plan_19) is the remote-player proxy, fed to each
+        replayed step as an additional targeting candidate (see `step`) —
+        the host's replayed ticks saw the other player's ship as a
+        candidate, so the replay must too, or the re-run lock/charge
+        desyncs.
 
         The replay mirrors the host's own tick loop: for each sim tick T
         from snap_time to now (step TICK), the host applies the LATEST
@@ -1657,10 +1670,11 @@ class PredictedShip:
             while j + 1 < len(buf) and buf[j + 1][0] <= t + 1e-9:
                 j += 1
             inp = buf[j][1] if j >= 0 else buf[0][1]
-            self.step(TICK, inp, enemies=enemies, rocks=rocks)
+            self.step(TICK, inp, enemies=enemies, rocks=rocks,
+                      player_proxy=player_proxy)
             self.step_local_bullets(TICK)
             self.step_local_beams(TICK)
-            self.step_local_missiles(TICK, enemies)
+            self.step_local_missiles(TICK, enemies, player_proxy)
         # The replay moved the physics state to snap_time + n*TICK. Set the
         # physics clock to max(now, snap_time + n*TICK):
         #   - normal case (now >= snap_time): the clock stays at `now` (the
@@ -1696,7 +1710,7 @@ class PredictedShip:
         # _last_step_time is the same, so the render interpolation phase
         # is _acc = _sim_time - _last_step_time (in [0, TICK)).
 
-    def step(self, dt, inp, enemies=None, rocks=None):
+    def step(self, dt, inp, enemies=None, rocks=None, player_proxy=None):
         """Advance the ghost ONE fixed step with the LOCAL input.
 
         `dt` is passed by the caller (the sim's TICK) because netcode.py
@@ -1727,7 +1741,19 @@ class PredictedShip:
         entries. When given, the ghost's laser target is picked from them
         (the SAME nearest-in-range math the host's `_pick_laser_target`
         uses) so the ghost charges + fires a beam on the same tick the
-        host does. The BEAMS `s.update()` returns are kept as presentation
+        host does.
+
+        `player_proxy` (plan_19) is the REMOTE-PLAYER proxy
+        (`_GhostPlayerProxy`, built by the caller from the buffer's
+        `pos['ships'][remote_index]` entry). When given, it joins the
+        enemy proxies as a targeting candidate (the host's
+        `_targetable_candidates` returns the same set: enemies + the
+        other player's ship), so the ghost locks + charges + launches on
+        the other player on the same tick the host does. None (tests,
+        single-player, or before the buffer has a window) leaves the
+        candidates as the enemies only.
+
+        The BEAMS `s.update()` returns are kept as presentation
         entries in `self.local_beams` (hull-local muzzle -> world target;
         predicted_view re-anchors the muzzle to the ghost's current pose
         at draw time), so the player sees their own beam immediately
@@ -1745,11 +1771,11 @@ class PredictedShip:
         # predict the angular motion over the L gap).
         self._last_inp = inp
         s.tracked = 0
-        s.laser_target = self._pick_laser_target(s, enemies)
+        s.laser_target = self._pick_laser_target(s, enemies, player_proxy)
         # Pick the ghost's missile target from the proxies (the SAME
         # nearest-in-range math the host's _pick_missile_target uses), so
         # the ghost locks + launches on the same tick the host does.
-        s.missile_target = self._pick_missile_target(s, enemies)
+        s.missile_target = self._pick_missile_target(s, enemies, player_proxy)
         s.contacts = []
         shots, beams, missiles = s.update(dt, inp)
         # Build the ghost's sensor contacts AFTER s.update — the ghost's
@@ -1917,43 +1943,68 @@ class PredictedShip:
         while len(self.local_missiles) > MISSILE_POOL_MAX:
             self.local_missiles.pop(0)
 
-    def _pick_laser_target(self, s, enemies):
-        """Nearest enemy proxy within the max laser range; None if no laser
-        is fitted or `enemies` is empty/None. Mirrors the host's
-        `Game._pick_laser_target` (nearest-in-range) so the ghost charges +
-        fires on the same tick the host does, given the same target in the
-        wedge. Reads only `.pos` off each proxy — the buffer's enemy
-        proxies expose that."""
-        if not enemies:
+    def _targetable_candidates(self, s, enemies, player_proxy=None):
+        """plan_19: the alive, off-team proxies `s` may target — the enemy
+        proxies + the remote-player proxy. Mirrors the host's
+        `Game._targetable_candidates` (enemies + the other player's ship,
+        filtered by the `can_target` team predicate) so the ghost picks the
+        SAME target the host does, given the same buffer window. The
+        predicate is inlined (netcode.py cannot import game.py — circular):
+        a proxy is targetable iff its `.team != s.team` and it is not
+        `.dead` (enemy proxies have no `.dead` — `getattr(..., False)`
+        keeps them always-targetable, exactly like the host's AIEnemies).
+        """
+        out = []
+        for e in (enemies or []):
+            if e.team != s.team and not getattr(e, "dead", False):
+                out.append(e)
+        if player_proxy is not None:
+            if (player_proxy.team != s.team
+                    and not getattr(player_proxy, "dead", False)):
+                out.append(player_proxy)
+        return out
+
+    def _pick_laser_target(self, s, enemies, player_proxy=None):
+        """Nearest targetable proxy within the max laser range; None if no
+        laser is fitted or there are no candidates. Mirrors the host's
+        `Game._pick_laser_target` (nearest-in-range over
+        `_targetable_candidates`) so the ghost charges + fires on the same
+        tick the host does, given the same target in the wedge. Reads only
+        `.pos` off each proxy — the buffer's enemy proxies and the
+        remote-player proxy expose that."""
+        cands = self._targetable_candidates(s, enemies, player_proxy)
+        if not cands:
             return None
         max_range = max((w.comp.laser_range for w in s.weapons
                          if w.comp.laser_range > 0), default=0.0)
         if max_range <= 0:
             return None
         best, best_d = None, max_range
-        for e in enemies:
-            d = e.pos.distance_to(s.pos)
+        for t in cands:
+            d = t.pos.distance_to(s.pos)
             if d <= best_d:
-                best, best_d = e, d
+                best, best_d = t, d
         return best
 
-    def _pick_missile_target(self, s, enemies):
-        """Nearest enemy proxy within the max missile lock range; None if no
-        missile is fitted or `enemies` is empty/None. Mirrors the host's
-        `Game._pick_missile_target` (nearest-in-range) so the ghost locks +
-        launches on the same tick the host does, given the same target in
-        the wedge. Reads only `.pos` off each proxy."""
-        if not enemies:
+    def _pick_missile_target(self, s, enemies, player_proxy=None):
+        """Nearest targetable proxy within the max missile lock range; None
+        if no missile is fitted or there are no candidates. Mirrors the
+        host's `Game._pick_missile_target` (nearest-in-range over
+        `_targetable_candidates`) so the ghost locks + launches on the same
+        tick the host does, given the same target in the wedge. Reads only
+        `.pos` off each proxy."""
+        cands = self._targetable_candidates(s, enemies, player_proxy)
+        if not cands:
             return None
         max_range = max((w.comp.missile_lock_range for w in s.weapons
                          if w.comp.missile_speed > 0), default=0.0)
         if max_range <= 0:
             return None
         best, best_d = None, max_range
-        for e in enemies:
-            d = e.pos.distance_to(s.pos)
+        for t in cands:
+            d = t.pos.distance_to(s.pos)
             if d <= best_d:
-                best, best_d = e, d
+                best, best_d = t, d
         return best
 
     def _update_contacts(self, s, enemies):
@@ -2023,7 +2074,7 @@ class PredictedShip:
             b.update(dt)
         self.local_bullets = [b for b in self.local_bullets if b.life > 0]
 
-    def step_local_missiles(self, dt, enemies=None):
+    def step_local_missiles(self, dt, enemies=None, player_proxy=None):
         """Advance the ghost's local missiles by `dt` and cull the dead. Mirrors
         the host's `for m in self.missiles: m.update(dt)` +
         `self.missiles = [m for m in ... if m.life > 0]` — except the
@@ -2031,9 +2082,18 @@ class PredictedShip:
         id (re-resolved each step from `enemies`; None when the target has
         left the buffer, so the missile coasts). Called by `advance` after
         each ghost step; tests may call it directly. `dt` is the sim's TICK
-        (passed in, not imported)."""
-        # Map enemy id -> proxy for this step (the buffer's current view).
+        (passed in, not imported).
+
+        `player_proxy` (plan_19) is the remote-player proxy: a missile
+        locked on the other player carries its `"p<index>"` id, which is a
+        different key space from the enemy numeric ids, so the `by_id` map
+        includes the proxy too — a missile locked on the remote player
+        homes on it (the proxy is always present while the ship is in the
+        buffer; ships don't turn over)."""
+        # Map target id -> proxy for this step (the buffer's current view).
         by_id = {e.id: e for e in (enemies or [])}
+        if player_proxy is not None:
+            by_id[player_proxy.id] = player_proxy
         for m in self.local_missiles:
             # Re-resolve the target by the id the missile locked. m.target
             # is the proxy it was launched at; its .id is the key.
@@ -2209,7 +2269,8 @@ class PredictedShip:
         return {}
 
     def advance(self, dt, inp, enemies=None, real_time=None,
-                host_time=None, rtt_ow=0.0, rocks=None):
+                host_time=None, rtt_ow=0.0, rocks=None,
+                player_proxy=None):
         """Advance the ghost by real time `dt`.
 
         THE GHOST CLOCK CONTRACT — the single source of truth for how the
@@ -2269,6 +2330,11 @@ class PredictedShip:
         target tracks the buffer's enemies and it fires a beam on the same
         tick the host does.
 
+        `player_proxy` (plan_19): the remote-player proxy
+        (`_GhostPlayerProxy`) — fed to every step as an additional
+        targeting candidate (see `step`), so the ghost's lock/charge/
+        launch on the other player stays in lockstep with the host.
+
         `rocks`: a list of lightweight asteroid proxies from the
         interpolation buffer, fed to every step so the ghost's own laser
         beam's endpoint is clamped to the nearest asteroid that intersects
@@ -2297,7 +2363,8 @@ class PredictedShip:
             self.step_local_beams(min(dt, MAX_FRAME_DT))
             # A missile in flight at the moment of death coasts + ages out
             # too (no enemies while dead — it can no longer home).
-            self.step_local_missiles(min(dt, MAX_FRAME_DT))
+            self.step_local_missiles(min(dt, MAX_FRAME_DT),
+                                     player_proxy=player_proxy)
             self._diag('ADV', {'real_time': real_time,
                                 'pre_sim': self._sim_time,
                                 'pre_last': self._last_step_time,
@@ -2368,10 +2435,11 @@ class PredictedShip:
             # _ship_pose does the same from the model's prev/curr).
             self._prev_pos = pygame.Vector2(self._ship.pos)
             self._prev_angle = self._ship.angle
-            self.step(TICK, inp, enemies=enemies, rocks=rocks)
+            self.step(TICK, inp, enemies=enemies, rocks=rocks,
+                      player_proxy=player_proxy)
             self.step_local_bullets(TICK)   # advance + cull
             self.step_local_beams(TICK)     # age + cull
-            self.step_local_missiles(TICK, enemies)   # home + cull
+            self.step_local_missiles(TICK, enemies, player_proxy)   # home + cull
             self._last_step_time += TICK
             n += 1
         # The render interpolation phase: the time since the last step

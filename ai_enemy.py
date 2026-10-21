@@ -15,7 +15,7 @@ from .config import (ENEMY_HP, ENEMY_ENGAGE_RANGE, ENEMY_ORBIT_OFFSET,
                      ENEMY_AVOID_RADIUS, ENEMY_AVOID_WEIGHT,
                      ENEMY_COURSE_MARGIN, MAX_SPEED,
                      ENEMY_FILL, ENEMY_EDGE, ENEMY_FLAME, TARGETING_MAX_LEAD,
-                     ENEMY_AVOID_BUFFER, ENEMY_BULLET_SPEED)
+                     ENEMY_AVOID_BUFFER, ENEMY_BULLET_SPEED, TEAM_NEUTRAL)
 
 from .hulls import ENEMY_HULL, enemy_loadout, MOTE_HULL, mote_loadout
 
@@ -37,6 +37,9 @@ class AIEnemy:
         self.ship = Ship(ship_id=self._next_id, hull=self.hull,
                          loadout=loadout or enemy_loadout())
         AIEnemy._next_id += 1
+        # plan_19: AI enemies are TEAM_NEUTRAL — not a team member, so
+        # always targetable by both players (the team predicate).
+        self.ship.team = TEAM_NEUTRAL
         self.ship.pos = pygame.Vector2(pos)
         self.ship.angle = self._rng.uniform(0, 2 * math.pi)
         self.hp = ENEMY_HP
@@ -47,6 +50,14 @@ class AIEnemy:
     @property
     def pos(self):
         return self.ship.pos
+
+    @property
+    def team(self):
+        # plan_19: the targeting predicate (can_target) reads `.team` off
+        # whatever object it is given — for an AI enemy that is the AIEnemy
+        # itself, so delegate to the owned ship (TEAM_NEUTRAL, set in
+        # __init__).
+        return self.ship.team
 
     @property
     def collision_radius(self):

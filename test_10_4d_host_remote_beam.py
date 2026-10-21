@@ -97,6 +97,14 @@ def main():
     #     it with the firing player's index. ---
     g = make_host(screen, font, big_font, light_tex, fog_surf, light_surf)
     g.protect_timer = 0.0
+    # plan_19: the other player's ship is a targeting candidate (team 0
+    # != team 1), and p0 spawns at center — the SAME point the remote
+    # ship is moved to (WIDTH/2, HEIGHT/2 == REMOTE_POS). At d=0 the
+    # remote's laser would pick p0 (and the wedge test rejects d<1), so
+    # move p0 out of the 600 px laser range: the enemy is the intended
+    # target of this test (it is about beam anchoring, not targeting).
+    g.players[0].pos = pygame.Vector2(200.0, 200.0)
+    g.players[0].vel = pygame.Vector2(0.0, 0.0)
     # Remote (client) ship mid-screen, facing +x.
     r = g.players[1]
     r.pos = REMOTE_POS.copy()

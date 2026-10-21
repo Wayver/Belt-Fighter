@@ -53,7 +53,8 @@ from .config import (INTERP_DELAY, SNAPSHOT_INTERVAL, ROCK_FILL, ROCK_EDGE,
                     ENEMY_FILL, ENEMY_EDGE, ENEMY_FLAME,
                     SHIP_COLOR, SHIP_EDGE,
                     MISSILE_HANDOFF_DECAY, MISSILE_HANDOFF_OFFSET_EPS,
-                    MISSILE_HANDOFF_MAX_SHRINK, MISSILE_LIFE)
+                    MISSILE_HANDOFF_MAX_SHRINK, MISSILE_LIFE,
+                    TEAM_NEUTRAL)
 
 STEP = 1 / 60   # fixed simulation timestep
 
@@ -146,6 +147,11 @@ class _GhostEnemyProxy:
         self.vel = vel
         self.angle = angle
         self.id = eid
+        # plan_19: the ghost's team predicate (can_target) reads `.team`
+        # off every candidate — enemy proxies are TEAM_NEUTRAL (the
+        # buffer carries no team; the client derives it: AI enemies are
+        # never a team member, so always targetable).
+        self.team = TEAM_NEUTRAL
         self._ship = _GhostEnemyShip(power_used, power_idle_total)
 
     @property
@@ -215,6 +221,108 @@ class _GhostRockProxy:
     def __init__(self, pos, collision_radius):
         self.pos = pos
         self.collision_radius = collision_radius
+
+
+def can_target(attacker, target):
+    """plan_19: the single team-based targeting predicate.
+
+    True if `attacker` may target `target`: the target is ALIVE and on a
+    DIFFERENT team. Replaces the old hardcoded "loop over self.enemies" —
+    a ship's viable targets are exactly the alive, off-team ships (the AI
+    enemies + the other player's ship).
+
+    `attacker`/`target` are anything exposing `.team` and (for player
+    ships) `.dead`. AI enemies have no `.dead`, so `getattr(..., False)`
+    keeps them always-targetable (they are `TEAM_NEUTRAL`, off-team from
+    both players). A frozen corpse (`.dead` True) is not a target —
+    matching the existing "a dead ship is frozen and no longer a
+    collision or enemy target" rule in `Game._step`.
+    """
+    return target.team != attacker.team and not getattr(target, "dead", False)
+
+
+class _GhostPlayerProxy:
+    """Lightweight REMOTE-PLAYER proxy for the prediction ghost's weapon
+    targeting (plan_19).
+
+    The ghost is a real Ship stepped with the local input, but the client
+    never runs the sim — it has no live reference to the OTHER player's
+    ship to target. The interpolation buffer's ship entries DO carry the
+    remote player's interpolated (pos, vel, angle, dead), so predicted_view
+    builds one of these from `pos['ships'][remote_index]` each frame and
+    feeds it to `ghost.advance` -> `step` alongside the enemy proxies. The
+    ghost's laser/missile target is picked from (enemies + this proxy) with
+    the SAME nearest-in-range + team-predicate math the host's
+    `_pick_laser_target` / `_pick_missile_target` use, so the ghost locks +
+    charges + launches on the other player on the same tick the host does.
+
+    It exposes only what the ship's weapon math reads: `.pos` (the
+    interpolated world pos — `Ship._in_wedge` / `_pick_*` read `t.pos`),
+    `.vel` (ZERO — the buffer's ship entries carry no velocity; the
+    target-SELECTION math reads only `.pos`, so the zero vel is
+    presentation-accurate; `lead_point` degrades to "aim at the current
+    pos", the same constant-velocity order as a stationary target),
+    `.id` (a stable key, `"p<index>"` — a different key space from the
+    enemy numeric ids, so a ghost missile can re-resolve it by id),
+    `.team` (the remote player's index — off-team from the ghost's own
+    ship), and `.lead_point` (constant-velocity intercept, the same math
+    as `_GhostEnemyProxy.lead_point`). A `.ship` stand-in carries the
+    shield oval (from the local `players[remote]` hull — the hull is
+    fixed on both peers) for any shield-oval math. Never stepped, never
+    fed to the sim.
+    """
+
+    def __init__(self, pos, vel, angle, index, dead, shield_oval):
+        self.pos = pos
+        self.vel = vel
+        self.angle = angle
+        self.id = "p%d" % index          # stable key, distinct from enemy ids
+        self.team = index                # the remote player's team == its index
+        self.dead = dead
+        self._ship = _GhostPlayerShip(shield_oval)
+
+    @property
+    def ship(self):
+        return self._ship
+
+    def lead_point(self, shooter_pos, bullet_speed):
+        """Constant-velocity intercept — the same math as
+        `_GhostEnemyProxy.lead_point` / `Ship.lead_point`, using this
+        proxy's pos/vel (zero accel — the buffer carries no smoothed
+        accel). The ghost's missile homing reads this."""
+        e0 = self.pos
+        v = self.vel
+        d0 = (e0 - shooter_pos).length()
+        if d0 < 1:
+            return None
+        T = d0 / bullet_speed
+        for _ in range(6):
+            eT = e0 + v * T
+            T_new = (eT - shooter_pos).length() / bullet_speed
+            if T_new > TARGETING_MAX_LEAD:
+                return None
+            if abs(T_new - T) < 1e-3:
+                T = T_new
+                break
+            T = T_new
+        return e0 + v * T
+
+
+class _GhostPlayerShip:
+    """The `.ship` stand-in a _GhostPlayerProxy exposes.
+
+    Carries the remote player's shield oval (from the local
+    `players[remote]` hull — the hull is fixed on both peers) so any
+    shield-oval math (e.g. a beam's vis_end) can run client-side. The
+    sensor-contact signature fields default to 0: the remote player is
+    NOT in the ghost's sensor contacts (enemies-only, plan_19 §4 — the
+    remote player's live power signature is not available to the ghost).
+    Never stepped, never fed to the sim."""
+
+    def __init__(self, shield_oval):
+        self.shield_oval = shield_oval
+        self.power_used = 0.0
+        self.power_idle_total = 0.0
 
 
 # --- model-driven WORLD render helpers ------------------------------------
@@ -735,6 +843,12 @@ class Game:
             self.players = [Ship(hull=hull, loadout=loadout)]
         else:
             self.players = [Ship(hull=hull, loadout=loadout), Ship()]
+        # plan_19: each player ship's team == its index (the single id field
+        # the targeting predicate reads). AI enemies are TEAM_NEUTRAL (set
+        # in AIEnemy.__init__). NOT serialized — the client derives the same
+        # assignment from its player index.
+        for i, p in enumerate(self.players):
+            p.team = i
         # local_index: which player this Game controls locally (0 = host's
         # own ship, 1 = the client's). The prediction ghost tracks
         # players[local_index].
@@ -969,6 +1083,7 @@ class Game:
         hull/loadout from the wire).
         """
         self.players[i] = ship
+        ship.team = i   # plan_19: the swapped-in ship's team == its index
         self.shields[i] = self._make_shield(ship)
 
     def _sfx(self, name):
@@ -1011,7 +1126,8 @@ class Game:
         # Reset ALL player ships: each to center, idle. (Both players spawn at
         # center in v1 — no ship-vs-ship collision, so they pass through
         # each other.)
-        for p in self.players:
+        for i, p in enumerate(self.players):
+            p.team = i   # plan_19: team == player index (robust re-assert)
             p.pos = pygame.Vector2(WIDTH / 2, HEIGHT / 2)
             p.vel = pygame.Vector2(0, 0)
             p.angle = -math.pi / 2
@@ -1779,33 +1895,64 @@ class Game:
                 txt = self.font.render(f"{dist:.0f}", True, color)
                 screen.blit(txt, (p.x - txt.get_width() / 2, p.y + 10))
 
+    def _targetable_candidates(self, ship):
+        """plan_19: the alive, off-team ships `ship` may target — the AI
+        enemies + the other player's ship.
+
+        Replaces the old "loop over self.enemies" in the pickers: the
+        viable targets are exactly the ships that pass `can_target`
+        (alive + off-team). In single-player the other player does not
+        exist, so this is just the enemies — bit-identical to the old
+        behavior. The pickers keep their nearest-in-range math over this
+        list; the laser/missile wedge test reads only `t.pos`, so it works
+        unchanged for a player target.
+        """
+        out = [e for e in self.enemies if can_target(ship, e)]
+        for i, p in enumerate(self.players):
+            if i != self._player_index(ship) and can_target(ship, p):
+                out.append(p)
+        return out
+
+    def _player_index(self, ship):
+        """The index of `ship` in self.players, or -1 if it is not a player
+        ship (an AI enemy). Used by _targetable_candidates to skip the
+        ship's own slot."""
+        for i, p in enumerate(self.players):
+            if p is ship:
+                return i
+        return -1
+
     def _pick_laser_target(self, ship):
-        """Nearest enemy within the max laser range; None if no laser fitted.
-        (per-ship, called once per player.)"""
+        """Nearest targetable ship within the max laser range; None if no
+        laser fitted. (per-ship, called once per player.) plan_19: the
+        candidates are the alive off-team ships (enemies + the other
+        player), not just the enemies."""
         max_range = max((w.comp.laser_range for w in ship.weapons
                          if w.comp.laser_range > 0), default=0.0)
         if max_range <= 0:
             return None
         best, best_d = None, max_range
-        for e in self.enemies:
-            d = e.pos.distance_to(ship.pos)
+        for t in self._targetable_candidates(ship):
+            d = t.pos.distance_to(ship.pos)
             if d <= best_d:
-                best, best_d = e, d
+                best, best_d = t, d
         return best
 
 
     def _pick_missile_target(self, ship):
-        """Nearest enemy within the max missile lock range; None if no
-        missile fitted. (per-ship, called once per player.)"""
+        """Nearest targetable ship within the max missile lock range; None
+        if no missile fitted. (per-ship, called once per player.) plan_19:
+        the candidates are the alive off-team ships (enemies + the other
+        player), not just the enemies."""
         max_range = max((w.comp.missile_lock_range for w in ship.weapons
                          if w.comp.missile_speed > 0), default=0.0)
         if max_range <= 0:
             return None
         best, best_d = None, max_range
-        for e in self.enemies:
-            d = e.pos.distance_to(ship.pos)
+        for t in self._targetable_candidates(ship):
+            d = t.pos.distance_to(ship.pos)
             if d <= best_d:
-                best, best_d = e, d
+                best, best_d = t, d
         return best
 
 
@@ -2480,6 +2627,7 @@ class Game:
             # no targets.
             enemies = None
             rocks = None
+            player_proxy = None
             rp = getattr(self, "render_point", None)
             if rp is not None:
                 rp_now = rp.now()
@@ -2491,6 +2639,10 @@ class Game:
                         # (a beam re-fired during the rewind replay is
                         # clamped to the nearest rock, like the live steps).
                         rocks = self._ghost_rock_proxies(pos)
+                        # plan_19: the remote-player proxy — the host's
+                        # replayed ticks saw the other player's ship as a
+                        # targeting candidate, so the replay must too.
+                        player_proxy = self._ghost_player_proxy(pos)
             # Measure the ghost's displacement ACROSS the reconcile (the
             # "snap size") for the net debug overlay + log: ~0 with
             # dead-reckoning rewind + identical input; large = the
@@ -2530,7 +2682,7 @@ class Game:
             self.ghost.reconcile_rewind(
                 local_s, sim_time, sim_time if now is None else now,
                 enemies=enemies, real_time=real_time, rate=rate,
-                rocks=rocks)
+                rocks=rocks, player_proxy=player_proxy)
             self.last_snap_px = math.hypot(
                 self.ghost.ship.pos.x - _bx, self.ghost.ship.pos.y - _by)
             # The render pose's displacement across the reconcile.
@@ -2687,6 +2839,12 @@ class Game:
         # (laser target) and reused below for the targeting reticle — one
         # build per frame.
         ghost_enemies = self._ghost_enemy_proxies(pos)
+        # plan_19: the remote-player proxy — the ghost's targeting
+        # candidate for the OTHER player's ship (the host's
+        # `_targetable_candidates` returns enemies + the other player's
+        # ship, so the ghost must see the same set to stay in lockstep).
+        # None in single-player (no remote ship in the buffer).
+        ghost_player = self._ghost_player_proxy(pos)
         # Asteroid proxies for the ghost's beam occlusion (the client-side
         # mirror of the host's `_beam_blocked`): the ghost's own laser
         # beam's endpoint is clamped to the nearest rock that intersects
@@ -2718,7 +2876,8 @@ class Game:
             real_time=real_time,
             host_time=getattr(self, "host_time", None),
             rtt_ow=getattr(self, "_rtt_ow", 0.0),
-            rocks=ghost_rocks)
+            rocks=ghost_rocks,
+            player_proxy=ghost_player)
         # Frame time of the frame that also ran the reconcile (the log
         # line is written in this same frame) — the snap's timing context.
         self.last_frame_dt = dt
@@ -4071,6 +4230,46 @@ class Game:
                 pygame.Vector2(x, y), pygame.Vector2(vx, vy),
                 ang, eid, power_used, idle))
         return proxies
+
+    def _ghost_player_proxy(self, pos):
+        """The REMOTE-PLAYER proxy for the prediction ghost's weapon
+        targeting (plan_19).
+
+        Built from the buffer's `pos['ships'][remote_index]` entry
+        ((x, y, angle, dead, shield_dump, shield_clock, flame_mags,
+        brownout, power_factor) — see interp_positions). The ghost needs
+        the other player's ship as a targeting candidate (the host's
+        `_targetable_candidates` returns enemies + the other player's
+        ship), so the ghost's predicted lock/charge/launch stays in
+        lockstep with the host.
+
+        `.pos` is the interpolated world pos (the pickers read only
+        `.pos`); `.vel` is zero (the buffer's ship entries carry no
+        velocity); `.id` is `"p<index>"`
+        (a stable key, distinct from the enemy numeric ids — a ghost
+        missile locked on the remote player re-resolves it by id);
+        `.team` is the remote index (off-team from the ghost's own
+        ship); `.dead` is the buffer's flag (a frozen corpse is not a
+        target). The `.ship` stand-in carries the remote player's shield
+        oval from the local `players[remote]` hull (the hull is fixed on
+        both peers — the client learns it at the join handshake,
+        `set_player_ship`).
+
+        None when there is no remote player (single-player) or the
+        buffer's ship list is short (no window yet).
+        """
+        remote = 1 - self.local_index
+        if remote >= len(pos['ships']):
+            return None
+        x, y, ang, dead = pos['ships'][remote][:4]
+        oval = self.players[remote].shield_oval
+        # The buffer's ship entries carry no velocity — zero vel (the
+        # pickers read only `.pos`; `lead_point` degrades to "aim at the
+        # current pos", the same constant-velocity order as a stationary
+        # target).
+        return _GhostPlayerProxy(pygame.Vector2(x, y),
+                                 pygame.Vector2(0, 0), ang, remote,
+                                 dead, oval)
 
     def _ghost_rock_proxies(self, pos):
         """Lightweight asteroid proxies from the buffer's asteroid entries

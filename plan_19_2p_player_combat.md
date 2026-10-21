@@ -1,6 +1,14 @@
 # Plan 19 — 2P Player-vs-Player Combat (team-based targeting, damage, lock-on, hit FX)
 
-**Status:** NOT STARTED.
+**Status:** Session 1 DONE (commit b26ffe6). Next: Session 2 (host-side
+damage). Session 1 landed: config TEAM_* constants; Ship.team +
+Ship.lead_point; AIEnemy.team + neutral assignment; game.py can_target +
+_targetable_candidates + team assignment in reset/set_player_ship +
+rewritten pickers + _GhostPlayerProxy + _ghost_player_proxy; netcode.py
+ghost pickers/advance/reconcile/step_local_missiles take player_proxy +
+ghost ship team == local_index; test_14_3 + test_10_4d updated for the
+new 2P candidate set. Full suite green (3 pre-existing failures
+unchanged: 10_3a, 10_11c, test_network).
 **Scope:** let the two human players actually fight each other in 2P. Today the
 game has **no "who can shoot whom" concept** — it is hardcoded to "players
 shoot AI enemies." This plan introduces a **team** field on the ship, a single

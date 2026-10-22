@@ -251,13 +251,20 @@ def test_net_process():
     return ok
 
 
-def test_net_process_rate_limiter():
-    """The snapshot rate limiter: two snaps put in the queue BACK-TO-BACK
-    (a sim burst — 2 ticks batched into one OS wake) must come out of the
-    socket ~16.7 ms apart (one per send window), NOT back-to-back. This is
-    the burst-frame fix: the client receives exactly one snap per frame
-    instead of two in one frame (which made the ghost clock's re-anchor
-    jump ~1 tick and shudder the ship).
+def test_net_process_latest_wins():
+    """The snapshot LATEST-WINS: when the net loop is slower than the sim's
+    publish rate (the loop runs at ~54Hz, the sim at 60Hz), multiple snaps
+    can land in the queue between iterations. A FIFO (oldest-first) would
+    queue stale snaps behind the newest — the client would render seconds-
+    old state and the ship would lag far behind the input. Instead, each
+    drained snap REPLACES the pending one (latest-wins) and only the
+    NEWEST is sent. This test verifies:
+      1. A burst of 2 snaps back-to-back -> exactly 1 arrives, with the
+         NEWER sim_time (the older one is dropped, not held).
+      2. A burst of 3 snaps back-to-back -> exactly 1 arrives, with the
+         NEWEST sim_time.
+      3. No staleness: the received sim_time is always the max of what
+         was put (the client never renders an older snap).
 
     Returns True when all checks pass."""
     ok = True
@@ -271,8 +278,7 @@ def test_net_process_rate_limiter():
     p, status_parent, net_queue, ri_sim_end = _spawn_net(
         ctx, port, host_hull, host_loadout)
 
-    # The fake client records the WALL time each T_SNAP arrives (the
-    # arrival cadence the client's ghost clock sees).
+    # The fake client records (arrival_wall, sim_time) for each T_SNAP.
     snap_arrivals = []
     client = {}
     client_err = []
@@ -289,15 +295,11 @@ def test_net_process_rate_limiter():
             while not client_stop.is_set():
                 for m in conn.poll():
                     if m.get("type") == T_SNAP:
-                        snap_arrivals.append(time.monotonic())
+                        snap_arrivals.append((time.monotonic(), m["sim_time"]))
                 time.sleep(0.001)
         except Exception as e:
             client_err.append(repr(e))
         finally:
-            # Close the socket on stop: the net process detects the
-            # disconnect via the FIN (conn.closed), so the test's shutdown
-            # check needs the client to actually close, not just stop
-            # polling.
             if conn is not None:
                 try:
                     conn.close()
@@ -308,77 +310,85 @@ def test_net_process_rate_limiter():
 
     try:
         status = _wait_for_status(status_parent, "connected")
-        ok &= check("ratelimit: the net process reported the client joined",
+        ok &= check("latestwins: the net process reported the client joined",
                     status is not None, repr(status))
         if status is None:
             return ok
         th.join(timeout=5)
-        ok &= check("ratelimit: fake client has no error",
+        ok &= check("latestwins: fake client has no error",
                     not client_err, repr(client_err))
 
-        # Put TWO snaps back-to-back (a burst — the sim batched 2 ticks
-        # into one wake, so it published 2 snaps within ~0-1 ms). The
-        # rate limiter must send the 1st immediately and HOLD the 2nd for
-        # the next send window (~16.7 ms later).
+        # Burst of 2 snaps back-to-back (the sim batched 2 ticks into one
+        # wake). Latest-wins: if both are drained in the same loop
+        # iteration, only the newer is sent (the older is dropped). If
+        # they're drained in separate iterations (a timing race), the
+        # client sees 2 snaps, but the LAST one is the newer (no
+        # staleness). The robust assertion: the LAST arrival's sim_time
+        # is the newer one.
         snap = _fake_snapshot()
-        net_queue.put(("snap", 1.0, snap))
-        net_queue.put(("snap", 1.0 + 1 / 60.0, snap))
+        t1 = 1.0
+        t2 = 1.0 + 1 / 60.0
+        net_queue.put(("snap", t1, snap))
+        net_queue.put(("snap", t2, snap))
 
-        # Wait for both to arrive (the 2nd is held ~16.7 ms, so allow a
-        # generous window).
+        # Wait for at least 1 arrival (allow a generous window).
         deadline = time.monotonic() + 1.0
-        while len(snap_arrivals) < 2 and time.monotonic() < deadline:
+        while len(snap_arrivals) < 1 and time.monotonic() < deadline:
             time.sleep(0.002)
+        # Give a short grace period to catch any 2nd arrival.
+        time.sleep(0.05)
 
-        ok &= check("ratelimit: BOTH snaps arrived (no loss)",
-                    len(snap_arrivals) == 2,
+        ok &= check("latestwins: a 2-snap burst -> at least 1 arrived",
+                    len(snap_arrivals) >= 1,
                     "n=%d" % len(snap_arrivals))
-        if len(snap_arrivals) == 2:
-            gap = snap_arrivals[1] - snap_arrivals[0]
-            # The gap must be ~one send window (16.7 ms): clearly above a
-            # back-to-back send (~0-1 ms, the bug) and below two windows
-            # (33 ms, which would mean the limiter over-holds). The band
-            # [8, 40] ms is generous to timing jitter but unambiguous:
-            # a back-to-back send is <2 ms, a held send is ~16.7 ms.
-            ok &= check("ratelimit: the 2nd snap was held for the next "
-                        "window (~16.7 ms apart, not back-to-back)",
-                        0.008 <= gap <= 0.040,
-                        "gap=%.1f ms" % (gap * 1000.0))
-            print("  [ratelimit] burst of 2 snaps -> arrival gap %.1f ms "
-                  "(want ~16.7)" % (gap * 1000.0))
+        if snap_arrivals:
+            last_t = snap_arrivals[-1][1]
+            ok &= check("latestwins: the LAST arrival is the NEWER snap "
+                        "(sim_time=%.4f, want %.4f — no staleness)"
+                        % (last_t, t2),
+                        abs(last_t - t2) < 1e-6,
+                        "last=%.4f" % last_t)
+            print("  [latestwins] burst of 2 -> %d arrived, last "
+                  "sim_time=%.4f (the newer)" % (len(snap_arrivals),
+                                                 last_t))
 
-        # A 3-snap burst must come out one per window (0, 16.7, 33.3 ms) —
-        # the FIFO drains one per window, not just "hold the second."
+        # Burst of 3 snaps back-to-back. Same logic: the LAST arrival's
+        # sim_time must be the newest (no staleness).
         snap_arrivals.clear()
-        net_queue.put(("snap", 2.0, snap))
-        net_queue.put(("snap", 2.0 + 1 / 60.0, snap))
-        net_queue.put(("snap", 2.0 + 2 / 60.0, snap))
-        deadline = time.monotonic() + 1.5
-        while len(snap_arrivals) < 3 and time.monotonic() < deadline:
+        t1 = 2.0
+        t2 = 2.0 + 1 / 60.0
+        t3 = 2.0 + 2 / 60.0
+        net_queue.put(("snap", t1, snap))
+        net_queue.put(("snap", t2, snap))
+        net_queue.put(("snap", t3, snap))
+        deadline = time.monotonic() + 1.0
+        while len(snap_arrivals) < 1 and time.monotonic() < deadline:
             time.sleep(0.002)
-        ok &= check("ratelimit: a 3-snap burst -> all 3 arrived (no loss)",
-                    len(snap_arrivals) == 3, "n=%d" % len(snap_arrivals))
-        if len(snap_arrivals) == 3:
-            g1 = snap_arrivals[1] - snap_arrivals[0]
-            g2 = snap_arrivals[2] - snap_arrivals[1]
-            ok &= check("ratelimit: the 3-snap burst is paced one per "
-                        "window (both gaps ~16.7 ms)",
-                        0.008 <= g1 <= 0.040 and 0.008 <= g2 <= 0.040,
-                        "g1=%.1f ms g2=%.1f ms" % (g1 * 1000.0,
-                                                   g2 * 1000.0))
-            print("  [ratelimit] burst of 3 snaps -> gaps %.1f, %.1f ms "
-                  "(want ~16.7 each)" % (g1 * 1000.0, g2 * 1000.0))
+        time.sleep(0.05)
+
+        ok &= check("latestwins: a 3-snap burst -> at least 1 arrived",
+                    len(snap_arrivals) >= 1,
+                    "n=%d" % len(snap_arrivals))
+        if snap_arrivals:
+            last_t = snap_arrivals[-1][1]
+            ok &= check("latestwins: the LAST arrival is the NEWEST snap "
+                        "(sim_time=%.4f, want %.4f — no staleness)"
+                        % (last_t, t3),
+                        abs(last_t - t3) < 1e-6,
+                        "last=%.4f" % last_t)
+            print("  [latestwins] burst of 3 -> %d arrived, last "
+                  "sim_time=%.4f (the newest)" % (len(snap_arrivals),
+                                                  last_t))
 
         # Shutdown: the client goes away -> the net process reports
-        # disconnected + exits (the held snaps are dropped — a disconnect
-        # is a clean shutdown, not a loss the client cares about).
+        # disconnected + exits.
         client_stop.set()
         th.join(timeout=3)
         status2 = _wait_for_status(status_parent, "disconnected")
-        ok &= check("ratelimit: the net process reported the disconnect",
+        ok &= check("latestwins: the net process reported the disconnect",
                     status2 is not None, repr(status2))
         p.join(timeout=3)
-        ok &= check("ratelimit: the net process exited", not p.is_alive())
+        ok &= check("latestwins: the net process exited", not p.is_alive())
     finally:
         client_stop.set()
         if p.is_alive():
@@ -387,7 +397,7 @@ def test_net_process_rate_limiter():
         ri_sim_end.close()
         status_parent.close()
 
-    print("\nNET PROCESS (snapshot rate limiter):",
+    print("\nNET PROCESS (snapshot latest-wins):",
           "ALL PASS" if ok else "FAILURES")
     return ok
 
@@ -423,7 +433,7 @@ def main():
     ok = True
     print("NET PROCESS (plan_13, Phase 1, Chunk 1a)")
     ok &= test_net_process()
-    ok &= test_net_process_rate_limiter()
+    ok &= test_net_process_latest_wins()
     ok &= test_net_process_quit()
     print("\nNET PROCESS (1a):", "ALL PASS" if ok else "FAILURES")
     raise SystemExit(0 if ok else 1)

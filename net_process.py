@@ -51,8 +51,6 @@ import os
 import time
 import traceback
 
-from .config import TICK
-
 # The net import chain (net -> intent -> pygame) pulls in pygame, so the
 # dummy drivers MUST be set before that import. They are set inside
 # net_process_main (below), NOT here, so the PARENT process — which imports
@@ -121,35 +119,30 @@ def net_process_main(status_conn, net_queue, remote_input_conn,
     snap_log_f = None
     snap_seq = 0
 
-    # SNAPSHOT RATE LIMITER (the burst-frame fix). The sim process
-    # occasionally batches 2 ticks into one OS wake (scheduler latency —
-    # the loop body is light, the OS just wakes the thread ~1 tick late
-    # ~12-19% of the time), so it publishes 2 snapshots within ~0-1 ms of
-    # each other in wall time. Sending both the moment they land makes the
-    # client receive 2 snaps in one frame (a burst frame): the ghost
-    # clock's re-anchor (anchored on the newest arrival) jumps ~1 tick,
-    # the render target jumps ~1 tick, and the ship shudders. The rate
-    # limiter holds the 2nd snap in `snap_fifo` and sends it on the next
-    # send window (~16.7 ms later), so the client receives EXACTLY one
-    # snap per frame — a smooth 1-tick arrival cadence, no burst.
+    # SNAPSHOT LATEST-WINS (the staleness fix). The net loop runs at ~54Hz
+    # (not 60Hz): the loop body is light (serialize_snapshot measures
+    # ~0.03 ms — the send cadence is the OS descheduling this process on
+    # the host's Mac, which is busy with the render + sim processes,
+    # stretching the 1 ms sleep to ~18 ms). The sim publishes at 60Hz,
+    # so ~6 snaps/sec pile up in the queue. A FIFO (oldest-first) would
+    # cause the client to receive stale snaps (the oldest in the FIFO
+    # can be seconds old), making the ship appear to lag behind the
+    # player's input.
     #
-    # Why a rate limiter (not a precise send timer): a timer (sleep until
-    # the next 16.7 ms boundary) would be subject to the SAME OS wake
-    # latency as the sim — a late wake would batch the sends. The rate
-    # limiter only GATES the send (at most one per 16.7 ms window); it is
-    # driven by the net process's existing ~1 ms loop, so it cannot burst
-    # no matter how the snaps arrive. A late wake causes a GAP (no snap
-    # for one frame) — which the client's interpolation buffer already
-    # handles (it holds the last frame) — not a burst.
+    # Instead, we use LATEST-WINS: drain the queue, keep only the NEWEST
+    # snap, send it. The client always receives the most current state,
+    # regardless of the loop rate. Dropped snaps are a network loss the
+    # client's interpolation buffer already handles (it holds the last
+    # frame). The rock-shape tracker handles dropped snaps gracefully
+    # (it's a "have I seen this rock before?" check, not a delta-from-last
+    # check, so a dropped snap just means the next snap sends full verts
+    # for any new rocks — a one-time cost, not a correctness issue).
     #
-    # `snap_fifo`: snaps pulled from the queue but held for the next send
-    # window (FIFO — oldest first, so the send order == the publish order
-    # == the stamp order, which the rock-shape tracker's verts
-    # delta-compression depends on). `last_snap_send`: the monotonic time
-    # of the last snap SENT (None until the first — the first snap is sent
-    # immediately).
-    snap_fifo = []
-    last_snap_send = None
+    # `latest_snap`: the newest snap pulled from the queue (None until the
+    # first). Replaced on each drain (latest-wins). Sent on each loop
+    # iteration (the loop runs at ~54Hz, so the client receives ~54 snaps/
+    # sec — a 10% slowdown vs the sim's 60Hz, but no staleness).
+    latest_snap = None
 
     # Rock-shape tracker (plan_17): drives the verts delta-compression in
     # serialize_snapshot. One per connection; the net process is 2P-only
@@ -217,23 +210,19 @@ def net_process_main(status_conn, net_queue, remote_input_conn,
             #   * beam / echo: sent the moment they land (low-rate events,
             #     no cadence — a beam is a 0.15 s flash, an echo is one
             #     input; neither is a cadence the client phase-locks to).
-            #   * snap: RATE-LIMITED to at most one per TICK (16.7 ms)
-            #     wall-time window. The sim occasionally batches 2 ticks
-            #     into one OS wake (scheduler latency — the loop body is
-            #     light, the OS just wakes the thread ~1 tick late), so it
-            #     publishes 2 snaps within ~0-1 ms of each other. Sending
-            #     both the moment they land makes the client receive 2
-            #     snaps in one frame (a burst frame): the ghost clock's
-            #     re-anchor (anchored on the newest arrival) jumps ~1
-            #     tick, the render target jumps ~1 tick, and the ship
-            #     shudders. Holding the 2nd snap in snap_fifo and sending
-            #     it on the next window makes the client receive EXACTLY
-            #     one snap per frame — a smooth 1-tick arrival cadence.
-            #     The gate is on the LAST SEND time (not a fixed
-            #     boundary), so a descheduled net process (a late wake)
-            #     causes a GAP (no snap for one frame — the client's
-            #     interpolation buffer holds the last frame), never a
-            #     burst.
+            #   * snap: LATEST-WINS. The loop runs at ~54Hz (the loop body
+            #     takes ~17.5ms) while the sim publishes at 60Hz, so a
+            #     snap or two can land between iterations. Sending them
+            #     oldest-first (a FIFO) would queue stale snaps behind the
+            #     newest — the client would render seconds-old state and
+            #     the ship would lag far behind the input. Instead, each
+            #     drained snap REPLACES the pending one (latest-wins) and
+            #     the newest is sent this iteration. A dropped snap is a
+            #     1-tick loss the client's interpolation buffer already
+            #     handles (it holds the last frame); the rock-shape
+            #     tracker re-sends full verts for any rock it has not
+            #     seen, so a drop is a one-time bandwidth cost, not a
+            #     correctness issue.
             while True:
                 try:
                     m = net_queue.get_nowait()
@@ -241,19 +230,14 @@ def net_process_main(status_conn, net_queue, remote_input_conn,
                     break
                 kind = m[0]
                 if kind == "snap":
-                    snap_fifo.append(m)
+                    latest_snap = m   # latest-wins: newest replaces pending
                 else:   # "beam" / "echo" — the msg dict is m[1]
                     conn.send(m[1])
-            # Rate-limited snap send: at most one per TICK window. The
-            # FIFO is drained oldest-first, so the send order == the
-            # publish order == the stamp order (the rock-shape tracker's
-            # verts delta-compression depends on that order).
-            if snap_fifo and (last_snap_send is None
-                              or time.monotonic() - last_snap_send >= TICK):
-                m = snap_fifo.pop(0)
+            if latest_snap is not None:
+                m = latest_snap
+                latest_snap = None
                 conn.send({"type": T_SNAP, "sim_time": m[1],
                            "snap": serialize_snapshot(m[2], rock_tracker)})
-                last_snap_send = time.monotonic()
                 if snap_log_f is not None:
                     snap_seq += 1
                     snap_log_f.write("%.3f,%.3f,%.4f,%d\n" % (

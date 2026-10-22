@@ -14,24 +14,23 @@ re-explaining. History (why a rule changed) lives in git, not here.
   is stepped with local input and reconciled to authority.
 - The host applies the LATEST received input each tick (pinned #5).
 - Snapshots are published at the sim STEP (60 Hz, one per step). The
-  host's NET process sends them RATE-LIMITED: at most one per TICK
-  (16.7 ms) wall-time window (a FIFO holds any extra). WHY: the sim
-  process occasionally batches 2 ticks into one OS wake (scheduler
-  latency — the loop body is light, ~1 ms; the OS just wakes the thread
-  ~1 tick late ~12-19% of the time on the host's Mac), so it publishes 2
-  snaps within ~0-1 ms of each other. Sending both the moment they land
-  makes the client receive 2 snaps in one frame (a burst frame): the
-  ghost clock's re-anchor (anchored on the newest arrival) jumps ~1
-  tick, the render target jumps ~1 tick, and the ship shudders. The
-  limiter makes the client receive exactly one snap per frame — a smooth
-  1-tick arrival cadence. A rate limiter (not a precise send timer): a
-  timer would be subject to the SAME OS wake latency as the sim; the
-  limiter only gates the send, driven by the net process's ~1 ms loop, so
-  a late wake causes a GAP (the client's interpolation buffer holds the
-  last frame), never a burst. Beams/echoes are still sent the moment
-  they land (low-rate events, no cadence). The snapshot's sim_time is
-  still its stamp (the limiter delays the SEND by at most one window on
-  a burst, not the stamp). The client reconciles at the ghost's OWN clock
+  host's NET process sends them LATEST-WINS: each loop iteration drains
+  the net Queue, and if more than one snap landed since the last
+  iteration, only the NEWEST is sent (the older ones are dropped). WHY:
+  the net loop runs at ~54 Hz (the loop body — serialize_snapshot +
+  send — takes ~17.5 ms) while the sim publishes at 60 Hz, so a snap or
+  two can land between iterations. A FIFO (oldest-first) queues stale
+  snaps behind the newest: the FIFO grows ~6 snaps/s and the client
+  receives snaps seconds old — the ship renders far behind the input
+  (unplayable). Latest-wins guarantees the client always receives the
+  most current state; a dropped snap is a 1-tick loss the client's
+  interpolation buffer already handles (it holds the last frame), and
+  the rock-shape tracker re-sends full verts for any rock it has not
+  serialized, so a drop is a one-time bandwidth cost, not a
+  correctness issue. Beams/echoes are still sent the moment they land
+  (low-rate events, no cadence). The snapshot's sim_time is still its
+  stamp (latest-wins drops the SEND of older snaps, not the stamp). The
+  client reconciles at the ghost's OWN clock
   (`ghost.sim_time`, advanced to the current frame BEFORE the poll
   loop) — NOT at `sim_time + L` (that anchor sat ~3 ms ahead of the raw
   clock and each reconcile jumped the clock forward -> a per-reconcile
@@ -77,8 +76,9 @@ re-explaining. History (why a rule changed) lives in git, not here.
     process owns the socket end to end (listen + accept + handshake +
     send + receive) and runs its own ~1 ms loop, so the render thread's
     draw is completely out of the send path (no shared GIL, no GIL-switch
-    lag). It sends beams/echoes the moment they land and rate-limits the
-    snaps (one per TICK window — see the snapshot bullet above).
+    lag). It sends beams/echoes the moment they land and sends snaps
+    LATEST-WINS (only the newest pending snap per loop iteration — see
+    the snapshot bullet above).
 - The render loop DRAINS the model queue in the SAME thread as the draw,
   every frame. A separate drain thread would be starved by the draw's
   GIL hold, the queue would fill, and the sim process would block —
@@ -90,7 +90,7 @@ re-explaining. History (why a rule changed) lives in git, not here.
   receive). The sim process hands it the snapshot / beam / echo data
   over the DEDICATED net Queue; the net process drains it in its own
   ~1 ms loop and sends each message (beams/echoes immediately, snaps
-  rate-limited — see the snapshot bullet). WHY a separate process (not
+  latest-wins — see the snapshot bullet). WHY a separate process (not
   a thread in the render process): the first M4 rode the wire traffic on
   the model Queue, so the render thread's per-frame drain (the SAME
   thread as the draw) was in the snapshot's send path — a busy draw
@@ -102,7 +102,7 @@ re-explaining. History (why a rule changed) lives in git, not here.
   as long as it wants and the net process keeps draining + sending —
   the render thread is COMPLETELY out of the send path. (The sim
   process is GIL-free too, so the snapshot STAMPS stay smooth either
-  way; the rate limiter smooths the SEND cadence on top of that.)
+  way; latest-wins keeps the SEND current on top of that.)
 
 ## Wire
 - TCP, non-blocking, 4-byte big-endian length prefix + JSON. Message

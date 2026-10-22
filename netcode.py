@@ -1232,6 +1232,17 @@ class PredictedShip:
     # tracks the ship exactly. Capping the catch-up (not the total velocity)
     # means the gap still closes while the ship is at max speed.
     SMOOTH_MAX_CATCH = 1.0        # × max_speed (position), × max_turn_rate (angle)
+    # HYBRID snap threshold (in units of one tick of motion at max speed):
+    # when the gap is <= SMOOTH_SNAP_FACTOR * max_speed * TICK, the smoothed
+    # pose SNAPS to the target exactly (the old behavior — no vibration,
+    # because the rendered pose is exactly the render target every frame).
+    # When the gap is larger (a stall), the velocity controller is used
+    # (smooth catch-up). The factor is 2.0: the steady-state gap is at most
+    # 2 ticks (the sim clock can advance 2 ticks in one frame), so 2.0
+    # always snaps in steady state (no vibration), and the transition lurch
+    # (when a stall gap closes to <= 2 ticks) is at most 2 ticks — the same
+    # as a normal burst-frame move, so it is not perceived as a lurch.
+    SMOOTH_SNAP_FACTOR = 2.0
 
     def __init__(self, hull=None, loadout=None, local_index=0):
         # A self-contained Ship: __init__ builds components/thrusters/
@@ -2598,46 +2609,59 @@ class PredictedShip:
         too. Rendering that directly lurches the ship 2 ticks for one
         frame (the shudder).
 
-        The fix: a VELOCITY-BASED CONTROLLER (feedforward + proportional). The
-        smoothed pose's velocity = the ship's velocity (feedforward: track
-        the ship's motion exactly, zero steady-state lag) + a catch-up term
-        proportional to the RESIDUAL gap (the gap minus the ship's motion
-        during the frame, which the feedforward already handles). The
-        residual-gap dynamics are d(residual)/dt = -SMOOTH_GAIN * residual,
-        so a stall gap closes with a time constant of 1/SMOOTH_GAIN
-        (exponential, monotonic, no overshoot). The catch-up is capped at
-        SMOOTH_MAX_CATCH * max_speed to avoid a lurch on a large stall gap.
+        The fix: a HYBRID of a snap and a VELOCITY-BASED CONTROLLER (feedforward +
+        proportional), selected by the gap size:
+        - GAP SMALL (<= SMOOTH_SNAP_FACTOR ticks of motion at max speed,
+          i.e. steady state): SNAP to the target exactly. The rendered pose
+          is then EXACTLY the render target every frame — zero per-frame
+          error, no vibration. (The render target itself is already smooth:
+          it is the physics pose lerped across the in-progress tick by
+          render_pose, so snapping to it does not re-introduce the 60 Hz
+          stepping.)
+        - GAP LARGE (a stall/burst left the smoothed pose behind): the
+          velocity controller. The smoothed pose's velocity = the ship's
+          velocity (feedforward: track the ship's motion exactly, no
+          rubber-band when the player starts moving) + a catch-up term
+          proportional to the RESIDUAL gap (the gap minus the ship's motion
+          during the frame, which the feedforward already handles). The
+          residual-gap dynamics are d(residual)/dt = -SMOOTH_GAIN *
+          residual, so a stall gap closes with a time constant of
+          1/SMOOTH_GAIN (exponential, monotonic, no overshoot). The
+          catch-up is capped at SMOOTH_MAX_CATCH * max_speed to avoid a
+          lurch on a large stall gap.
 
-        Why a velocity-based controller and not the alternatives:
+        Why the hybrid and not either half alone:
         - A BOUNDED-RATE CHASE capped at the ship's ACTUAL speed has a cap
           of 0 at rest, so a gap a stall left behind could never close
           (the "fires from empty space, never gets closer" bug).
         - Flooring that cap at the ship's MAX speed closes the gap, but
           makes the catch-up a constant-velocity slide that rubber-bands
-          when the player starts moving (the slide and the target's
-          acceleration disagree — there is no feedforward).
-        - A plain proportional catch-up (no feedforward) settles to a
-          persistent lag of v/GAIN in steady state (the ship drawn behind
-          where it is, the muzzle drifting off the bullets).
-        The velocity-based controller gets the best of each: the feedforward
-        tracks the ship's motion exactly (zero steady-state lag, no
-        rubber-band when the player starts moving), the proportional term
-        closes any stall gap (works at rest, damped, no overshoot), and
-        there is no constant-velocity slide.
+          when the player starts moving (no feedforward).
+        - A velocity controller ALONE (no snap) has a constant per-frame
+          vibration: the feedforward integrates over the SMOOTH real frame
+          time dt, but the render target advances in RAGGED tick chunks
+          (the sim clock jumps 0, 1, or 2 ticks per frame), so the
+          feedforward's per-frame advance differs from the target's by up
+          to ~1 tick — a vibration visible from game start. The snap
+          eliminates it in steady state (the pose is exactly the target).
+        The snap threshold (2 ticks at max speed) covers the worst-case
+        steady-state gap (a burst frame advances the target 2 ticks), so
+        the snap always engages in steady state, and the transition lurch
+        when a stall gap closes to <= 2 ticks is at most 2 ticks — the same
+        as a normal burst-frame move, not perceived as a lurch.
 
-        Two subtleties that matter (both were bugs when missed):
-        - The feedforward must apply EVERY frame, even when the residual is
-          ~0. If it's skipped when the residual is ~0, the smoothed pose
-          stays put while the target moves by v*dt, and the gap jumps by
-          v*dt — a per-frame jitter.
+        Subtleties that matter (each was a bug when missed):
+        - The feedforward must apply EVERY frame of the controller branch
+          (even when the residual is ~0). If it's skipped, the smoothed
+          pose stays put while the target moves by v*dt — a per-frame
+          jitter.
         - The catch-up reacts to the RESIDUAL gap (gap - ship's motion this
           frame), not the full gap. The full gap includes the ship's motion
           during the frame, which the feedforward already handles; reacting
           to the full gap double-counts that motion, over-corrects, and
-          overshoots — a per-frame jitter. The catch-up DIRECTION is toward
-          the target (delta / dist, always well-defined), not along the
-          residual (a near-zero residual's direction is numerically
-          unstable).
+          overshoots. The catch-up DIRECTION is toward the target
+          (delta / dist, always well-defined), not along the residual (a
+          near-zero residual's direction is numerically unstable).
 
         This is a RENDER helper only — it does NOT touch self._ship.pos
         (the ghost's actual simulated pose, which the no-teleport/rewind
@@ -2713,48 +2737,54 @@ class PredictedShip:
         # the ship exactly).
         ship_vel = self._ship.vel
         max_speed = MAX_SPEED * self._ship.hull.max_speed_factor
-        # Position: feedforward + capped proportional catch-up. NO SNAP —
-        # the feedforward tracks the target exactly in steady state (gap
-        # -> 0), and the catch-up closes any stall gap (exponential decay).
-        # A snap (setting smooth_pos = target_pos) would leave the smoothed
-        # pose behind by v*TICK on the next frame (the target moves, but the
-        # snap overrode the feedforward) — a per-frame jitter. The
-        # feedforward + catch-up closes the gap to ~0 (sub-pixel) without
-        # the jitter.
+        # HYBRID: snap to the target when the gap is small (steady state —
+        # the old behavior, no vibration), use the velocity controller when
+        # the gap is large (stall recovery — smooth catch-up).
         #
-        # The catch-up reacts to the RESIDUAL gap (the gap MINUS the ship's
-        # motion during the frame), not the full gap. The full gap at the
-        # start of the frame includes the ship's motion during the frame
-        # (v*dt), which the feedforward is already handling. If the
-        # catch-up reacted to the full gap, it would double-count the
-        # ship's motion, over-correct, and overshoot — a per-frame jitter
-        # (the gap oscillates: closes, overshoots, closes, ...). Using the
-        # residual gap eliminates the double-counting, so the gap closes
-        # monotonically (no overshoot, no jitter).
+        # Why the hybrid: the velocity controller's feedforward
+        # (smooth += ship_vel * dt) approximates the target's advance, but
+        # the target advances in RAGGED tick chunks (the sim clock jumps 0,
+        # 1, or 2 ticks per frame) while the feedforward integrates over the
+        # SMOOTH real frame time dt. That mismatch is a per-frame error of
+        # up to ~1 tick (8.67 px) — a constant vibration visible from game
+        # start. The old code snapped to the target in steady state (gap
+        # <= cap), so the rendered pose was EXACTLY the render target every
+        # frame — zero error, no vibration. The hybrid restores that: snap
+        # when the gap is small (steady state), use the controller only when
+        # the gap is large (a stall).
+        #
+        # The threshold is SMOOTH_SNAP_FACTOR * max_speed * TICK (2 ticks of
+        # motion at max speed). The steady-state gap is at most 2 ticks (the
+        # sim clock can advance 2 ticks in one frame), so 2.0 always snaps in
+        # steady state (no vibration). When a stall gap closes to <= 2 ticks,
+        # the snap lurch is at most 2 ticks — the same as a normal burst-frame
+        # move, so it is not perceived as a lurch.
         delta = target_pos - self._smooth_pos
         dist = delta.length()
-        # The residual gap: the gap minus the ship's motion during the
-        # frame (the part the feedforward does NOT handle). The catch-up
-        # magnitude is proportional to the residual (so it doesn't
-        # double-count the ship's motion, which the feedforward handles),
-        # but the catch-up DIRECTION is toward the target (delta / dist) —
-        # the direction of a near-zero residual is numerically unstable,
-        # while delta / dist is always well-defined.
-        residual = delta - ship_vel * dt
-        rdist = residual.length()
-        # ALWAYS apply the feedforward (track the ship's motion exactly).
-        # The feedforward is what keeps the smoothed pose tracking the
-        # target in steady state — it must apply even when the residual is
-        # ~0 (otherwise the smoothed pose stays put while the target moves
-        # by v*dt, and the gap jumps by v*dt — a per-frame jitter).
-        self._smooth_pos += ship_vel * dt
-        # Apply the catch-up only if there's a residual gap (proportional
-        # to the residual, capped, toward the target). When the residual is
-        # ~0 the feedforward alone keeps the gap at ~0 (no catch-up needed).
-        if rdist > 1e-9 and dist > 1e-9:
-            catch = min(self.SMOOTH_GAIN * rdist,
-                        self.SMOOTH_MAX_CATCH * max_speed)
-            self._smooth_pos += (delta / dist) * catch * dt
+        snap_threshold = self.SMOOTH_SNAP_FACTOR * max_speed * TICK
+        if dist <= snap_threshold:
+            # Steady state: snap to the target exactly (no vibration).
+            self._smooth_pos = pygame.Vector2(target_pos)
+        else:
+            # Stall recovery: velocity controller (feedforward + proportional
+            # catch-up). The catch-up reacts to the RESIDUAL gap (the gap
+            # MINUS the ship's motion during the frame), not the full gap —
+            # the full gap includes the ship's motion during the frame
+            # (v*dt), which the feedforward is already handling. Reacting to
+            # the full gap would double-count that motion, over-correct, and
+            # overshoot. The catch-up DIRECTION is toward the target
+            # (delta / dist, always well-defined), not along the residual
+            # (a near-zero residual's direction is numerically unstable).
+            residual = delta - ship_vel * dt
+            rdist = residual.length()
+            # ALWAYS apply the feedforward (track the ship's motion exactly).
+            self._smooth_pos += ship_vel * dt
+            # Apply the catch-up only if there's a residual gap (proportional
+            # to the residual, capped, toward the target).
+            if rdist > 1e-9 and dist > 1e-9:
+                catch = min(self.SMOOTH_GAIN * rdist,
+                            self.SMOOTH_MAX_CATCH * max_speed)
+                self._smooth_pos += (delta / dist) * catch * dt
         # Angle: same discipline. The feedforward is the ship's angular
         # velocity (the render target advances at the ship's turn rate, see
         # _render_pre_step: next_angle = s.angle + turn * ROT_SPEED *
@@ -2766,31 +2796,32 @@ class PredictedShip:
         ship_omega = turn * ROT_SPEED * self._ship.hull.turn_rate_factor
         max_turn_rate = ROT_SPEED * self._ship.hull.turn_rate_factor
         da = (target_angle - self._smooth_angle + math.pi) % (2 * math.pi) - math.pi
-        # NO SNAP (same reason as the position): the feedforward tracks the
-        # target exactly in steady state (gap -> 0), and the catch-up closes
-        # any stall gap (exponential decay). A snap would leave the smoothed
-        # angle behind by omega*TICK on the next frame (the target rotates,
-        # but the snap overrode the feedforward) — a per-frame jitter.
-        #
-        # The catch-up reacts to the RESIDUAL angle gap (the gap MINUS the
-        # ship's rotation during the frame), not the full gap. The full gap
-        # at the start of the frame includes the ship's rotation during the
-        # frame (omega*dt), which the feedforward is already handling. If
-        # the catch-up reacted to the full gap, it would double-count the
-        # ship's rotation, over-correct, and overshoot — a per-frame jitter.
-        # Using the residual gap eliminates the double-counting, so the gap
-        # closes monotonically (no overshoot, no jitter).
-        residual_da = da - ship_omega * dt
-        # ALWAYS apply the feedforward (track the ship's rotation exactly) —
-        # see the position: it must apply even when the residual is ~0, or
-        # the smoothed angle stays put while the target rotates by
-        # omega*dt (a per-frame jitter).
-        self._smooth_angle += ship_omega * dt
-        # Apply the catch-up only if there's a residual angle gap.
-        if abs(residual_da) > 1e-9:
-            catch = min(self.SMOOTH_GAIN * abs(residual_da),
-                        self.SMOOTH_MAX_CATCH * max_turn_rate)
-            self._smooth_angle += math.copysign(catch, residual_da) * dt
+        # HYBRID (same as the position): snap to the target when the angle
+        # gap is small (steady state — no vibration), use the velocity
+        # controller when the gap is large (stall recovery — smooth
+        # catch-up). The threshold is SMOOTH_SNAP_FACTOR * max_turn_rate *
+        # TICK (2 ticks of rotation at max turn rate) — the steady-state
+        # angle gap is at most 2 ticks, so 2.0 always snaps in steady state.
+        ang_snap_threshold = (self.SMOOTH_SNAP_FACTOR * max_turn_rate * TICK)
+        if abs(da) <= ang_snap_threshold:
+            # Steady state: snap to the target exactly (no vibration).
+            self._smooth_angle = target_angle
+        else:
+            # Stall recovery: velocity controller. The catch-up reacts to
+            # the RESIDUAL angle gap (the gap MINUS the ship's rotation
+            # during the frame), not the full gap — the full gap includes
+            # the ship's rotation during the frame (omega*dt), which the
+            # feedforward is already handling. Reacting to the full gap
+            # would double-count that rotation, over-correct, and overshoot.
+            residual_da = da - ship_omega * dt
+            # ALWAYS apply the feedforward (track the ship's rotation
+            # exactly).
+            self._smooth_angle += ship_omega * dt
+            # Apply the catch-up only if there's a residual angle gap.
+            if abs(residual_da) > 1e-9:
+                catch = min(self.SMOOTH_GAIN * abs(residual_da),
+                            self.SMOOTH_MAX_CATCH * max_turn_rate)
+                self._smooth_angle += math.copysign(catch, residual_da) * dt
         return self._smooth_pos, self._smooth_angle
 
     def pos(self):

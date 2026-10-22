@@ -127,7 +127,8 @@ def test_angle_catchup_at_rest():
 
 def test_steady_state_zero_lag():
     """A ship moving at max speed, smoothed pose seeded ON the target, must
-    stay ON the target (the floor must not add lag at max speed)."""
+    stay EXACTLY ON the target every frame (the hybrid snaps to the target
+    in steady state — zero per-frame error, no vibration)."""
     g = make_ghost()
     v = MAX_SPEED * g.ship.hull.max_speed_factor
     g.ship.pos = pygame.Vector2(0.0, 0.0)
@@ -147,14 +148,52 @@ def test_steady_state_zero_lag():
         g.ship.pos += g.ship.vel * TICK
         sp, _ = g.render_pose_smoothed(DT)
         # The target this frame is the new physics pose (vel*TICK pre-step,
-        # _acc 0 -> base = s.pos). The smoothed pose should track it with
-        # ~zero lag (cap == max_speed*dt == the target's per-frame advance).
+        # _acc 0 -> base = s.pos). The hybrid SNAPS to the target in steady
+        # state, so the error must be EXACTLY 0 (no vibration).
         lag = (g.ship.pos - sp).length()
         max_lag = max(max_lag, lag)
-    # Zero-lag tolerance: one tick of motion is v*TICK; allow up to that.
-    assert max_lag <= v * TICK + EPS, (
-        f"steady-state lag {max_lag:.3f} px exceeds one tick of motion "
-        f"({v * TICK:.3f} px) — the floor introduced lag at max speed")
+    assert max_lag < EPS, (
+        f"steady-state error {max_lag:.4f} px — the smoothed pose must be "
+        f"EXACTLY on the target in steady state (the hybrid snaps; a "
+        f"feedforward-only tracker leaves a per-frame vibration)")
+    return True
+
+
+def test_steady_state_no_vibration():
+    """The vibration regression: at a CRUISING speed (below max), the
+    smoothed pose must be EXACTLY the render target every frame — including
+    on a BURST frame where the target advances 2 ticks in one frame (the
+    worst-case steady-state gap). A feedforward-only tracker (no snap)
+    leaves a per-frame error of up to ~1 tick (the feedforward integrates
+    over the smooth frame time dt, but the target advances in ragged tick
+    chunks) — a constant vibration visible from game start. The hybrid
+    snaps whenever the gap is <= 2 ticks of motion at max speed, which
+    covers the worst-case steady-state gap, so the error is exactly 0.
+    """
+    g = make_ghost()
+    v = 300.0  # a realistic cruising speed (below max)
+    g.ship.pos = pygame.Vector2(0.0, 0.0)
+    g.ship.angle = 0.0
+    g.ship.vel = pygame.Vector2(v, 0.0)
+    g._acc = 0.0
+    g._last_inp = ShipInput()
+    g._smooth_pos = pygame.Vector2(0.0, 0.0)
+    g._smooth_angle = 0.0
+    g._smooth_dead = False
+
+    max_err = 0.0
+    for i in range(120):
+        # Alternate 1-tick and 2-tick (burst) frames — the sim clock
+        # advances 0, 1, or 2 ticks per frame in real play.
+        ticks = 2 if i % 3 == 0 else 1
+        g.ship.pos += g.ship.vel * TICK * ticks
+        sp, _ = g.render_pose_smoothed(DT)
+        err = (g.ship.pos - sp).length()
+        max_err = max(max_err, err)
+    assert max_err < EPS, (
+        f"steady-state vibration: max per-frame error {max_err:.4f} px "
+        f"(the smoothed pose must be EXACTLY the target in steady state — "
+        f"the hybrid snaps; a feedforward-only tracker vibrates)")
     return True
 
 
@@ -215,6 +254,7 @@ def main():
         ("position catch-up at rest", test_position_catchup_at_rest),
         ("angle catch-up at rest", test_angle_catchup_at_rest),
         ("steady-state zero lag", test_steady_state_zero_lag),
+        ("steady-state no vibration", test_steady_state_no_vibration),
         ("no rubber-band on start moving", test_no_rubberband_on_start_moving),
     ]:
         try:

@@ -7,8 +7,12 @@ NEVER close — the ship sat still while its smoothed pose (and therefore its
 muzzle) stayed stuck at the pre-stall position. Bullets fired from that stale
 pose appeared to come from empty space and never got closer.
 
-The fix floors the catch-up rate at the ship's MAX speed (position) and MAX
-turn rate (angle), so the gap always closes at >= 1 tick/frame even at rest.
+The fix is a VELOCITY-BASED CONTROLLER (feedforward + proportional): the
+smoothed pose's velocity = the ship's velocity (feedforward: track the ship's
+motion exactly, zero steady-state lag) + GAIN * the gap (proportional: close
+any stall gap, damped). The gap closes with a time constant of 1/GAIN,
+independent of the ship's motion (the feedforward cancels it), so the gap
+closes at rest AND while the ship is moving (no rubber-band).
 
 This gate is a pure function of the ghost's internal render state (no Game,
 no network), so it is deterministic and fast:
@@ -19,8 +23,13 @@ no network), so it is deterministic and fast:
       the old actual-speed cap the gap would stay 100 px forever (FAIL).
   (2) ANGLE CATCH-UP AT REST — same, for a stale heading while not turning.
   (3) STEADY-STATE ZERO LAG — a ship moving at max speed with the smoothed
-      pose seeded ON the target must stay ON the target (the floor must not
-      introduce lag when the ship is actually moving at max speed).
+      pose seeded ON the target must stay ON the target (the feedforward must
+      track the ship exactly, no lag).
+  (4) NO RUBBER-BAND ON START MOVING — a stall leaves a gap, then the ship
+      starts moving at max speed. The gap must keep CLOSING (not grow) — the
+      feedforward cancels the ship's motion, so the gap dynamics are
+      independent of the ship's velocity. A constant-velocity slide (the
+      floor fix) has no feedforward and rubber-bands here.
 
 Run:  python -m ship5.test_11_smoothed_catchup
 """
@@ -149,6 +158,56 @@ def test_steady_state_zero_lag():
     return True
 
 
+def test_no_rubberband_on_start_moving():
+    """The key scenario: a stall leaves a gap, then the player starts
+    moving. The gap must keep CLOSING (not grow / rubber-band) when the
+    ship starts moving. This is the property the feedforward gives: the
+    gap dynamics are d(gap)/dt = -GAIN*gap, INDEPENDENT of the ship's
+    velocity (the feedforward cancels the ship's motion). A
+    constant-velocity slide (the floor fix) has no feedforward, so when
+    the ship starts moving at max speed the slide (also at max speed)
+    can't close the gap — it stays stuck or grows (the rubber-band).
+    """
+    g = make_ghost()
+    # Start at rest with a 100 px gap (a stall just happened).
+    _set_rest(g, (100.0, 0.0), 0.0)
+    g._smooth_pos = pygame.Vector2(0.0, 0.0)
+    g._smooth_angle = 0.0
+    g._smooth_dead = False
+
+    # Let the gap close a bit at rest (a few frames).
+    for _ in range(5):
+        g.render_pose_smoothed(DT)
+    prev_gap = (pygame.Vector2(100.0, 0.0) - g._smooth_pos).length()
+
+    # Now the player starts moving at max speed. The gap must keep
+    # closing (not grow) — the feedforward cancels the ship's motion, so
+    # the gap dynamics are independent of the ship's velocity.
+    v = MAX_SPEED * g.ship.hull.max_speed_factor
+    g.ship.vel = pygame.Vector2(v, 0.0)
+    closed = False
+    for _ in range(60):
+        # Advance the physics pose (the target moves at the ship's speed).
+        g.ship.pos += g.ship.vel * TICK
+        sp, _ = g.render_pose_smoothed(DT)
+        gap = (g.ship.pos - sp).length()
+        # The gap must not grow when the ship starts moving (no
+        # rubber-band). Allow a 1 px tolerance for the feedforward to
+        # catch up to the new velocity.
+        assert gap <= prev_gap + 1.0, (
+            f"gap grew when the ship started moving: {prev_gap:.2f} -> "
+            f"{gap:.2f} px (rubber-band — no feedforward)")
+        prev_gap = gap
+        if gap < EPS:
+            closed = True
+            break
+    assert closed, (
+        f"gap did not close while the ship was moving: final gap "
+        f"{prev_gap:.2f} px (the slide can't close the gap at max speed "
+        f"— no feedforward)")
+    return True
+
+
 def main():
     pygame.init()
     ok = True
@@ -156,6 +215,7 @@ def main():
         ("position catch-up at rest", test_position_catchup_at_rest),
         ("angle catch-up at rest", test_angle_catchup_at_rest),
         ("steady-state zero lag", test_steady_state_zero_lag),
+        ("no rubber-band on start moving", test_no_rubberband_on_start_moving),
     ]:
         try:
             fn()

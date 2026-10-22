@@ -251,6 +251,147 @@ def test_net_process():
     return ok
 
 
+def test_net_process_rate_limiter():
+    """The snapshot rate limiter: two snaps put in the queue BACK-TO-BACK
+    (a sim burst — 2 ticks batched into one OS wake) must come out of the
+    socket ~16.7 ms apart (one per send window), NOT back-to-back. This is
+    the burst-frame fix: the client receives exactly one snap per frame
+    instead of two in one frame (which made the ghost clock's re-anchor
+    jump ~1 tick and shudder the ship).
+
+    Returns True when all checks pass."""
+    ok = True
+    ctx = multiprocessing.get_context("spawn")
+    port = _free_port()
+    host_hull = PLAYER_HULLS[0]
+    host_loadout = default_loadout(host_hull)
+    client_hull = PLAYER_HULLS[1]
+    client_loadout = default_loadout(client_hull)
+
+    p, status_parent, net_queue, ri_sim_end = _spawn_net(
+        ctx, port, host_hull, host_loadout)
+
+    # The fake client records the WALL time each T_SNAP arrives (the
+    # arrival cadence the client's ghost clock sees).
+    snap_arrivals = []
+    client = {}
+    client_err = []
+    client_stop = threading.Event()
+    def fake_client():
+        conn = None
+        try:
+            time.sleep(0.3)   # let the net process bind + listen
+            conn = connect("127.0.0.1", port)
+            do_handshake_client(conn, serialize_hull(client_hull),
+                                serialize_loadout(client_loadout))
+            conn.set_nonblocking()
+            client["conn"] = conn
+            while not client_stop.is_set():
+                for m in conn.poll():
+                    if m.get("type") == T_SNAP:
+                        snap_arrivals.append(time.monotonic())
+                time.sleep(0.001)
+        except Exception as e:
+            client_err.append(repr(e))
+        finally:
+            # Close the socket on stop: the net process detects the
+            # disconnect via the FIN (conn.closed), so the test's shutdown
+            # check needs the client to actually close, not just stop
+            # polling.
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    th = threading.Thread(target=fake_client, daemon=True)
+    th.start()
+
+    try:
+        status = _wait_for_status(status_parent, "connected")
+        ok &= check("ratelimit: the net process reported the client joined",
+                    status is not None, repr(status))
+        if status is None:
+            return ok
+        th.join(timeout=5)
+        ok &= check("ratelimit: fake client has no error",
+                    not client_err, repr(client_err))
+
+        # Put TWO snaps back-to-back (a burst — the sim batched 2 ticks
+        # into one wake, so it published 2 snaps within ~0-1 ms). The
+        # rate limiter must send the 1st immediately and HOLD the 2nd for
+        # the next send window (~16.7 ms later).
+        snap = _fake_snapshot()
+        net_queue.put(("snap", 1.0, snap))
+        net_queue.put(("snap", 1.0 + 1 / 60.0, snap))
+
+        # Wait for both to arrive (the 2nd is held ~16.7 ms, so allow a
+        # generous window).
+        deadline = time.monotonic() + 1.0
+        while len(snap_arrivals) < 2 and time.monotonic() < deadline:
+            time.sleep(0.002)
+
+        ok &= check("ratelimit: BOTH snaps arrived (no loss)",
+                    len(snap_arrivals) == 2,
+                    "n=%d" % len(snap_arrivals))
+        if len(snap_arrivals) == 2:
+            gap = snap_arrivals[1] - snap_arrivals[0]
+            # The gap must be ~one send window (16.7 ms): clearly above a
+            # back-to-back send (~0-1 ms, the bug) and below two windows
+            # (33 ms, which would mean the limiter over-holds). The band
+            # [8, 40] ms is generous to timing jitter but unambiguous:
+            # a back-to-back send is <2 ms, a held send is ~16.7 ms.
+            ok &= check("ratelimit: the 2nd snap was held for the next "
+                        "window (~16.7 ms apart, not back-to-back)",
+                        0.008 <= gap <= 0.040,
+                        "gap=%.1f ms" % (gap * 1000.0))
+            print("  [ratelimit] burst of 2 snaps -> arrival gap %.1f ms "
+                  "(want ~16.7)" % (gap * 1000.0))
+
+        # A 3-snap burst must come out one per window (0, 16.7, 33.3 ms) —
+        # the FIFO drains one per window, not just "hold the second."
+        snap_arrivals.clear()
+        net_queue.put(("snap", 2.0, snap))
+        net_queue.put(("snap", 2.0 + 1 / 60.0, snap))
+        net_queue.put(("snap", 2.0 + 2 / 60.0, snap))
+        deadline = time.monotonic() + 1.5
+        while len(snap_arrivals) < 3 and time.monotonic() < deadline:
+            time.sleep(0.002)
+        ok &= check("ratelimit: a 3-snap burst -> all 3 arrived (no loss)",
+                    len(snap_arrivals) == 3, "n=%d" % len(snap_arrivals))
+        if len(snap_arrivals) == 3:
+            g1 = snap_arrivals[1] - snap_arrivals[0]
+            g2 = snap_arrivals[2] - snap_arrivals[1]
+            ok &= check("ratelimit: the 3-snap burst is paced one per "
+                        "window (both gaps ~16.7 ms)",
+                        0.008 <= g1 <= 0.040 and 0.008 <= g2 <= 0.040,
+                        "g1=%.1f ms g2=%.1f ms" % (g1 * 1000.0,
+                                                   g2 * 1000.0))
+            print("  [ratelimit] burst of 3 snaps -> gaps %.1f, %.1f ms "
+                  "(want ~16.7 each)" % (g1 * 1000.0, g2 * 1000.0))
+
+        # Shutdown: the client goes away -> the net process reports
+        # disconnected + exits (the held snaps are dropped — a disconnect
+        # is a clean shutdown, not a loss the client cares about).
+        client_stop.set()
+        th.join(timeout=3)
+        status2 = _wait_for_status(status_parent, "disconnected")
+        ok &= check("ratelimit: the net process reported the disconnect",
+                    status2 is not None, repr(status2))
+        p.join(timeout=3)
+        ok &= check("ratelimit: the net process exited", not p.is_alive())
+    finally:
+        client_stop.set()
+        if p.is_alive():
+            p.terminate()
+            p.join()
+        ri_sim_end.close()
+        status_parent.close()
+
+    print("\nNET PROCESS (snapshot rate limiter):",
+          "ALL PASS" if ok else "FAILURES")
+    return ok
+
+
 def test_net_process_quit():
     """The net process exits cleanly on ("quit",) (the render process's
     ESC/QUIT) — tested in the accept loop (no client connected). Returns
@@ -282,6 +423,7 @@ def main():
     ok = True
     print("NET PROCESS (plan_13, Phase 1, Chunk 1a)")
     ok &= test_net_process()
+    ok &= test_net_process_rate_limiter()
     ok &= test_net_process_quit()
     print("\nNET PROCESS (1a):", "ALL PASS" if ok else "FAILURES")
     raise SystemExit(0 if ok else 1)

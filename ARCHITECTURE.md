@@ -13,9 +13,25 @@ re-explaining. History (why a rule changed) lives in git, not here.
   render point in the PAST; it renders its OWN ship from the ghost, which
   is stepped with local input and reconciled to authority.
 - The host applies the LATEST received input each tick (pinned #5).
-- Snapshots are published at the sim STEP (60 Hz, one per step) and sent
-  immediately by the NetWorker — no send timer. The snapshot's sim_time
-  IS its send time. The client reconciles at the ghost's OWN clock
+- Snapshots are published at the sim STEP (60 Hz, one per step). The
+  host's NET process sends them RATE-LIMITED: at most one per TICK
+  (16.7 ms) wall-time window (a FIFO holds any extra). WHY: the sim
+  process occasionally batches 2 ticks into one OS wake (scheduler
+  latency — the loop body is light, ~1 ms; the OS just wakes the thread
+  ~1 tick late ~12-19% of the time on the host's Mac), so it publishes 2
+  snaps within ~0-1 ms of each other. Sending both the moment they land
+  makes the client receive 2 snaps in one frame (a burst frame): the
+  ghost clock's re-anchor (anchored on the newest arrival) jumps ~1
+  tick, the render target jumps ~1 tick, and the ship shudders. The
+  limiter makes the client receive exactly one snap per frame — a smooth
+  1-tick arrival cadence. A rate limiter (not a precise send timer): a
+  timer would be subject to the SAME OS wake latency as the sim; the
+  limiter only gates the send, driven by the net process's ~1 ms loop, so
+  a late wake causes a GAP (the client's interpolation buffer holds the
+  last frame), never a burst. Beams/echoes are still sent the moment
+  they land (low-rate events, no cadence). The snapshot's sim_time is
+  still its stamp (the limiter delays the SEND by at most one window on
+  a burst, not the stamp). The client reconciles at the ghost's OWN clock
   (`ghost.sim_time`, advanced to the current frame BEFORE the poll
   loop) — NOT at `sim_time + L` (that anchor sat ~3 ms ahead of the raw
   clock and each reconcile jumped the clock forward -> a per-reconcile
@@ -56,27 +72,37 @@ re-explaining. History (why a rule changed) lives in git, not here.
   * the MODEL channel (maxsize 4): the render model (60 Hz) + lifecycle
     (ready/crash/done). Drained by the RENDER thread.
   * the NET channel (maxsize 16): the wire traffic (snap/beam/echo) the
-    SimThread hands to its worker. Drained by a DEDICATED net-pump
-    thread (run_host's _NetPump) — NOT the render thread.
+    SimThread hands to its worker. Drained by the host's DEDICATED NET
+    PROCESS (net_process.py, plan_13) — NOT the render thread. The net
+    process owns the socket end to end (listen + accept + handshake +
+    send + receive) and runs its own ~1 ms loop, so the render thread's
+    draw is completely out of the send path (no shared GIL, no GIL-switch
+    lag). It sends beams/echoes the moment they land and rate-limits the
+    snaps (one per TICK window — see the snapshot bullet above).
 - The render loop DRAINS the model queue in the SAME thread as the draw,
   every frame. A separate drain thread would be starved by the draw's
   GIL hold, the queue would fill, and the sim process would block —
   defeating the whole point.
-- The NetWorker + Connection stay in the RENDER process (a live socket
-  is not passed across the spawn boundary). The sim process hands the
-  render process the snapshot / beam / echo data over the DEDICATED net
-  Queue; a dedicated net-pump thread (run_host's _NetPump) drains it and
-  routes each message to the worker, which serializes + sends it the
-  moment it lands (M4). WHY a dedicated thread: the first M4 rode the
-  wire traffic on the model Queue, so the render thread's per-frame
-  drain (the SAME thread as the draw) was in the snapshot's send path —
-  a busy draw delayed (up to a full frame) or dropped snapshots. The
-  pump drains the net Queue every ~1 ms regardless of the draw, so the
-  render thread's draw is OUT of the send path. (The pump shares the
-  render process's GIL with the draw, so under a heavy draw its sends
-  can lag by up to the GIL switch interval — far better than a full
-  frame, and the sim process itself is GIL-free, so the snapshot STAMPS
-  stay smooth either way.)
+- The socket + the send live in the host's DEDICATED NET PROCESS
+  (net_process.py, plan_13) — NOT the render process. A live socket
+  can't be pickled across the spawn boundary, so the net process owns
+  it end to end (listen + accept + the join/welcome handshake + send +
+  receive). The sim process hands it the snapshot / beam / echo data
+  over the DEDICATED net Queue; the net process drains it in its own
+  ~1 ms loop and sends each message (beams/echoes immediately, snaps
+  rate-limited — see the snapshot bullet). WHY a separate process (not
+  a thread in the render process): the first M4 rode the wire traffic on
+  the model Queue, so the render thread's per-frame drain (the SAME
+  thread as the draw) was in the snapshot's send path — a busy draw
+  delayed (up to a full frame) or dropped snapshots. A net-pump THREAD
+  was the next fix, but it still shared the render process's GIL with
+  the draw, so under a heavy draw its sends could lag by up to the GIL
+  switch interval. The separate process has its OWN GIL (shared only
+  with itself), so the render thread's draw can hold the render GIL for
+  as long as it wants and the net process keeps draining + sending —
+  the render thread is COMPLETELY out of the send path. (The sim
+  process is GIL-free too, so the snapshot STAMPS stay smooth either
+  way; the rate limiter smooths the SEND cadence on top of that.)
 
 ## Wire
 - TCP, non-blocking, 4-byte big-endian length prefix + JSON. Message

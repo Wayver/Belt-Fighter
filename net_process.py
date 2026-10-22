@@ -51,6 +51,8 @@ import os
 import time
 import traceback
 
+from .config import TICK
+
 # The net import chain (net -> intent -> pygame) pulls in pygame, so the
 # dummy drivers MUST be set before that import. They are set inside
 # net_process_main (below), NOT here, so the PARENT process — which imports
@@ -119,6 +121,36 @@ def net_process_main(status_conn, net_queue, remote_input_conn,
     snap_log_f = None
     snap_seq = 0
 
+    # SNAPSHOT RATE LIMITER (the burst-frame fix). The sim process
+    # occasionally batches 2 ticks into one OS wake (scheduler latency —
+    # the loop body is light, the OS just wakes the thread ~1 tick late
+    # ~12-19% of the time), so it publishes 2 snapshots within ~0-1 ms of
+    # each other in wall time. Sending both the moment they land makes the
+    # client receive 2 snaps in one frame (a burst frame): the ghost
+    # clock's re-anchor (anchored on the newest arrival) jumps ~1 tick,
+    # the render target jumps ~1 tick, and the ship shudders. The rate
+    # limiter holds the 2nd snap in `snap_fifo` and sends it on the next
+    # send window (~16.7 ms later), so the client receives EXACTLY one
+    # snap per frame — a smooth 1-tick arrival cadence, no burst.
+    #
+    # Why a rate limiter (not a precise send timer): a timer (sleep until
+    # the next 16.7 ms boundary) would be subject to the SAME OS wake
+    # latency as the sim — a late wake would batch the sends. The rate
+    # limiter only GATES the send (at most one per 16.7 ms window); it is
+    # driven by the net process's existing ~1 ms loop, so it cannot burst
+    # no matter how the snaps arrive. A late wake causes a GAP (no snap
+    # for one frame) — which the client's interpolation buffer already
+    # handles (it holds the last frame) — not a burst.
+    #
+    # `snap_fifo`: snaps pulled from the queue but held for the next send
+    # window (FIFO — oldest first, so the send order == the publish order
+    # == the stamp order, which the rock-shape tracker's verts
+    # delta-compression depends on). `last_snap_send`: the monotonic time
+    # of the last snap SENT (None until the first — the first snap is sent
+    # immediately).
+    snap_fifo = []
+    last_snap_send = None
+
     # Rock-shape tracker (plan_17): drives the verts delta-compression in
     # serialize_snapshot. One per connection; the net process is 2P-only
     # (accepts ONE client, no re-accept loop), so one tracker per process
@@ -181,13 +213,27 @@ def net_process_main(status_conn, net_queue, remote_input_conn,
                     break
                 elif m[0] == "snap_log":
                     _snap_log(m[1])
-            # SEND side: drain the sim's net Queue -> the socket. The sim
-            # publishes a snap (+ beam/echo) per step; the net process sends
-            # each the moment it lands, so the snapshot's age at send is ~0
-            # (the client's `now = sim_time + L` is exact). The queue is
-            # bounded + drop-when-full (the sim's put_nowait), so a backlog
-            # never blocks the sim — a dropped snapshot is a network loss the
-            # client's interpolation buffer already handles.
+            # SEND side: drain the sim's net Queue -> the socket.
+            #   * beam / echo: sent the moment they land (low-rate events,
+            #     no cadence — a beam is a 0.15 s flash, an echo is one
+            #     input; neither is a cadence the client phase-locks to).
+            #   * snap: RATE-LIMITED to at most one per TICK (16.7 ms)
+            #     wall-time window. The sim occasionally batches 2 ticks
+            #     into one OS wake (scheduler latency — the loop body is
+            #     light, the OS just wakes the thread ~1 tick late), so it
+            #     publishes 2 snaps within ~0-1 ms of each other. Sending
+            #     both the moment they land makes the client receive 2
+            #     snaps in one frame (a burst frame): the ghost clock's
+            #     re-anchor (anchored on the newest arrival) jumps ~1
+            #     tick, the render target jumps ~1 tick, and the ship
+            #     shudders. Holding the 2nd snap in snap_fifo and sending
+            #     it on the next window makes the client receive EXACTLY
+            #     one snap per frame — a smooth 1-tick arrival cadence.
+            #     The gate is on the LAST SEND time (not a fixed
+            #     boundary), so a descheduled net process (a late wake)
+            #     causes a GAP (no snap for one frame — the client's
+            #     interpolation buffer holds the last frame), never a
+            #     burst.
             while True:
                 try:
                     m = net_queue.get_nowait()
@@ -195,17 +241,25 @@ def net_process_main(status_conn, net_queue, remote_input_conn,
                     break
                 kind = m[0]
                 if kind == "snap":
-                    conn.send({"type": T_SNAP, "sim_time": m[1],
-                               "snap": serialize_snapshot(
-                                   m[2], rock_tracker)})
-                    if snap_log_f is not None:
-                        snap_seq += 1
-                        snap_log_f.write("%.3f,%.3f,%.4f,%d\n" % (
-                            time.time(), time.monotonic(), m[1], snap_seq))
-                        if snap_seq % 60 == 0:   # ~1 s of rows: bound buffer
-                            snap_log_f.flush()
+                    snap_fifo.append(m)
                 else:   # "beam" / "echo" — the msg dict is m[1]
                     conn.send(m[1])
+            # Rate-limited snap send: at most one per TICK window. The
+            # FIFO is drained oldest-first, so the send order == the
+            # publish order == the stamp order (the rock-shape tracker's
+            # verts delta-compression depends on that order).
+            if snap_fifo and (last_snap_send is None
+                              or time.monotonic() - last_snap_send >= TICK):
+                m = snap_fifo.pop(0)
+                conn.send({"type": T_SNAP, "sim_time": m[1],
+                           "snap": serialize_snapshot(m[2], rock_tracker)})
+                last_snap_send = time.monotonic()
+                if snap_log_f is not None:
+                    snap_seq += 1
+                    snap_log_f.write("%.3f,%.3f,%.4f,%d\n" % (
+                        time.time(), time.monotonic(), m[1], snap_seq))
+                    if snap_seq % 60 == 0:   # ~1 s of rows: bound buffer
+                        snap_log_f.flush()
             conn.drain_send()
             # RECEIVE side: the client's input + commands. The client's input
             # is forwarded to the sim the moment it lands (~1 ms) — the same

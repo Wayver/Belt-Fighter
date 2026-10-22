@@ -247,7 +247,7 @@ def arm_separate_process():
             print("  [separate-process] SIM CRASHED:\n" + m[1])
             parent_conn.close()
             p.join()
-            return []
+            return [], None
     # The render loop: each frame, DRAIN the model queue (the render
     # thread reads the newest model) then DRAW (the GIL load). Same
     # thread, every frame. The queue is bounded + drop-on-full, so a
@@ -303,12 +303,12 @@ def arm_separate_process():
     ri_sim_end.close()
     ri_net_end.close()   # the sim has exited; release the net end
     if done is not None:
-        _, steps, simt, wall, stamps = done
+        _, steps, simt, wall, stamps, iter_log = done
         print("  [separate-process] CHILD step report: steps=%d sim_time=%.3f "
               "wall=%.3f -> sim/wall=%.2fx (%.1f steps/s)"
               % (steps, simt, wall, simt / wall, steps / wall))
-        return stamps
-    return []
+        return stamps, iter_log
+    return [], None
 
 
 # ---------------------------------------------------------------------------
@@ -557,7 +557,7 @@ def test_m2_input_commands_remote():
     parent_conn.close()
     ri_sim_end.close()
     if done is not None:
-        _, steps, simt, wall, _stamps = done
+        _, steps, simt, wall, _stamps, _iter_log = done
         print("  [M2] CHILD step report: steps=%d sim_time=%.3f wall=%.3f"
               % (steps, simt, wall))
     return ok
@@ -777,7 +777,7 @@ def test_m3_hulls_and_sfx():
     parent_conn.close()
     ri_sim_end.close()
     if done is not None:
-        _, steps, simt, wall, _stamps = done
+        _, steps, simt, wall, _stamps, _iter_log = done
         print("  [M3] CHILD step report: steps=%d sim_time=%.3f wall=%.3f"
               % (steps, simt, wall))
     return ok
@@ -1194,8 +1194,27 @@ def main():
         _report_walls("in-process WALL", walls_a)
 
         print("\nB. SEPARATE PROCESS (sim in spawned process, GIL load in parent):")
-        stamps_b = arm_separate_process()
+        stamps_b, iter_log_b = arm_separate_process()
         n_b, batched_b, pct_b = _report("separate STAMPS", stamps_b)
+        # Cadence decomposition (the batching diagnostic): body_time is the
+        # work per iteration; inter_wake is the real time between wakes.
+        # inter_wake = body_time + sleep + wake_latency. A large body_time
+        # means the loop body eats into the tick; a ragged inter_wake with
+        # a small body_time means the OS scheduler wakes the thread late.
+        if iter_log_b:
+            rows = iter_log_b[1:]   # skip the first (inter_wake = 0)
+            if rows:
+                inter = [r[0] * 1000 for r in rows]
+                body = [r[1] * 1000 for r in rows]
+                nsteps = [r[2] for r in rows]
+                n2 = sum(1 for s in nsteps if s >= 2)
+                print("  [separate WALL] %d iters: inter_wake med=%.2f "
+                      "max=%.2f ms  body med=%.2f max=%.2f ms  "
+                      "batched(>=2 steps)=%d (%.1f%%)"
+                      % (len(rows),
+                         sorted(inter)[len(inter) // 2], max(inter),
+                         sorted(body)[len(body) // 2], max(body),
+                         n2, 100.0 * n2 / len(rows)))
 
         print()
         # The separate-process sim must actually be running (enough stamps

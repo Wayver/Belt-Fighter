@@ -127,6 +127,17 @@ class SimThread:
         # stamps jump and is a candidate driver of the client's sawtooth
         # snap.
         self._steps_total = 0
+        # Per-iteration cadence log (diagnostics): (inter_wake, body_time,
+        # steps) tuples, one per loop iteration. `inter_wake` is the real
+        # time between consecutive wakes (top of the loop); `body_time` is
+        # the work done this iteration (wake -> just before the sleep);
+        # `steps` is the number of fixed steps taken. Used to diagnose WHY
+        # the sim batches: inter_wake = body_time + sleep + wake_latency, so
+        # a ragged inter_wake with a small body_time means the OS scheduler
+        # is waking the thread late (jitter); a large body_time means the
+        # loop body is eating into the tick. None disables the log (the
+        # default — it is only enabled for the cadence diagnostics).
+        self._iter_log = None
         self._stop = threading.Event()
         self._thread = None
         self._started = False
@@ -198,7 +209,14 @@ class SimThread:
         g = self._game
         acc = 0.0
         last = time.monotonic()
+        prev_top = None   # previous iteration's top-of-loop time (cadence log)
         while not self._stop.is_set():
+            # Cadence log: the top-of-loop time (the wake moment). The
+            # inter-wake interval is measured between consecutive tops;
+            # the body time is top -> just before the sleep.
+            iter_t0 = time.monotonic()
+            inter_wake = (iter_t0 - prev_top) if prev_top is not None else 0.0
+            prev_top = iter_t0
             # 1. commands: drain everything posted since the last
             #    iteration (a few at most — the render thread posts at
             #    most one per key, per frame). Applied BEFORE stepping
@@ -322,6 +340,19 @@ class SimThread:
             #    accumulator build up 1-7 ticks of time between wake-ups,
             #    which batches the steps and makes the snapshot stamps
             #    jump).
+            # Cadence log: record (inter_wake, body_time, steps) for this
+            # iteration. body_time = top-of-loop -> just before the sleep
+            # (the work done: command drain + steps + model publish).
+            # inter_wake = the real time between consecutive wakes. The
+            # decomposition: inter_wake = body_time + sleep_time +
+            # wake_latency, where wake_latency is the OS scheduler's
+            # overshoot (how long after the requested sleep the thread
+            # actually resumed). A ragged inter_wake with a small
+            # body_time => OS jitter; a large body_time => the loop body
+            # is eating into the tick.
+            if self._iter_log is not None:
+                self._iter_log.append((inter_wake,
+                                       time.monotonic() - iter_t0, steps))
             sleep_time = STEP - acc
             if sleep_time > 0:
                 self._stop.wait(sleep_time)

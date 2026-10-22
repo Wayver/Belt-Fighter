@@ -327,7 +327,8 @@ def sim_process_main(cmd_conn, model_queue, net_queue, remote_input_conn):
                 # model-stream measurement).
                 model_queue.put(("done", st._steps_total, game.sim_time,
                                  time.monotonic() - t_start,
-                                 worker.stamps))
+                                 worker.stamps,
+                                 st._iter_log))
                 return True
             elif kind == "input":
                 st.publish_input(m[1])
@@ -341,6 +342,13 @@ def sim_process_main(cmd_conn, model_queue, net_queue, remote_input_conn):
                     # the worker's logging, so it is handled here, not
                     # routed to st.command.
                     worker.set_snap_log(arg)
+                elif name == "iter_log":
+                    # Cadence diagnostics: enable (arg=True) / disable
+                    # (arg=False) the SimThread's per-iteration log
+                    # (inter_wake, body_time, steps). The done report
+                    # carries the accumulated list. NOT a sim command —
+                    # it configures the SimThread's logging.
+                    st._iter_log = [] if arg else None
                 else:
                     st.command(name, arg)
             # ("remote_input", ...) no longer rides the command Pipe

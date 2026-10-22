@@ -2631,30 +2631,30 @@ class PredictedShip:
         # (max_speed * dt, with dt ~ TICK at 60 FPS) — the jump is spread
         # over 2 frames.
         self._smooth_dead = _dead
-        # The cap is the ship's ACTUAL speed (not max speed) * dt — 1 tick
-        # of motion at the ship's CURRENT speed. Using max speed was the
-        # bug: the cap (max_speed * dt) is higher than the render pose's
-        # per-frame advance (actual_speed * TICK) when actual_speed <
-        # max_speed, so on a burst frame the 2-tick jump (2 *
-        # actual_speed * TICK) is less than the cap (max_speed * dt) and
-        # the cap does NOT bind — the smoothed pose moves the full 2-tick
-        # jump in one frame (the lurch persists). The cap only bound when
-        # actual_speed > max_speed/2, so the shudder was unsmoothed below
-        # half of max speed. Using the ACTUAL speed makes the cap match
-        # the render pose's per-frame advance in steady state (zero lag)
-        # and cap the 2-tick jump on burst frames (smooth), at ALL
-        # speeds.
-        #
-        # The ship's actual speed is self._ship.vel.length() (the physics
-        # velocity, smooth — it changes gradually, not raggedly). The
-        # render pose advances at actual_speed * clock_advance per frame
-        # (clock_advance is ragged: 1 tick in steady state, 2 ticks on a
-        # burst frame). The cap (actual_speed * dt, with dt ~ TICK at 60
-        # FPS) is 1 tick at the ship's current speed, so it matches the
-        # render pose's steady-state advance (zero lag) and caps the
-        # burst-frame jump (smooth).
+        # Catch-up cap: max(actual_speed, MAX_SPEED * max_speed_factor) * dt.
+        # The cap must be >= the render pose's per-frame advance in steady
+        # state (actual_speed * dt) so the smoothed pose tracks with ZERO
+        # lag, AND it must be > 0 at rest so a gap a stall left behind can
+        # CLOSE. Capping at actual_speed alone (the old code) made the cap
+        # 0 at rest — the smoothed pose could never catch up to a target
+        # that jumped during a freeze, so the ship (and its muzzle) stayed
+        # stuck at the pre-stall pose forever. Flooring at the ship's max
+        # speed keeps the cap >= 1 tick/frame of motion at every speed, so
+        # the gap always closes at a smooth slide (>= 1 tick/frame) and the
+        # steady-state zero-lag property is preserved (the floor only binds
+        # when actual_speed < max_speed, i.e. never in steady state).
         actual_speed = self._ship.vel.length()
-        pos_cap = actual_speed * dt
+        # FLOOR the catch-up rate at the ship's MAX speed (not actual speed).
+        # The old cap (actual_speed * dt) went to ZERO at rest, so a gap a
+        # stall left behind could NEVER close — the ship sat still while the
+        # smoothed pose stayed stuck at its pre-stall position, and bullets
+        # fired from that stale pose (the "fires from empty space, never
+        # gets closer" bug). Flooring at max_speed * dt guarantees the gap
+        # closes at >= 1 tick/frame (the ship's max per-frame motion) even
+        # at rest: a smooth slide, never a lurch. In steady state the target
+        # moves <= max_speed * dt, so the floor never binds (zero lag).
+        pos_cap = max(actual_speed,
+                      MAX_SPEED * self._ship.hull.max_speed_factor) * dt
         # Position: move toward the target, capped at pos_cap.
         delta = target_pos - self._smooth_pos
         dist = delta.length()
@@ -2662,26 +2662,25 @@ class PredictedShip:
             self._smooth_pos += delta / dist * pos_cap
         else:
             self._smooth_pos = pygame.Vector2(target_pos)
-        # Angle: move toward the target (wrapped delta), capped at the
-        # ship's ACTUAL turn rate * dt (1 tick of rotation at the ship's
-        # CURRENT turn rate). The ship's actual turn rate is
-        # inp.turn * ROT_SPEED * turn_rate_factor (the angular velocity,
-        # smooth — it's the input × the turn rate). Using max turn rate
-        # was the same bug as the position: the cap (max_turn_rate * dt)
-        # is higher than the render pose's per-frame angle advance
-        # (actual_turn_rate * TICK) when actual_turn_rate < max_turn_rate,
-        # so the cap doesn't bind and the angle lurches. Using the ACTUAL
-        # turn rate makes the cap match the render pose's steady-state
-        # angle advance (zero lag) and cap the burst-frame angle jump
-        # (smooth), at ALL turn rates.
-        #
+        # Angle: same discipline as the position. Cap =
+        # max(actual_turn_rate, ROT_SPEED * turn_rate_factor) * dt. The
+        # actual turn rate is inp.turn * ROT_SPEED * turn_rate_factor
+        # (0 when not turning). Flooring at the ship's MAX turn rate
+        # keeps the cap > 0 at rest so a stale heading a stall left
+        # behind can close (the old actual-rate cap was 0 when not
+        # turning — the ship kept firing at its pre-stall angle forever).
         # self._last_inp is the last input the ghost was stepped with (set
-        # in step()). .turn is -1, 0, or 1 (the turn input). The turn rate
-        # is 0 when not turning (the angle is static — no smoothing
-        # needed), ±ROT_SPEED*turn_rate_factor when turning.
+        # in step()). .turn is -1, 0, or 1 (the turn input).
         turn = self._last_inp.turn if self._last_inp is not None else 0.0
         actual_turn_rate = turn * ROT_SPEED * self._ship.hull.turn_rate_factor
-        ang_cap = abs(actual_turn_rate) * dt
+        # FLOOR the angle catch-up rate at the ship's MAX turn rate (same
+        # reasoning as the position cap): at rest (turn == 0) the old cap
+        # was 0, so a stale angle a stall left behind could never close —
+        # the ship would keep firing at its pre-stall heading. Flooring at
+        # ROT_SPEED * turn_rate_factor * dt closes the angle gap at >= 1
+        # tick/frame even while not turning.
+        ang_cap = max(abs(actual_turn_rate),
+                      ROT_SPEED * self._ship.hull.turn_rate_factor) * dt
         da = (target_angle - self._smooth_angle + math.pi) % (2 * math.pi) - math.pi
         if abs(da) > ang_cap:
             self._smooth_angle += math.copysign(ang_cap, da)

@@ -1,0 +1,171 @@
+"""11.x SMOOTHED-POSE CATCH-UP regression gate.
+
+The bug: `render_pose_smoothed` capped its per-frame catch-up at the ship's
+ACTUAL speed * dt. At rest (vel == 0, no turn input) that cap is 0, so once a
+stall/burst left the smoothed pose BEHIND the render target, the gap could
+NEVER close — the ship sat still while its smoothed pose (and therefore its
+muzzle) stayed stuck at the pre-stall position. Bullets fired from that stale
+pose appeared to come from empty space and never got closer.
+
+The fix floors the catch-up rate at the ship's MAX speed (position) and MAX
+turn rate (angle), so the gap always closes at >= 1 tick/frame even at rest.
+
+This gate is a pure function of the ghost's internal render state (no Game,
+no network), so it is deterministic and fast:
+
+  (1) POSITION CATCH-UP AT REST — the smoothed pose starts 100 px behind the
+      (static) render target, the ship is at rest (vel 0, no input). Over
+      successive frames the gap must MONOTONICALLY shrink and reach ~0. With
+      the old actual-speed cap the gap would stay 100 px forever (FAIL).
+  (2) ANGLE CATCH-UP AT REST — same, for a stale heading while not turning.
+  (3) STEADY-STATE ZERO LAG — a ship moving at max speed with the smoothed
+      pose seeded ON the target must stay ON the target (the floor must not
+      introduce lag when the ship is actually moving at max speed).
+
+Run:  python -m ship5.test_11_smoothed_catchup
+"""
+import os
+os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
+
+import math
+
+import pygame
+
+from .config import TICK, MAX_SPEED, ROT_SPEED
+from .hulls import SILAS_HULL, default_loadout
+from .ship import Ship
+from .intent import ShipInput
+from .netcode import PredictedShip
+
+EPS = 1e-3
+DT = TICK  # one 60 Hz frame
+
+
+def make_ghost():
+    s = Ship(hull=SILAS_HULL, loadout=default_loadout(SILAS_HULL))
+    g = PredictedShip(hull=SILAS_HULL, loadout=default_loadout(SILAS_HULL))
+    g.seed(s.snapshot())
+    return g
+
+
+def _set_rest(g, pos, angle):
+    """Put the ghost at rest at `pos`/`angle` with a static render target.
+
+    vel 0 + no input + _acc 0 makes render_pose() return exactly (pos,
+    angle) every frame (the pre-step integrates zero velocity / zero turn).
+    """
+    g.ship.pos = pygame.Vector2(pos)
+    g.ship.angle = angle
+    g.ship.vel = pygame.Vector2(0.0, 0.0)
+    g._acc = 0.0
+    g._last_inp = ShipInput()  # turn 0, no thrust
+
+
+def test_position_catchup_at_rest():
+    g = make_ghost()
+    _set_rest(g, (100.0, 0.0), 0.0)
+    # Start the smoothed pose 100 px BEHIND the target (the post-stall gap).
+    g._smooth_pos = pygame.Vector2(0.0, 0.0)
+    g._smooth_angle = 0.0
+    g._smooth_dead = False
+
+    target = pygame.Vector2(100.0, 0.0)
+    prev_gap = (target - g._smooth_pos).length()
+    closed = False
+    for _ in range(60):  # up to 1 s of frames
+        sp, _ = g.render_pose_smoothed(DT)
+        gap = (target - sp).length()
+        # The gap must never GROW (monotonic approach).
+        assert gap <= prev_gap + EPS, (
+            f"gap grew {prev_gap:.3f} -> {gap:.3f} (should only shrink)")
+        prev_gap = gap
+        if gap < EPS:
+            closed = True
+            break
+    assert closed, (
+        f"smoothed pose never caught up at rest: final gap {prev_gap:.3f} px "
+        f"(old actual-speed cap = 0 at rest -> gap is permanent)")
+    return True
+
+
+def test_angle_catchup_at_rest():
+    g = make_ghost()
+    _set_rest(g, (0.0, 0.0), 0.0)
+    # Start the smoothed heading 0.5 rad STALE (the post-stall angle gap).
+    g._smooth_pos = pygame.Vector2(0.0, 0.0)
+    g._smooth_angle = 0.5
+    g._smooth_dead = False
+
+    target_angle = 0.0
+    prev_gap = abs((target_angle - g._smooth_angle + math.pi)
+                   % (2 * math.pi) - math.pi)
+    closed = False
+    for _ in range(60):
+        _, sa = g.render_pose_smoothed(DT)
+        gap = abs((target_angle - sa + math.pi) % (2 * math.pi) - math.pi)
+        assert gap <= prev_gap + EPS, (
+            f"angle gap grew {prev_gap:.3f} -> {gap:.3f}")
+        prev_gap = gap
+        if gap < EPS:
+            closed = True
+            break
+    assert closed, (
+        f"smoothed angle never caught up at rest: final gap {prev_gap:.3f} rad "
+        f"(old actual-turn-rate cap = 0 when not turning -> stale heading)")
+    return True
+
+
+def test_steady_state_zero_lag():
+    """A ship moving at max speed, smoothed pose seeded ON the target, must
+    stay ON the target (the floor must not add lag at max speed)."""
+    g = make_ghost()
+    v = MAX_SPEED * g.ship.hull.max_speed_factor
+    g.ship.pos = pygame.Vector2(0.0, 0.0)
+    g.ship.angle = 0.0
+    g.ship.vel = pygame.Vector2(v, 0.0)
+    g._acc = 0.0
+    g._last_inp = ShipInput()
+    # Seed the smoothed pose exactly on the current render target.
+    g._smooth_pos = pygame.Vector2(0.0, 0.0)
+    g._smooth_angle = 0.0
+    g._smooth_dead = False
+
+    max_lag = 0.0
+    for _ in range(30):
+        # Advance the physics pose by one tick (what advance() does per step)
+        # so the render target moves at the ship's actual (max) speed.
+        g.ship.pos += g.ship.vel * TICK
+        sp, _ = g.render_pose_smoothed(DT)
+        # The target this frame is the new physics pose (vel*TICK pre-step,
+        # _acc 0 -> base = s.pos). The smoothed pose should track it with
+        # ~zero lag (cap == max_speed*dt == the target's per-frame advance).
+        lag = (g.ship.pos - sp).length()
+        max_lag = max(max_lag, lag)
+    # Zero-lag tolerance: one tick of motion is v*TICK; allow up to that.
+    assert max_lag <= v * TICK + EPS, (
+        f"steady-state lag {max_lag:.3f} px exceeds one tick of motion "
+        f"({v * TICK:.3f} px) — the floor introduced lag at max speed")
+    return True
+
+
+def main():
+    pygame.init()
+    ok = True
+    for name, fn in [
+        ("position catch-up at rest", test_position_catchup_at_rest),
+        ("angle catch-up at rest", test_angle_catchup_at_rest),
+        ("steady-state zero lag", test_steady_state_zero_lag),
+    ]:
+        try:
+            fn()
+            print(f"PASS: {name}")
+        except AssertionError as e:
+            ok = False
+            print(f"FAIL: {name}: {e}")
+    print("ALL PASS" if ok else "FAILURES PRESENT")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

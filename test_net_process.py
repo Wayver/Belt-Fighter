@@ -429,11 +429,162 @@ def test_net_process_quit():
     return ok
 
 
+def test_net_process_cadence():
+    """The plan_20 SEND CADENCE: the net process paces its sends to a
+    steady 60 Hz (16.7 ms) with a deadline + busy-wait hybrid, so the
+    client receives ~one snap per frame. This test feeds the net process
+    snaps at a clean 60 Hz (the sim's measured publish rate) for a few
+    seconds and asserts the SEND gaps are ~16.7 ms:
+      * p90 gap < 20 ms (a steady 16.7 ms cadence, not the old ragged
+        17-26 ms),
+      * NO gap > 30 ms (the old 53.9 Hz loop produced 315 such gaps),
+      * the mean gap is within [15, 20] ms (the 16.7 ms target).
+    Returns True when all checks pass."""
+    ok = True
+    ctx = multiprocessing.get_context("spawn")
+    port = _free_port()
+    host_hull = PLAYER_HULLS[0]
+    host_loadout = default_loadout(host_hull)
+    client_hull = PLAYER_HULLS[1]
+    client_loadout = default_loadout(client_hull)
+
+    p, status_parent, net_queue, ri_sim_end = _spawn_net(
+        ctx, port, host_hull, host_loadout)
+
+    # The fake client records (arrival_mono, sim_time) for each T_SNAP.
+    snap_arrivals = []
+    client = {}
+    client_err = []
+    client_stop = threading.Event()
+    def fake_client():
+        conn = None
+        try:
+            time.sleep(0.3)   # let the net process bind + listen
+            conn = connect("127.0.0.1", port)
+            do_handshake_client(conn, serialize_hull(client_hull),
+                                serialize_loadout(client_loadout))
+            conn.set_nonblocking()
+            client["conn"] = conn
+            while not client_stop.is_set():
+                for m in conn.poll():
+                    if m.get("type") == T_SNAP:
+                        snap_arrivals.append((time.monotonic(), m["sim_time"]))
+                time.sleep(0.001)
+        except Exception as e:
+            client_err.append(repr(e))
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    th = threading.Thread(target=fake_client, daemon=True)
+    th.start()
+
+    try:
+        status = _wait_for_status(status_parent, "connected")
+        ok &= check("cadence: the net process reported the client joined",
+                    status is not None, repr(status))
+        if status is None:
+            return ok
+        th.join(timeout=5)
+        ok &= check("cadence: fake client has no error",
+                    not client_err, repr(client_err))
+
+        # Feed snaps at a clean 60 Hz (the sim's measured publish rate)
+        # for a few seconds. The net process paces its SENDS to 60 Hz
+        # (SEND_TICK), so the client should receive ~one snap per frame.
+        snap = _fake_snapshot()
+        TICK = 1.0 / 60.0
+        RUN_SECONDS = 3.0
+        t0 = time.monotonic()
+        sim_t = 0.0
+        next_pub = t0
+        n_pub = 0
+        while time.monotonic() - t0 < RUN_SECONDS:
+            now = time.monotonic()
+            while next_pub < now:
+                try:
+                    net_queue.put_nowait(("snap", sim_t, snap))
+                    n_pub += 1
+                except Exception:
+                    pass   # dropped (queue full) — the sim would drop too
+                sim_t += TICK
+                next_pub += TICK
+            while ri_sim_end.poll():
+                try:
+                    ri_sim_end.recv()
+                except Exception:
+                    break
+            time.sleep(0.001)
+
+        # Let the last few snaps drain through the net process.
+        time.sleep(0.2)
+
+        # Analyze the SEND gaps (the client's arrival times are the net
+        # process's send times + a constant loopback latency, so the gaps
+        # are the send gaps).
+        if len(snap_arrivals) < 2:
+            ok &= check("cadence: the client received snaps",
+                        len(snap_arrivals) >= 2,
+                        "n=%d" % len(snap_arrivals))
+            return ok
+        gaps = [b[0] - a[0] for a, b in zip(snap_arrivals, snap_arrivals[1:])]
+        gaps.sort()
+        n = len(gaps)
+        mean = sum(gaps) / n
+        p90 = gaps[int(n * 0.9)]
+        p99 = gaps[int(n * 0.99)]
+        max_gap = gaps[-1]
+        n_over_30 = sum(1 for g in gaps if g > 0.030)
+        n_over_20 = sum(1 for g in gaps if g > 0.020)
+        print("  [cadence] %d snaps over %.1f s -> %.1f Hz"
+              % (len(snap_arrivals), RUN_SECONDS,
+                 len(snap_arrivals) / RUN_SECONDS))
+        print("  [cadence] gaps ms: mean=%.2f p90=%.2f p99=%.2f max=%.2f"
+              % (mean * 1000, p90 * 1000, p99 * 1000, max_gap * 1000))
+        print("  [cadence] gaps >20ms: %d (%.1f%%)   >30ms: %d (%.1f%%)"
+              % (n_over_20, 100.0 * n_over_20 / n,
+                 n_over_30, 100.0 * n_over_30 / n))
+
+        ok &= check("cadence: the mean gap is ~16.7 ms (in [15, 20] ms)",
+                    0.015 <= mean <= 0.020,
+                    "mean=%.2f ms" % (mean * 1000))
+        ok &= check("cadence: p90 gap < 20 ms (a steady 16.7 ms cadence)",
+                    p90 < 0.020,
+                    "p90=%.2f ms" % (p90 * 1000))
+        ok &= check("cadence: NO gap > 30 ms (the old 53.9 Hz loop had 315)",
+                    n_over_30 == 0,
+                    "n_over_30=%d" % n_over_30)
+
+        # Shutdown: the client goes away -> the net process reports
+        # disconnected + exits.
+        client_stop.set()
+        th.join(timeout=3)
+        status2 = _wait_for_status(status_parent, "disconnected")
+        ok &= check("cadence: the net process reported the disconnect",
+                    status2 is not None, repr(status2))
+        p.join(timeout=3)
+        ok &= check("cadence: the net process exited", not p.is_alive())
+    finally:
+        client_stop.set()
+        if p.is_alive():
+            p.terminate()
+            p.join()
+        ri_sim_end.close()
+        status_parent.close()
+
+    print("\nNET PROCESS (send cadence, plan_20):",
+          "ALL PASS" if ok else "FAILURES")
+    return ok
+
+
 def main():
     ok = True
     print("NET PROCESS (plan_13, Phase 1, Chunk 1a)")
     ok &= test_net_process()
     ok &= test_net_process_latest_wins()
+    ok &= test_net_process_cadence()
     ok &= test_net_process_quit()
     print("\nNET PROCESS (1a):", "ALL PASS" if ok else "FAILURES")
     raise SystemExit(0 if ok else 1)

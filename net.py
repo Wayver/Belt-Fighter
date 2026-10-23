@@ -913,6 +913,21 @@ class NetWorker:
                             and self._input_sink is not None
                             and self._input_sink(m)):
                         continue
+                    if m.get("type") == T_SNAP:
+                        # WIRE-ARRIVAL STAMP (plan_20 follow-up): the moment
+                        # the snapshot's bytes were parsed off the socket,
+                        # on the WORKER thread — BEFORE the message sits in
+                        # in_queue until the render thread's next
+                        # worker.poll() (up to a full frame later). The
+                        # client's client_snap_debug.csv uses this as its
+                        # "receive" time, so the receive cadence measures
+                        # the WIRE (host send + LAN latency), not the
+                        # render thread's frame-quantized poll. Without
+                        # this stamp the receive gaps were quantized to
+                        # the render frame (16/32 ms) and inflated the
+                        # apparent jitter.
+                        m["_wire_mono"] = time.monotonic()
+                        m["_wire_wall"] = time.time()
                     self._in.put(m)
                 # 3. host: drain the snapshot queue to the NEWEST and send it
                 #    (publish-driven, no timer). The sim thread
@@ -1380,6 +1395,15 @@ def _self_test():
         cw.send({"type": T_INPUT, "inp": {"turn": 1.0, "fire": True}})
         got_snap = _wait_for(cw, T_SNAP)
         got_inp = _wait_for(hw, T_INPUT)
+        # The wire-arrival stamp (plan_20 follow-up): the worker thread
+        # stamps each T_SNAP with the moment its bytes were parsed off
+        # the socket (before it sits in in_queue). The client's
+        # client_snap_debug.csv uses this as its "receive" time, so the
+        # receive cadence measures the wire, not the render thread's
+        # frame-quantized poll.
+        stamped = (got_snap is not None
+                   and isinstance(got_snap.get("_wire_mono"), float)
+                   and isinstance(got_snap.get("_wire_wall"), float))
         if (got_snap is not None and got_snap["sim_time"] == 1.0
                 and got_inp is not None and got_inp["inp"]["turn"] == 1.0):
             print("PASS: NetWorker send + receive (both directions, loopback)")
@@ -1387,6 +1411,13 @@ def _self_test():
             ok = False
             print("FAIL: NetWorker send/receive -> snap=%r inp=%r"
                   % (got_snap, got_inp))
+        if stamped:
+            print("PASS: NetWorker wire-arrival stamp (T_SNAP carries "
+                  "_wire_mono/_wire_wall from the worker thread)")
+        else:
+            ok = False
+            print("FAIL: NetWorker wire-arrival stamp missing -> %r"
+                  % (got_snap,))
     finally:
         hw.stop()
         cw.stop()

@@ -12,6 +12,16 @@ Three modes (chosen on the menu's mode screen):
   join   — connect to a host, run the client sim (predict the local
            ship, interpolate the remote entities), send input every
            frame, push each snapshot, render via predicted_view.
+
+Client-only flag:
+  --cadence — isolate the send/receive cadence from the per-frame entity
+           telemetry. The 5 entity CSVs (missile / bullet / bullet_time /
+           bullet_handoff / hit_fx) append a row per event from the render
+           thread; that I/O + allocation adds render-thread load that can
+           itself perturb the frame timing being measured. With --cadence
+           they are OFF (even when F3 is on); the cadence-relevant logs
+           (client_snap_debug via the worker's wire stamp, net_debug,
+           ghost_clock) stay on. Normal runs are unaffected.
 """
 import gc
 import multiprocessing
@@ -47,6 +57,16 @@ from . import bullet_telemetry
 from . import bullet_time_telemetry
 from . import bullet_handoff_telemetry
 from . import hit_fx_telemetry
+
+# CADENCE CAPTURE (plan_20 follow-up): run the CLIENT with `--cadence` to
+# isolate the send/receive cadence from the per-frame entity telemetry.
+# The 5 entity CSVs (missile / bullet / bullet_time / bullet_handoff /
+# hit_fx) append a row per event from the render thread — that I/O +
+# allocation adds render-thread load that can itself perturb the frame
+# timing we are measuring. With --cadence they are OFF (even when F3 is
+# on); the cadence-relevant logs (client_snap_debug via the worker's wire
+# stamp, net_debug, ghost_clock) stay on. Normal runs are unaffected.
+CADENCE_CAPTURE = "--cadence" in sys.argv
 
 
 class _HostRenderClock:
@@ -1103,23 +1123,32 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
                 game._dbg_dt_max = raw_dt
             if raw_dt > 0.05:
                 game._dbg_hiccups += 1
+        # CADENCE CAPTURE (--cadence): the per-frame ENTITY telemetry CSVs
+        # (missile / bullet / bullet_time / bullet_handoff / hit_fx) are
+        # OFF. They append a row per event (per frame, per bullet) from
+        # the render thread — that I/O + allocation adds render-thread
+        # load that can itself perturb the very frame timing we are
+        # measuring. The cadence-relevant logs (client_snap_debug via the
+        # worker's wire stamp, net_debug, ghost_clock, host_debug,
+        # host_sim_debug) stay on. Normal F3 captures are unaffected.
+        telemetry_on = game.debug_net and not CADENCE_CAPTURE
         # Missile telemetry: rides the same F3 toggle as the net
         # debug overlay (client only — the ghost never runs on the host).
-        missile_telemetry.set_enabled(game.debug_net)
+        missile_telemetry.set_enabled(telemetry_on)
         # Bullet telemetry (Phase 0, plan_14): the fire-drift + double-draw
         # measurement, same F3 toggle, client only.
-        bullet_telemetry.set_enabled(game.debug_net)
+        bullet_telemetry.set_enabled(telemetry_on)
         # Bullet TIME-DOMAIN telemetry (ship-vs-bullet clock gap + muzzle
         # trailing), same F3 toggle, client only.
-        bullet_time_telemetry.set_enabled(game.debug_net)
+        bullet_time_telemetry.set_enabled(telemetry_on)
         # Bullet HANDOFF-OFFSET telemetry (ghost vs buffer drawn position at
         # the handoff frame, decomposed into parallel/perpendicular), same
         # F3 toggle, client only.
-        bullet_handoff_telemetry.set_enabled(game.debug_net)
+        bullet_handoff_telemetry.set_enabled(telemetry_on)
         # Bullet-impact (option A) trigger telemetry: the closest-approach
         # geometry to ships vs enemies + the spark decision, same F3 toggle,
         # client only.
-        hit_fx_telemetry.set_enabled(game.debug_net)
+        hit_fx_telemetry.set_enabled(telemetry_on)
         # 11.x diagnostics: open/close ghost_clock.csv on the F3 edge and
         # set/clear the ghost's diag_sink. Opening on the rising edge
         # (not every frame) keeps the file fresh per capture; clearing the
@@ -1228,8 +1257,22 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
             if m.get("type") == T_SNAP:
                 if game._snap_log_f is not None:
                     game._snap_seq += 1
+                    # WIRE-ARRIVAL STAMP (plan_20 follow-up): log the
+                    # moment the worker thread parsed the snapshot off
+                    # the socket (m["_wire_mono"], stamped in
+                    # NetWorker._run), NOT this render thread's poll
+                    # time. The poll happens once per frame (16.05 ms at
+                    # 62 FPS), so logging it here quantized the receive
+                    # gaps to the render frame (16/32 ms) and inflated
+                    # the apparent jitter. The wire stamp measures the
+                    # actual host-send + LAN-arrival cadence.
+                    wire_mono = m.get("_wire_mono")
+                    wire_wall = m.get("_wire_wall")
+                    if wire_mono is None:   # defensive: pre-stamp build
+                        wire_mono = time.monotonic()
+                        wire_wall = time.time()
                     game._snap_log_f.write("%.3f,%.3f,%.4f,%d\n" % (
-                        time.time(), time.monotonic(), m["sim_time"],
+                        wire_wall, wire_mono, m["sim_time"],
                         game._snap_seq))
                     if game._snap_seq % 60 == 0:   # ~1 s: bound the buffer
                         game._snap_log_f.flush()

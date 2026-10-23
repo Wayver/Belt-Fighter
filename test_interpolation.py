@@ -195,7 +195,7 @@ WARMUP = 300   # ticks before the first pair of snapshots (sim is hot)
 K = SNAPSHOT_INTERVAL   # ticks between snap_prev and snap_curr = one
                # snapshot interval (SNAPSHOT_INTERVAL), the realistic
                # netcode window. 10.8: tracks the config so the test
-               # exercises the REAL cadence (30 Hz = 2 ticks), not a
+               # exercises the REAL cadence (60 Hz = 1 tick), not a
                # frozen 10 Hz value.
 W = 60         # turnover-stress window: 10x the snapshot interval — long
                # enough that splits/spawns/culls/respawns are likely
@@ -1115,7 +1115,7 @@ def main():
     # interval (MAX_LEAD) of the newest sample — the estimator caps
     # extrapolation at MAX_LEAD, so a query farther out would be clamped
     # (a cap, not an estimate error). The old 10 Hz test queried 0.1 s past
-    # the newest sample, which at 30 Hz (MAX_LEAD 0.033 s) is beyond the cap.
+    # the newest sample, which at 60 Hz (MAX_LEAD 0.0167 s) is beyond the cap.
     est_interval = SNAPSHOT_INTERVAL * STEP
     est_n = max(2, int(round(2.0 / est_interval)))   # ~2 s of samples
     est_lead = 0.5 * est_interval                     # within MAX_LEAD
@@ -1861,13 +1861,14 @@ def main():
     # interpolation buffer must therefore hold at least
     # ceil(INTERP_DELAY_MAX / snapshot_interval) + 1 snapshots, or
     # positions_at clamps to the OLDEST snapshot and the remote render
-    # stalls exactly when the adaptive delay is doing its job. At the 30 Hz
-    # cadence (interval 0.033 s) the old default of 8 only covered 0.233 s
-    # (< 0.35 s) and would clamp-stall; SNAPSHOT_BUFFER_MAX (16) covers
-    # 0.5 s. This gate is the regression lock for that fix: it checks both
-    # the arithmetic (config depth >= required) and the empirical behavior
-    # (a real 30 Hz stream into the DEFAULT buffer still brackets
-    # newest - INTERP_DELAY_MAX).
+    # stalls exactly when the adaptive delay is doing its job. At the
+    # original 30 Hz cadence (interval 0.033 s) the old default of 8 only
+    # covered 0.233 s (< 0.35 s) and would clamp-stall; the depth was
+    # raised, and at the current 60 Hz cadence (interval 0.0167 s)
+    # SNAPSHOT_BUFFER_MAX (24) covers 0.4 s. This gate is the regression
+    # lock for that fix: it checks both the arithmetic (config depth >=
+    # required) and the empirical behavior (a real 60 Hz stream into the
+    # DEFAULT buffer still brackets newest - INTERP_DELAY_MAX).
     interval = SNAPSHOT_INTERVAL * STEP
     required = int(math.ceil(INTERP_DELAY_MAX / interval)) + 1
     buf_depth = SnapshotBuffer()       # DEFAULT depth (SNAPSHOT_BUFFER_MAX)

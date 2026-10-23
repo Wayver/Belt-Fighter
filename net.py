@@ -622,7 +622,7 @@ def _disable_nagle(sock):
 
     For a real-time game we want small messages out IMMEDIATELY, not
     coalesced, so TCP_NODELAY is set on BOTH peers' sockets (the host's
-    accepted socket and the client's connecting socket). The 30 Hz snapshots
+    accepted socket and the client's connecting socket). The 60 Hz snapshots
     are large enough that Nagle would not hold them, but the small 60 Hz
     input messages are exactly the case Nagle + delayed-ACK breaks.
     """

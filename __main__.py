@@ -37,7 +37,7 @@ from .config import WIDTH, HEIGHT, FPS, NET_PORT, BG, SNAPSHOT_INTERVAL, TICK
 from .fog import make_light_texture
 from .game import Game, STEP
 from .menu import Menu
-from .net import (connect, do_handshake_client,
+from .net import (connect, Host, do_handshake_client,
                   serialize_hull, serialize_loadout,
                   deserialize_hull, deserialize_loadout,
                   serialize_snapshot, deserialize_snapshot,
@@ -50,6 +50,7 @@ from .ship import Ship
 from .sim_thread import SimThread
 from .sim_process import sim_process_main
 from .net_process import net_process_main
+from .client_net_process import client_net_process_main
 from .sound import SoundBank
 from .intent import ShipInput
 from . import missile_telemetry
@@ -64,8 +65,8 @@ from . import hit_fx_telemetry
 # hit_fx) append a row per event from the render thread — that I/O +
 # allocation adds render-thread load that can itself perturb the frame
 # timing we are measuring. With --cadence they are OFF (even when F3 is
-# on); the cadence-relevant logs (client_snap_debug via the worker's wire
-# stamp, net_debug, ghost_clock) stay on. Normal runs are unaffected.
+# on); the cadence-relevant logs (client_snap_debug via the net process's
+# wire stamp, net_debug, ghost_clock) stay on. Normal runs are unaffected.
 CADENCE_CAPTURE = "--cadence" in sys.argv
 
 
@@ -933,25 +934,91 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
     decision #8: no reconnect in v1).
     """
     ip, port = menu.host_ip, menu.host_port
+    # The socket I/O + JSON run in a dedicated NET PROCESS (client_net_process.py)
+    # — NOT a NetWorker thread in the render process. The net process owns the
+    # socket end to end (connect + the join/welcome handshake + the game loop's
+    # input send + snapshot receive), in its OWN GIL (off the render thread).
+    # WHY a process, not a thread: a NetWorker THREAD shares the render
+    # process's GIL with the draw — when a snapshot's bytes land, the worker's
+    # recv() returns but it must RE-ACQUIRE the GIL to stamp the wire-arrival
+    # time, and the render thread holds the GIL for the whole draw frame
+    # (~16-25 ms), so a snap arriving at time T got stamped at T + (one frame)
+    # (the bimodal 16/32 ms receive artifact). A separate process has no shared
+    # GIL: the render thread's draw can hold the render GIL as long as it wants
+    # and the net process keeps draining the socket + stamping on time.
+    # The render process learns the handshake outcome by polling the msg Pipe
+    # (non-blocking poll()) while drawing the "connecting" screen.
+    _net_ctx = multiprocessing.get_context("spawn")
+    net_cmd, _net_cmd_child = _net_ctx.Pipe()   # render -> net (input/respawn/quit)
+    net_msg, _net_msg_child = _net_ctx.Pipe()   # net -> render (connected/snap/beam/echo/pong/disconnected/error/crash)
+    net_proc = _net_ctx.Process(target=client_net_process_main,
+                                args=(_net_cmd_child, _net_msg_child, ip, port,
+                                      menu.hull, menu.loadout))
+    net_proc.start()
+    _net_cmd_child.close()   # the render uses net_cmd (send) + net_msg (recv)
+    _net_msg_child.close()
+
+    def _shutdown_net():
+        """Stop the net process (idempotent — safe on every exit path). Send
+        ("quit",), close the Pipes, join(timeout=2), terminate() if still
+        alive. The net process ALSO exits on cmd_conn EOF (the parent died),
+        so a missed quit still can't leak it. Mirrors the host's run_host
+        net-process shutdown ordering."""
+        try:
+            net_cmd.send(("quit",))
+        except Exception:
+            pass
+        try:
+            net_cmd.close()
+        except Exception:
+            pass
+        try:
+            net_msg.close()
+        except Exception:
+            pass
+        net_proc.join(timeout=2.0)
+        if net_proc.is_alive():
+            net_proc.terminate()
+            net_proc.join()
+
     _draw_joining(screen, font, big_font, ip, port)
     pygame.display.flip()
-    try:
-        conn = connect(ip, port)
-    except OSError:
-        _notice(screen, font, big_font, clock,
-                ["COULD NOT CONNECT", "no host at %s:%d" % (ip, port)])
-        return
-
-    # The join/welcome handshake (blocking; the socket is still blocking).
-    # Returns the host's (hull, loadout) -> player 0, or (None, None) when the
-    # host goes away / the join times out.
-    wh, wl = do_handshake_client(conn, serialize_hull(menu.hull),
-                                 serialize_loadout(menu.loadout))
-    if wh is None:
-        conn.close()
-        _notice(screen, font, big_font, clock,
-                ["COULD NOT JOIN", "the host went away or took too long"])
-        return
+    # Wait for the handshake outcome (the net process owns the connect +
+    # handshake). Draw the "connecting" screen + pump events (ESC/QUIT ->
+    # quit the net process + return) while polling the msg Pipe.
+    wh = wl = None
+    while True:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                _shutdown_net()
+                return
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                _shutdown_net()
+                return
+        if net_msg.poll():
+            m = net_msg.recv()
+            if m[0] == "connected":
+                wh, wl = m[1], m[2]
+                break
+            elif m[0] == "error":
+                _notice(screen, font, big_font, clock,
+                        ["COULD NOT JOIN", m[1]])
+                _shutdown_net()
+                return
+            elif m[0] == "crash":
+                _notice(screen, font, big_font, clock,
+                        ["NET PROCESS CRASHED",
+                         m[1].splitlines()[-1] if m[1] else ""])
+                _shutdown_net()
+                return
+        elif not net_proc.is_alive():
+            _notice(screen, font, big_font, clock,
+                    ["NET PROCESS DIED", "the net process exited"])
+            _shutdown_net()
+            return
+        _draw_joining(screen, font, big_font, ip, port)
+        pygame.display.flip()
+        clock.tick(FPS)
 
     # Build the 2-ship sim: player 0 = the host's ship (from the welcome),
     # player 1 = the client's own ship (the menu choice). local_index=1: the
@@ -1069,17 +1136,14 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
     game._dbg_dt_sum = 0.0
     game._dbg_dt_max = 0.0
     game._dbg_hiccups = 0
-    # The socket I/O + JSON run on a NetWorker thread (the "Network Queue"
-    # pattern). The worker owns the Connection: it drains the OS socket
-    # buffer the instant a packet lands (no bunching) and parses the JSON
-    # off the render thread. The main thread talks to it only through
-    # worker.send() / worker.poll() / worker.closed — it never touches
-    # conn.* once the worker starts (the ownership rule that avoids the
-    # "Python Pygame Trap" shared-state corruption). start() flips the
-    # socket to non-blocking (the handshake used a 0.05 s recv timeout; it
-    # must be cleared before the loop) and launches the thread.
-    worker = NetWorker(conn, is_host=False)
-    worker.start()
+    # The socket I/O + JSON run in the dedicated NET PROCESS (above) — NOT a
+    # NetWorker thread. The render process talks to it only through the two
+    # Pipes: net_cmd (send the local input / respawn / quit) and net_msg
+    # (drain the connected/snap/beam/echo/pong/disconnected status). The
+    # render thread never touches the socket (the net process owns it) — the
+    # ownership rule that avoids the "Python Pygame Trap" shared-state
+    # corruption, now enforced by a process boundary (its own GIL) instead of
+    # a thread boundary.
 
     # The client's command sink. handle_events routes T/V/G/R/F through it
     # (a sink is provided), so it must handle all five — not just the
@@ -1182,24 +1246,23 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
         # frame.
         inp = ShipInput.from_keys(keys)
         # Send the local input every frame (pinned #5: the host applies the
-        # LATEST received input each tick). Queued to the worker (it
-        # flushes to the socket off the render thread). Tag it with a
-        # monotonic id + record the LOCAL send time — the host reflects
-        # the tag back in a T_PONG, and the RTT is the one-way-latency
-        # measurement that anchors the ghost's clock.
+        # LATEST received input each tick). Sent to the NET PROCESS (it
+        # forwards it to the socket the moment it lands — off the render
+        # thread's GIL). Tag it with a monotonic id + record the LOCAL send
+        # time — the host reflects the tag back in a T_PONG, and the RTT is
+        # the one-way-latency measurement that anchors the ghost's clock.
         game._rtt_tag += 1
         game._rtt_sent[game._rtt_tag] = time.time()
         if len(game._rtt_sent) > 500:   # bound the map (a lost pong)
             del game._rtt_sent[min(game._rtt_sent)]
-        worker.send({"type": T_INPUT, "inp": serialize_input(inp),
-                     "tag": game._rtt_tag})
+        net_cmd.send(("input", serialize_input(inp), game._rtt_tag))
         # Per-player death — R while the local ship is dead set
         # game._respawn_requested in handle_events; send the respawn
         # request to the host (it respawns player 1 — us — leaving the
         # host's ship + world untouched).
         if game._respawn_requested:
             game._respawn_requested = False
-            worker.send({"type": T_RESPAWN})
+            net_cmd.send(("respawn",))
         # Record the input in the ghost's rewind buffer, stamped with the
         # client's estimate of the host's sim clock at this moment (the
         # HostTimeEstimator — the same clock the snapshot stamps are in).
@@ -1244,39 +1307,41 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
                 rocks=game._ghost_rock_proxies(_pos),
                 player_proxy=game._ghost_player_proxy(_pos))
         _advance_ghost()
-        # Poll the host: each snapshot feeds the host-time estimator (its
-        # wire stamp vs the local arrival time — the estimator's
-        # per-arrival jitter sample is the adaptive delay's input) and
-        # then the interpolation buffer + prediction ghost (seed on the
-        # first, dead-reckoning rewind on the rest). The rewind replays
+        # Poll the NET PROCESS's msg Pipe (non-blocking): each snapshot feeds
+        # the host-time estimator (its wire stamp vs the local arrival time —
+        # the estimator's per-arrival jitter sample is the adaptive delay's
+        # input) and then the interpolation buffer + prediction ghost (seed on
+        # the first, dead-reckoning rewind on the rest). The rewind replays
         # from the snapshot's stamp up to the ghost's own clock
-        # (ghost.sim_time — advanced to this frame above). worker.poll()
-        # drains the messages the worker thread already parsed off the
-        # render thread (the JSON decode no longer happens here).
-        for m in worker.poll():
-            if m.get("type") == T_SNAP:
+        # (ghost.sim_time — advanced to this frame above). The net process
+        # already parsed the JSON off the render thread (its OWN GIL) and
+        # stamped the wire-arrival time, so the Pipe carries ready tuples:
+        #   ("snap", sim_time, snap, wire_mono, wire_wall)
+        #   ("beam", msg) | ("echo", msg) | ("pong", tag)
+        #   ("disconnected",) | ("crash", tb)
+        _net_disconnected = False
+        while net_msg.poll():
+            m = net_msg.recv()
+            kind = m[0]
+            if kind == "snap":
+                # m = ("snap", sim_time, snap, wire_mono, wire_wall)
+                sim_time, snap = m[1], m[2]
+                wire_mono, wire_wall = m[3], m[4]
                 if game._snap_log_f is not None:
                     game._snap_seq += 1
-                    # WIRE-ARRIVAL STAMP (plan_20 follow-up): log the
-                    # moment the worker thread parsed the snapshot off
-                    # the socket (m["_wire_mono"], stamped in
-                    # NetWorker._run), NOT this render thread's poll
-                    # time. The poll happens once per frame (16.05 ms at
-                    # 62 FPS), so logging it here quantized the receive
-                    # gaps to the render frame (16/32 ms) and inflated
-                    # the apparent jitter. The wire stamp measures the
-                    # actual host-send + LAN-arrival cadence.
-                    wire_mono = m.get("_wire_mono")
-                    wire_wall = m.get("_wire_wall")
-                    if wire_mono is None:   # defensive: pre-stamp build
-                        wire_mono = time.monotonic()
-                        wire_wall = time.time()
+                    # WIRE-ARRIVAL STAMP: the moment the NET PROCESS parsed
+                    # the snapshot off the socket (on its OWN GIL — NOT the
+                    # render thread's). This is the true wire cadence. The
+                    # old NetWorker THREAD stamped it AFTER re-acquiring the
+                    # render GIL (held for a whole draw frame), which
+                    # quantized the receive gaps to 16/32 ms (the bimodal
+                    # artifact). The separate process removes that.
                     game._snap_log_f.write("%.3f,%.3f,%.4f,%d\n" % (
-                        wire_wall, wire_mono, m["sim_time"],
+                        wire_wall, wire_mono, sim_time,
                         game._snap_seq))
                     if game._snap_seq % 60 == 0:   # ~1 s: bound the buffer
                         game._snap_log_f.flush()
-                if game.host_time.record(now, m["sim_time"]):
+                if game.host_time.record(now, sim_time):
                     game.latency.update(game.host_time.last_jitter)
                 # Re-advance the ghost to the FRESH anchor (this snapshot's
                 # stamp) BEFORE the reconcile: record() above moved the
@@ -1294,7 +1359,7 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
                 # (advanced before the poll loop, anchored on the PREVIOUS
                 # frame's newest snapshot). record() above just moved the
                 # anchor to this snapshot, and its local_time is exactly
-                # `now`, so host_time.now(now) == m["sim_time"] and the
+                # `now`, so host_time.now(now) == sim_time and the
                 # reconcile span is rtt_ow (positive, sub-tick) for EVERY
                 # snapshot in the burst. The old code passed the frozen
                 # pre-poll clock: in a double-arrival frame the second
@@ -1303,16 +1368,17 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
                 # jumped forward to the stamp -> the ~8.67 px snap. Using
                 # the fresh anchor keeps the span positive on every
                 # reconcile, so the clock never jumps.
-                game.push_snapshot(m["sim_time"],
-                                   deserialize_snapshot(m["snap"]),
+                game.push_snapshot(sim_time,
+                                   deserialize_snapshot(snap),
                                    now=game.host_time.now(now) + game._rtt_ow,
                                    real_time=now,
                                    rate=game.host_time.rate)
-            elif m.get("type") == T_BEAM:
-                # A laser beam the host fired — an EVENT (a 0.15 s flash, too short
-                # to ride the snapshot's INTERP_DELAY window). Push it
-                # into game.remote_beams as [local_start, end, age, ttl,
-                # owner] (hull-local muzzle + world endpoint);
+            elif kind == "beam":
+                # m = ("beam", msg). A laser beam the host fired — an EVENT
+                # (a 0.15 s flash, too short to ride the snapshot's
+                # INTERP_DELAY window). Push it into game.remote_beams as
+                # [local_start, end, age, ttl, owner, target] (hull-local
+                # muzzle + world endpoint);
                 # predicted_view draws it immediately (before the ships),
                 # re-anchoring the origin to the firing ship's
                 # interpolated pose, and ages it each frame
@@ -1323,7 +1389,8 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
                 # copy too (at the slightly different authoritative pose,
                 # ~10-20 ms later) produced a double-draw "criss-cross".
                 # Same dedup idea as the ghost-missile id skip.
-                if m.get("owner") == game.local_index:
+                msg = m[1]
+                if msg.get("owner") == game.local_index:
                     continue
                 # Store the HULL-LOCAL muzzle (lx, ly) + the firing owner,
                 # not the frozen world-space start. predicted_view
@@ -1341,38 +1408,48 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
                 # target == "p<local_index>"; today it is stored + drawn
                 # through (unused).
                 game.remote_beams.append([
-                    (m.get("lx", 0.0), m.get("ly", 0.0)),
-                    pygame.Vector2(m["ex"], m["ey"]),
-                    0.0, BEAM_TTL, m.get("owner", 0), m.get("target")])
-            elif m.get("type") == T_ECHO:
-                # The input the host ACTUALLY applied to OUR ship (player 1) on each
-                # tick — one (sim_time, input) pair per entry. Record
-                # each in the ghost's echo buffer (in arrival order —
-                # in-order TCP keeps it sorted by sim_time).
-                # reconcile_rewind prefers these over the client's own
-                # sent input for the replay: the host applied the latest
-                # input it had RECEIVED (up to one-way latency stale), so
-                # on an input change the client's own input diverges from
-                # what the host did — the high-speed snapback. A dropped
-                # echo degrades gracefully (the replay holds the last
-                # echoed input — what the host itself did).
-                for (st, d) in m.get("entries", []):
+                    (msg.get("lx", 0.0), msg.get("ly", 0.0)),
+                    pygame.Vector2(msg["ex"], msg["ey"]),
+                    0.0, BEAM_TTL, msg.get("owner", 0), msg.get("target")])
+            elif kind == "echo":
+                # m = ("echo", msg). The input the host ACTUALLY applied to
+                # OUR ship (player 1) on each tick — one (sim_time, input)
+                # pair per entry. Record each in the ghost's echo buffer
+                # (in arrival order — in-order TCP keeps it sorted by
+                # sim_time). reconcile_rewind prefers these over the
+                # client's own sent input for the replay: the host applied
+                # the latest input it had RECEIVED (up to one-way latency
+                # stale), so on an input change the client's own input
+                # diverges from what the host did — the high-speed
+                # snapback. A dropped echo degrades gracefully (the replay
+                # holds the last echoed input — what the host itself did).
+                msg = m[1]
+                for (st, d) in msg.get("entries", []):
                     game.ghost.record_echo(st, deserialize_input(d))
-            elif m.get("type") == T_PONG:
-                # The host reflected our T_INPUT tag back. The RTT is now - the
-                # LOCAL time we sent that tag; one-way L = RTT / 2.
-                # EMA-smooth + clamp (a hiccup can't spike the anchor). A
-                # missing tag (the map was bounded) just skips the sample.
-                t0 = game._rtt_sent.pop(m.get("tag"), None)
+            elif kind == "pong":
+                # m = ("pong", tag). The host reflected our T_INPUT tag
+                # back. The RTT is now - the LOCAL time we sent that tag;
+                # one-way L = RTT / 2. EMA-smooth + clamp (a hiccup can't
+                # spike the anchor). A missing tag (the map was bounded)
+                # just skips the sample.
+                t0 = game._rtt_sent.pop(m[1], None)
                 if t0 is not None:
                     rtt = max(0.0, time.time() - t0)
                     ow = rtt / 2.0
                     game._rtt_ow = 0.1 * ow + 0.9 * game._rtt_ow
                     game._rtt_ow = max(0.002, min(0.25, game._rtt_ow))
-        # The worker owns the socket now — read worker.closed (the worker
-        # mirrors conn.closed) and never touch conn.* here. The worker
-        # also does the drain_send() (off the render thread).
-        if worker.closed:
+            elif kind == "disconnected":
+                _net_disconnected = True
+            elif kind == "crash":
+                _notice(screen, font, big_font, clock,
+                        ["NET PROCESS CRASHED",
+                         m[1].splitlines()[-1] if m[1] else ""])
+                _net_disconnected = True
+        # The NET PROCESS owns the socket now — read the _net_disconnected
+        # flag (set by the "disconnected"/"crash" status above) and never
+        # touch the socket here. The net process also does the drain_send()
+        # (off the render thread's GIL).
+        if _net_disconnected:
             _notice(screen, font, big_font, clock,
                     ["DISCONNECTED", "the host left"])
             break
@@ -1432,12 +1509,12 @@ def run_client(screen, font, big_font, clock, sfx, menu, seed,
     bullet_handoff_telemetry.close()
     # Flush + close the bullet-impact (option A) trigger telemetry CSV.
     hit_fx_telemetry.close()
-    # Stop the worker (join its thread) BEFORE closing the
-    # connection — the worker owns the socket, and closing a socket a worker
-    # still owns crashes that worker with EBADF (the 8.1 gotcha). stop() is
-    # idempotent, so this is safe on every exit path (ESC/QUIT, disconnect).
-    worker.stop()
-    conn.close()
+    # Stop the NET PROCESS (send ("quit",), close the Pipes, join, terminate if
+    # stuck) — the net process owns the socket, and it must be stopped
+    # cleanly on every exit path (ESC/QUIT, disconnect). _shutdown_net is
+    # idempotent, so this is safe even if the connect phase already shut it
+    # down (it won't have — the connect phase returns before reaching here).
+    _shutdown_net()
 
 
 def _draw_waiting_client(screen, font, big_font):

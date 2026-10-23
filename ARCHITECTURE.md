@@ -73,14 +73,14 @@ re-explaining. History (why a rule changed) lives in git, not here.
   so this is safe. draw() runs in the RENDER process on a shell Game
   (M3).
 - The render->sim command channel is a Pipe (setup / input / command /
-  remote_input / quit — small, low-rate, ordered). `remote_input` (M4)
-  carries the CLIENT's input: the worker's input sink (worker thread)
-  sends it the moment a T_INPUT lands, and the sim process swaps
-  `game.remote_input` (the in-process `set_remote_input` reference swap).
-  The command Pipe has TWO senders in the render process (the main
-  thread + the worker thread), so the send side is serialized by a lock
-  (two concurrent senders would interleave the Pipe's 4-byte length
-  prefixes). The sim->render channels are TWO BOUNDED Queues with
+  quit — small, low-rate, ordered). The CLIENT's input does NOT ride this
+  Pipe: the host's NET process receives the T_INPUT off the socket and
+  sends it to the sim over the SEPARATE net->sim remote_input Pipe
+  (net_process.py) the moment it lands (~1 ms), and the sim process
+  swaps `game.remote_input` (the `set_remote_input` reference swap). The
+  command Pipe therefore has a SINGLE sender (the render thread — the
+  worker's input sink is gone, plan_13), so the send side needs no lock.
+  The sim->render channels are TWO BOUNDED Queues with
   put_nowait DROP-WHEN-FULL — NOT Pipes. A Pipe blocks the child's
   bridge on send() when the render process is busy drawing, and a
   blocked bridge can't drain commands. Dropping the oldest item when
@@ -90,7 +90,7 @@ re-explaining. History (why a rule changed) lives in git, not here.
   * the MODEL channel (maxsize 4): the render model (60 Hz) + lifecycle
     (ready/crash/done). Drained by the RENDER thread.
   * the NET channel (maxsize 16): the wire traffic (snap/beam/echo) the
-    SimThread hands to its worker. Drained by the host's DEDICATED NET
+    SimThread hands to the net Queue. Drained by the host's DEDICATED NET
     PROCESS (net_process.py, plan_13) — NOT the render thread. The net
     process owns the socket end to end (listen + accept + handshake +
     send + receive) and runs its own loop paced to a steady 60 Hz
@@ -126,6 +126,46 @@ re-explaining. History (why a rule changed) lives in git, not here.
   process is GIL-free too, so the snapshot STAMPS stay smooth either
   way; latest-wins keeps the SEND current on top of that.)
 
+## Client process topology (the net is a SEPARATE PROCESS)
+- The client's socket I/O + JSON run in its OWN process
+  (client_net_process.py) — NOT a NetWorker thread in the render
+  process. The net process owns the socket end to end (connect + the
+  join/welcome handshake + the game loop's input send + snapshot
+  receive) and talks to the render process only through two Pipes:
+  render->net (input / respawn / quit) and net->render (connected /
+  snap / beam / echo / pong / disconnected / error / crash). The render
+  process learns the handshake outcome by polling the msg Pipe
+  (non-blocking poll()) while drawing the "connecting" screen — the
+  render thread never touches the socket.
+- WHY a process, not a thread (the GIL fix): a NetWorker THREAD shares
+  the render process's GIL with the draw. When a snapshot's bytes land,
+  the worker's recv() returns (it releases the GIL while blocked) but it
+  must RE-ACQUIRE the GIL to stamp the wire-arrival time + queue the
+  message, and the render thread holds the GIL for the whole draw frame
+  (~16-25 ms). So a snap arriving at time T got stamped at T + (one
+  frame) — the client's client_snap_debug.csv went BIMODAL (76% at
+  10-18 ms, then a sharp 13% peak at 30-36 ms) that the host's UNIMODAL
+  send (55% at 10-18 ms, 31% at 18-22 ms, 1.5% at 30-36 ms) never
+  produced. The extra ~666 32 ms gaps were manufactured by the GIL
+  re-acquisition, not the wire. A separate process has its OWN GIL
+  (shared only with itself): the render thread's draw can hold the
+  render GIL as long as it wants and the net process keeps draining the
+  socket + stamping the wire-arrival time on time. The wire-arrival
+  stamp (the "receive" time in client_snap_debug.csv) is now the TRUE
+  wire cadence, decoupled from the render frame.
+- The net process is HEADLESS (SDL_VIDEODRIVER/AUDIODRIVER=dummy set
+  before the net import, inside the function so the parent keeps its
+  real video driver) — it does no draw. A best-effort, wrapped priority
+  elevation (os.nice on Linux/macOS, SetPriorityClass on Windows — all
+  try/except with a normal-priority fallback) is the secondary lever for
+  the OS-descheduling component; the separate GIL is the primary fix and
+  works without it.
+- Shutdown: the render process sends ("quit",) on the cmd Pipe, closes
+  both Pipes, join(timeout=2), terminate() if still alive. The net
+  process ALSO exits on cmd_conn EOF (the parent died), so a missed quit
+  can't leak it. Idempotent — safe on every exit path (ESC/QUIT,
+  disconnect, connect-phase error).
+
 ## Wire
 - TCP, non-blocking, 4-byte big-endian length prefix + JSON. Message
   types: join, welcome, input (carries `tag`), snap, respawn, beam,
@@ -145,10 +185,27 @@ re-explaining. History (why a rule changed) lives in git, not here.
   at 60 Hz; a NEW rock (a spawn/split child) costs one extra ~411 B of verts
   (spawns are capped at 4/tick, splits rare — amortized ~1-2 KB/s). See
   plan_17_client_rock_shapes.md.
-- The socket I/O + JSON run on the NetWorker daemon thread; the main
-  thread only queues/polls it. The worker owns the Connection after
-  start(). The host's input sink + pong reflection run on the worker
-  thread (GIL-atomic ref swap; no pygame).
+- The socket I/O + JSON run in a DEDICATED NET PROCESS on BOTH peers
+  (host: net_process.py, client: client_net_process.py) — NOT a thread
+  in the render process. Each net process owns its Connection end to
+  end (the host: listen + accept + handshake; the client: connect +
+  handshake) and talks to its render process only through Pipes. WHY a
+  process, not a thread: a NetWorker THREAD shares the render process's
+  GIL with the draw — when a snapshot's bytes land, the worker's
+  recv() returns but it must RE-ACQUIRE the GIL to stamp the
+  wire-arrival time, and the render thread holds the GIL for the whole
+  draw frame (~16-25 ms), so a snap arriving at time T got stamped at
+  T + (one frame) — the client's receive cadence went BIMODAL (76% at
+  10-18 ms, then a sharp 13% peak at 30-36 ms) that the host's
+  UNIMODAL send (55% at 10-18 ms, 31% at 18-22 ms, 1.5% at 30-36 ms)
+  never produced. A separate process has its OWN GIL (shared only with
+  itself): the render thread's draw can hold the render GIL as long as
+  it wants and the net process keeps draining the socket + stamping on
+  time. The host's input forward + pong reflection run in the host net
+  process; the client's input send + snap/beam/echo/pong forward run in
+  the client net process (no pygame in either). The NetWorker class
+  remains in net.py (its self-test still exercises it) but the game no
+  longer uses it.
 - Partial frames are sent in parts; the UNSENT remainder is kept (never
   re-send a whole frame — it would duplicate bytes). The receive side
   resyncs past corrupted regions instead of raising.

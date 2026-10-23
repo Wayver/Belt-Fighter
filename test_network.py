@@ -216,15 +216,21 @@ def run(res, impairment=None, label="clean", run_s=3.5):
     snap_disps = []
     _orig_rewind = PredictedShip.reconcile_rewind
     def _tracking_rewind(self, ship_s, snap_time, now, enemies=None,
-                     real_time=None, rate=1.0):
+                     real_time=None, rate=1.0, rocks=None,
+                     player_proxy=None):
         before = (self.ship.pos.x, self.ship.pos.y)
         # 10.3a: forward the enemy proxies (the ghost's laser target is
         # picked from them during the replay) — the wrapper must accept +
         # pass through the new kwarg or the reconcile crashes.
         # 10.11c: forward real_time (the phase-locked clock anchor) +
         # rate (the host's estimated sim rate).
+        # plan_17: forward rocks (the rock proxies for the replay's
+        # collision) + player_proxy (the other player's proxy) — the
+        # wrapper must accept + pass through these or the reconcile
+        # crashes (the current reconcile_rewind takes them).
         _orig_rewind(self, ship_s, snap_time, now, enemies=enemies,
-                     real_time=real_time, rate=rate)
+                     real_time=real_time, rate=rate, rocks=rocks,
+                     player_proxy=player_proxy)
         after = (self.ship.pos.x, self.ship.pos.y)
         snap_disps.append(math.hypot(after[0] - before[0],
                                      after[1] - before[1]))

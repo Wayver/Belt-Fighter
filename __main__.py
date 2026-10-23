@@ -895,7 +895,8 @@ def _make_ghost_clock_writer(path):
     """
     f = open(path, "w", newline="")
     f.write("kind,real_time,pre_sim,pre_last,pre_acc,ht_raw,ht_cap,rtt_ow,"
-            "clock,steps,post_last,post_acc,dead,snap_time,now,n,post_sim\n")
+            "clock,steps,post_last,post_acc,dead,snap_time,now,n,post_sim,"
+            "recon_off\n")
 
     def _fmt(v):
         if v is None:
@@ -905,7 +906,7 @@ def _make_ghost_clock_writer(path):
         return "%.4f" % v
 
     def sink(kind, rec):
-        f.write("%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" % (
+        f.write("%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" % (
             kind,
             _fmt(rec.get('real_time')), _fmt(rec.get('pre_sim')),
             _fmt(rec.get('pre_last')), _fmt(rec.get('pre_acc')),
@@ -914,7 +915,8 @@ def _make_ghost_clock_writer(path):
             _fmt(rec.get('steps')), _fmt(rec.get('post_last')),
             _fmt(rec.get('post_acc')), _fmt(rec.get('dead')),
             _fmt(rec.get('snap_time')), _fmt(rec.get('now')),
-            _fmt(rec.get('n')), _fmt(rec.get('post_sim'))))
+            _fmt(rec.get('n')), _fmt(rec.get('post_sim')),
+            _fmt(rec.get('recon_off'))))
         f.flush()
     return f, sink
 

@@ -1629,6 +1629,16 @@ class PredictedShip:
         self._capture_client_sensor_state()
         # Diagnostics: the pre-reconcile clock state (the REC record).
         _pre_sim, _pre_last = self._sim_time, self._last_step_time
+        # Diagnostics: the pre-reconcile PHYSICS pose — the ghost's
+        # dead-reckoned pose at the moment the snapshot arrives. The
+        # reconcile offset (recon_off) = |post_pos - pre_pos| measures how
+        # far the reconcile had to CORRECT the prediction: ~0 when the
+        # dead-reckoning matched authority (smooth), >0 when it did not
+        # (the visible snap). Captured BEFORE apply_snapshot (which
+        # overwrites the pose with the authoritative one). This is the
+        # per-reconcile snap magnitude the client_snap_debug.csv arrival
+        # cadence cannot see.
+        _pre_pos = pygame.Vector2(self._ship.pos)
         # The replay (step, not advance) moves the physics state but does
         # NOT touch `_acc` or `_sim_time`. After the replay, the physics
         # clock is set to max(now, snap_time + n*TICK) and the accumulator
@@ -1686,7 +1696,9 @@ class PredictedShip:
                                 'pre_sim': _pre_sim, 'pre_last': _pre_last,
                                 'post_sim': self._sim_time,
                                 'post_last': self._last_step_time,
-                                'post_acc': self._acc})
+                                'post_acc': self._acc,
+                                'recon_off': (pygame.Vector2(self._ship.pos)
+                                              - _pre_pos).length()})
             return
         # Walk the sim ticks from snap_time to now. `i` is the tick index
         # (0 = snap_time itself, the snapshot's own tick — already applied
@@ -1750,7 +1762,9 @@ class PredictedShip:
                             'pre_sim': _pre_sim, 'pre_last': _pre_last,
                             'post_sim': self._sim_time,
                             'post_last': self._last_step_time,
-                            'post_acc': self._acc})
+                            'post_acc': self._acc,
+                            'recon_off': (pygame.Vector2(self._ship.pos)
+                                          - _pre_pos).length()})
         # The pose is at snap_time + n*TICK (the replay end), and
         # _last_step_time is the same, so the render interpolation phase
         # is _acc = _sim_time - _last_step_time (in [0, TICK)).

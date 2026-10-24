@@ -2,14 +2,16 @@
 
 The world is infinite, so rocks aren't spawned in waves anymore. Instead
 the world is divided into SECTOR_SIZE cells; every sector within
-ACTIVE_SECTORS of the player group is kept topped up to ROCKS_PER_SECTOR
-rocks, and rocks that drift past DESPAWN_RADIUS are culled. Rocks persist
-where you leave them, so the field feels continuous rather than a
-treadmill.
+ACTIVE_SECTORS of ANY alive player is kept topped up to ROCKS_PER_SECTOR
+rocks, and rocks that drift past FIELD_KEEP_RADIUS of every player are
+culled. Rocks persist where you leave them, so the field feels continuous
+rather than a treadmill.
 
-Multiplayer-ready: update_field() takes a list of player positions
-(one today, one per ship later) and keys everything off their centroid.
-Sector ids are plain (int, int) pairs, so they're trivial to sync.
+Multiplayer-ready: update_field() takes a list of player positions (one
+per ship) and keys the field off the UNION of each player's active region
+(plan_21 S1: per-player, not the centroid — the centroid sat between the
+two players in 2P and left their local sectors empty). Sector ids are
+plain (int, int) pairs, so they're trivial to sync.
 
 Seedable: every random-using function takes an optional `rng` (a
 random.Random instance). Default None falls back to the global random
@@ -22,7 +24,7 @@ import random
 import pygame
 
 from .config import (WIDTH, HEIGHT, SECTOR_SIZE, ACTIVE_SECTORS,
-                     ROCKS_PER_SECTOR, DESPAWN_RADIUS, SPAWN_CLEAR_RADIUS,
+                     ROCKS_PER_SECTOR, FIELD_KEEP_RADIUS, SPAWN_CLEAR_RADIUS,
                      MAX_SPAWNS_PER_TICK)
 from .asteroid import Asteroid
 from .enemy import EnemyShip
@@ -107,8 +109,18 @@ def update_field(asteroids, players, dt, rng=None):
     """Top up under-populated sectors and cull rocks that drifted away.
 
     Call once per fixed step.
+
+    plan_21 S1: the field is the UNION of a per-player active region (a
+    3x3 block of sectors around EACH alive player), not a single
+    centroid-anchored blob. A rock is kept if it is within
+    FIELD_KEEP_RADIUS of AT LEAST ONE alive player (per-player
+    min-distance), not the centroid. This gives each 2P player a full
+    field centered on themselves (the old centroid blob sat between the
+    players and left their local sectors empty) and stops rocks near a
+    player's screen edge from being culled while visible.
+
     asteroids: the game's rock list (mutated in place)
-    players:   list of Vector2 positions — one entry today, one per ship later
+    players:   list of Vector2 positions — one per alive ship
     dt:        fixed step size (kept for API symmetry / future use)
     rng:       optional random.Random for reproducible fields (default global)
     """
@@ -116,34 +128,52 @@ def update_field(asteroids, players, dt, rng=None):
     if not players:
         # No one alive to anchor the field (2P, both players dead waiting to
         # respawn). Leave the field as-is — no cull, no top-up — until a
-        # respawn gives it a centroid again.
+        # respawn gives it players again.
         return
-    centroid = pygame.Vector2(sum(p.x for p in players) / len(players),
-                              sum(p.y for p in players) / len(players))
 
-    # tag each rock with its sector, then cull anything beyond the fog
+    # Cull: keep a rock if it is within FIELD_KEEP_RADIUS of at least one
+    # alive player (per-player min-distance, not the centroid).
+    def _kept(a):
+        for p in players:
+            if a.pos.distance_to(p) < FIELD_KEEP_RADIUS:
+                return True
+        return False
     for a in asteroids:
         a.sector = sector_of(a.pos)
-    asteroids[:] = [a for a in asteroids
-                    if a.pos.distance_to(centroid) < DESPAWN_RADIUS]
+    asteroids[:] = [a for a in asteroids if _kept(a)]
 
+    # Count surviving rocks per sector.
     counts = {}
     for a in asteroids:
         counts[a.sector] = counts.get(a.sector, 0) + 1
 
-    cs, ct = sector_of(centroid)
+    # Top up the UNION of each player's 3x3 active region. `region` tracks
+    # sectors already scheduled this tick so overlapping regions (players
+    # close together) are not double-filled. The GLOBAL spawn cap bounds the
+    # total per tick (deterministic fill order; see plan_21 §3.3).
+    region = set()
     spawned = 0
-    for sx in range(cs - ACTIVE_SECTORS, cs + ACTIVE_SECTORS + 1):
-        for sy in range(ct - ACTIVE_SECTORS, ct + ACTIVE_SECTORS + 1):
-            if spawned >= MAX_SPAWNS_PER_TICK:
-                break
-            need = ROCKS_PER_SECTOR - counts.get((sx, sy), 0)
-            for _ in range(need):
-                pos = _spawn_pos((sx, sy), players, rng=rng)
-                if pos is not None:
-                    asteroids.append(Asteroid(pos, _spawn_size(rng=rng),
-                                              rng=rng))
-                    counts[(sx, sy)] = counts.get((sx, sy), 0) + 1
-                    spawned += 1
+    for p in players:
+        ps, pt = sector_of(p)
+        for sx in range(ps - ACTIVE_SECTORS, ps + ACTIVE_SECTORS + 1):
+            for sy in range(pt - ACTIVE_SECTORS, pt + ACTIVE_SECTORS + 1):
                 if spawned >= MAX_SPAWNS_PER_TICK:
                     break
+                key = (sx, sy)
+                if key in region:
+                    continue
+                region.add(key)
+                need = ROCKS_PER_SECTOR - counts.get(key, 0)
+                for _ in range(need):
+                    pos = _spawn_pos(key, players, rng=rng)
+                    if pos is not None:
+                        asteroids.append(Asteroid(pos, _spawn_size(rng=rng),
+                                                  rng=rng))
+                        counts[key] = counts.get(key, 0) + 1
+                        spawned += 1
+                    if spawned >= MAX_SPAWNS_PER_TICK:
+                        break
+            if spawned >= MAX_SPAWNS_PER_TICK:
+                break
+        if spawned >= MAX_SPAWNS_PER_TICK:
+            break

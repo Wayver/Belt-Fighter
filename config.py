@@ -13,9 +13,19 @@ TETHER_STRENGTH = 0.5   # restoring accel per px of tether overshoot
 
 # --- infinite field (sector spawning) ---
 SECTOR_SIZE = 1000          # px per sector cell
-ACTIVE_SECTORS = 2          # Chebyshev radius of sectors kept populated
+# plan_21 S1: 3x3 region per player (was 5x5). A 3000x3000 region fully
+# covers the 1920x1280 screen with a 540 px buffer (absorbs the camera
+# look-ahead lead) — a 5x5 region was 5000x5000, mostly off-screen rocks
+# burning snapshot bandwidth. See plan_21 §2 for the measured table.
+ACTIVE_SECTORS = 1          # Chebyshev radius of sectors kept populated
 ROCKS_PER_SECTOR = 3        # target rocks per active sector
-DESPAWN_RADIUS = 2600       # rocks farther than this from the group are culled
+# plan_21 S1: rocks are kept if within this radius of AT LEAST ONE alive
+# player (per-player min-distance, not the centroid). Sized to fully contain
+# the 3x3 active region (corners ~2121 px from the anchor) so a rock is never
+# culled the tick it spawns. Was DESPAWN_RADIUS = 2600 (centroid cull), which
+# winked out rocks near a player's screen edge in 2P and left the active
+# region's corners outside the keep radius (spawn-then-cull waste).
+FIELD_KEEP_RADIUS = 2200
 SPAWN_CLEAR_RADIUS = 500    # never spawn closer than this to a player
 MAX_SPAWNS_PER_TICK = 4     # fill the field gradually, not all at once
 

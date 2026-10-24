@@ -316,8 +316,18 @@ def main():
     assert len(g.ghost.local_bullets) == 1, \
         "the ghost must keep exactly its own bullet (no fire, no handoff " \
         "this frame): %r" % (g.ghost.local_bullets,)
-    assert bullet_px(screen, g.cam, 100.0, 0.0) > 0, \
-        "the ghost's bullet (id (1,0)) must be DRAWN at (100,0)"
+    # The ghost's bullet is drawn translated by the ship's VISUAL offset
+    # (gpos - s.pos, where gpos is the smoothed render pose the visible
+    # ship is drawn at), not at the raw physics pose (b.pos) — see the
+    # _lead comment in predicted_view. Compute the expected position from
+    # the actual smoothed pose (robust to any steps taken during
+    # predicted_view).
+    _b = g.ghost.local_bullets[0]
+    _off = g.ghost._smooth_pos - g.ghost.ship.pos
+    _exp = (_b.pos.x + _off.x, _b.pos.y + _off.y)
+    assert bullet_px(screen, g.cam, _exp[0], _exp[1]) > 0, \
+        "the ghost's bullet (id (1,0)) must be DRAWN at the visual " \
+        "ship's position (%.1f, %.1f)" % _exp
     assert bullet_px(screen, g.cam, 300.0, 0.0) == 0, \
         "the buffer's copy of the client's bullet (id (1,0)) at (300,0) " \
         "must be SKIPPED (the ghost draws it): %d px" \

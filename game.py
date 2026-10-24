@@ -3094,6 +3094,21 @@ class Game:
         # still reads self.ghost.ship.pos (the current pose) — exactly
         # like the host's _draw_local_ship.
         gpos, gangle = self.ghost.render_pose_smoothed(dt)
+        # VISUAL OFFSET (per-frame): the ghost bullet is fired from the
+        # PHYSICS pose (s.pos), but the visible ship is drawn at gpos (the
+        # SMOOTHED render pose). The offset (gpos - s.pos) moves the bullet
+        # into the visual ship's frame. Using the CURRENT offset every
+        # frame (not a frozen fire-time value) keeps the bullet ALIGNED
+        # with the ship: drawn_bullet - drawn_ship = b.pos - s.pos, which
+        # is purely along the gun direction (the bullet inherits the ship's
+        # velocity, so its physics position stays lined up with the muzzle
+        # — a frozen offset would add a s.vel*(acc_fire - acc_now) term
+        # along the ship's velocity, breaking the alignment). The cost: a
+        # small wobble in ABSOLUTE space (the offset changes as the render
+        # phase advances) — much less noticeable than the misalignment.
+        # The buffer draw of a handed-off bullet uses the SAME per-frame
+        # offset (in scope below), so the handoff is seamless every frame.
+        _lead = pygame.Vector2(gpos) - self.ghost.ship.pos
         # Advance + cull the client-side death bursts (presentation).
         self._step_death_bursts(dt)
         # Age + cull the client-side bullet-impact sparks (presentation).
@@ -3252,13 +3267,15 @@ class Game:
                               h_culled=_mtel.fmt_ids([_bid]),
                               h_jump="")
                     # TELEMETRY (bullet_handoff_telemetry): record the
-                    # ghost's DRAWN position at the handoff frame (b.pos —
-                    # the present-time position the ghost was drawing it
-                    # at). Consumed in the buffer draw loop below to
-                    # compute the handoff offset (ghost_pos - buf_drawn).
+                    # ghost's DRAWN position at the handoff frame (b.pos +
+                    # _lead — the visual-muzzle position the ghost was
+                    # drawing it at). Consumed in the buffer draw loop
+                    # below to compute the handoff offset (ghost_drawn -
+                    # buf_drawn). The buffer draw uses the SAME per-frame
+                    # _lead (in scope), so the handoff is seamless.
                     if _bid is not None:
                         self._bullet_handoff_ghost_pos[_bid] = (
-                            b.pos.x, b.pos.y)
+                            b.pos.x + _lead.x, b.pos.y + _lead.y)
                     continue
             _bkept.append(b)
         self.ghost.local_bullets = _bkept
@@ -3375,12 +3392,16 @@ class Game:
             del _hit_fx_cull[_bid]
         _hit_fx_bullets = []
         _hf_n_ghost = 0
-        # Ghost-drawn local bullets (at the present, b.pos).
+        # Ghost-drawn local bullets (translated by the ship's per-frame VISUAL
+        # OFFSET _lead = gpos - s.pos — the same offset the sprite draw
+        # below applies, so the trigger segment ends where the dot is
+        # drawn).
         for b in self.ghost.local_bullets:
             if b.id is not None:
                 _hit_fx_bullets.append((
-                    tuple(b.id), b.prev_pos.x, b.prev_pos.y,
-                    b.pos.x, b.pos.y, 'ghost'))
+                    tuple(b.id),
+                    b.prev_pos.x + _lead.x, b.prev_pos.y + _lead.y,
+                    b.pos.x + _lead.x, b.pos.y + _lead.y, 'ghost'))
                 _hf_n_ghost += 1
         _hf_n_buf = 0
         # Buffer-drawn local bullets (pulled forward to the present).
@@ -3397,9 +3418,14 @@ class Game:
             if kind == 'player' and mid is not None \
                     and tuple(mid)[0] == self.local_index \
                     and tuple(mid) not in local_bullet_ids:
+                # The DRAW includes the ship's per-frame VISUAL OFFSET
+                # (_lead = gpos - s.pos — the same offset the sprite draw
+                # below applies), so the trigger segment must end at the
+                # DRAW: (x + _lead) -> (x + vx*D + _lead).
                 _hit_fx_bullets.append((
-                    tuple(mid), x, y,
-                    x + vx * _bdpull, y + vy * _bdpull, 'buf'))
+                    tuple(mid), x + _lead.x, y + _lead.y,
+                    x + vx * _bdpull + _lead.x, y + vy * _bdpull + _lead.y,
+                    'buf'))
                 _hf_n_buf += 1
         # Remote ships' drawn poses + collision radii (live ships only).
         _hit_fx_ships = []
@@ -3730,6 +3756,15 @@ class Game:
                 if _bid_t[0] == self.local_index:
                     x += vx * _bdpull
                     y += vy * _bdpull
+                    # Inherit the ship's per-frame VISUAL OFFSET (_lead = gpos - s.pos,
+                    # in scope — the same offset the ghost sprite draw
+                    # applies). The ghost drew the bullet at (b.pos +
+                    # _lead); the buffer's copy is at (buf_pos + V*D ~=
+                    # b.pos) in the SAME physics time domain, so adding
+                    # the same _lead lands it exactly where the ghost was
+                    # drawing it — a seamless handoff every frame.
+                    x += _lead.x
+                    y += _lead.y
                     # TELEMETRY (bullet_handoff_telemetry): the FIRST frame
                     # the buffer's copy is drawn (the handoff frame), log
                     # the offset between the ghost's last drawn position
@@ -3899,12 +3934,16 @@ class Game:
             if b.id is not None and tuple(b.id) in _hit_fx_cull:
                 continue
             _a = BULLET_LIFE - b.life
-            # Present-time draw (the plan_15 revert): b.pos, no t_off shift.
-            _rx = b.pos.x
-            _ry = b.pos.y
+            # Draw translated by the ship's per-frame VISUAL OFFSET (_lead =
+            # gpos - s.pos — see the _lead comment above). Keeps the
+            # bullet aligned with the visible ship (b.pos - s.pos is
+            # purely along the gun direction).
+            _rx = b.pos.x + _lead.x
+            _ry = b.pos.y + _lead.y
             s = self.cam.to_screen(pygame.Vector2(_rx, _ry))
             pygame.draw.circle(screen, BULLET_COLOR, (int(s.x), int(s.y)), 3)
-            _bttel_rows.append((b.id, _rx, _ry, b.vel.x, b.vel.y, _a))
+            _bttel_rows.append((b.id, _rx, _ry, b.vel.x, b.vel.y, _a,
+                                b.pos.x, b.pos.y))
         _bttel.log_frame(self, gpos, rp, _D, _bttel_rows)
         # HIT FX: remove the culled bullets from local_bullets NOW (before
         # the fog light loop below) so they get no lingering glow and the
@@ -3963,13 +4002,16 @@ class Game:
                                  local_bullet_ids=local_bullet_ids,
                                  pull=_bdpull,
                                  local_index=self.local_index,
-                                 local_missile_cull=_hit_fx_cull_mids)
+                                 local_missile_cull=_hit_fx_cull_mids,
+                                 bullet_visual_offset=_lead)
         # The player's OWN gun shots glow too — mirrors the
         # host's _build_lights, which adds a LightSource per player bullet.
-        # At the PRESENT (b.pos), the SAME position as the sprite (the
-        # plan_15 render-point shift is reverted — the glow follows the dot).
+        # At the per-frame VISUAL OFFSET position (b.pos + _lead), the
+        # SAME position as the sprite (the glow follows the dot).
         for b in self.ghost.local_bullets:
-            lights.append(LightSource(b.pos, 30, 0.5))
+            lights.append(LightSource(
+                pygame.Vector2(b.pos.x + _lead.x,
+                               b.pos.y + _lead.y), 30, 0.5))
         # The player's OWN missiles glow too (the buffer's copy of
         # each was skipped above, so light them from the predicted pos).
         for m in self.ghost.local_missiles:
@@ -4162,7 +4204,8 @@ class Game:
 
     def _remote_fog_lights(self, pos, local_ship, local_missile_ids=(),
                        handoff_offsets=None, local_bullet_ids=(),
-                       pull=0.0, local_index=0, local_missile_cull=()):
+                       pull=0.0, local_index=0, local_missile_cull=(),
+                       bullet_visual_offset=None):
         """LightSources for the client's fog of war (
         predicted_view previously skipped draw_fog entirely, so fire did
         not glow through the dark like on the host). Mirrors
@@ -4228,6 +4271,13 @@ class Game:
                 if _bid_t[0] == local_index:
                     x += vx * pull
                     y += vy * pull
+                    # Inherit the ship's per-frame VISUAL OFFSET (the same
+                    # _lead the ghost sprite draw applies) so the glow
+                    # lands where the sprite is drawn — a seamless
+                    # handoff every frame.
+                    if bullet_visual_offset is not None:
+                        x += bullet_visual_offset.x
+                        y += bullet_visual_offset.y
             # Apply the handoff offset to the fog light (same
             # position as the missile sprite).
             if kind == 'missile' and mid is not None and handoff_offsets:

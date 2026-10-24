@@ -156,6 +156,20 @@ FOG_FRONT_OFFSET = 120.0 # how far ahead of the ship the lobe is centered
 # safe for enemies (~20 px hulls) and projectiles. See PERFORMANCE.md.
 CULL_MARGIN = 80
 
+# --- wire culling (plan_21 S2) ---
+# Margin (px) added around the REMOTE player's viewport when deciding
+# whether to SEND a rock over the wire (host-side, in serialize_snapshot).
+# Must cover: camera look-ahead lead (LOOK_AHEAD * MAX_SPEED = 0.6 * 520 =
+# 312 px) + the viewport cull margin (CULL_MARGIN = 80) + interpolation
+# delay * max rock speed (INTERP_DELAY_MAX * 130 = 0.35 * 130 = 46 px) + a
+# safety buffer (200 px, covers jitter + adaptive-delay growth). Total:
+# ~640 px. A rock is sent iff it is within (WIDTH/2 + WIRE_CULL_MARGIN) of
+# the remote player's x AND (HEIGHT/2 + WIRE_CULL_MARGIN) of its y. A rock
+# that drops out of the cull rect simply leaves the wire (the client's
+# interpolation buffer drops it — same as a field-culled rock); one that
+# re-enters pops in ~640 px off-screen, so the player never sees it appear.
+WIRE_CULL_MARGIN = 640
+
 # collision
 HULL_COLLISION_INSET = 1.0   # scale collision poly toward centroid (1.0 = exact hull)
 DEBUG_COLLISION = False      # draw the collision polygons (presentation-only)

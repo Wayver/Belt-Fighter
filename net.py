@@ -58,7 +58,8 @@ import threading
 import time
 from dataclasses import asdict
 
-from .config import SNAPSHOT_INTERVAL, TICK
+from .config import (SNAPSHOT_INTERVAL, TICK, WIDTH, HEIGHT,
+                     WIRE_CULL_MARGIN)
 from .intent import ShipInput
 from .hulls import (PLAYER_HULLS, COMPONENT_CATALOG, DEFAULT_HULL,
                     default_loadout, validate_loadout)
@@ -286,7 +287,34 @@ class RockShapeTracker:
         return len(self._sent)
 
 
-def serialize_snapshot(snap, tracker=None):
+def _remote_player_pos(snap):
+    """The REMOTE player's world position from a Game.snapshot() tuple, or
+    None when it can't be determined.
+
+    plan_21 S2: the host culls rocks to the remote player's viewport before
+    serializing (see serialize_snapshot's `cull_center`). The remote player
+    is the one the RECVING peer controls: for the host's send that is
+    player 1 (index 1 — the client), for a client's send (if it ever sends
+    snapshots) it would be player 0. The 2P host is the only production
+    sender, so this reads `snap[0][1]` (the players tuple's index-1
+    Ship.snapshot(), whose first two fields are pos.x, pos.y).
+
+    Returns None (no culling) when the snapshot has fewer than 2 players —
+    a single-player snapshot has no remote peer to cull for — or when the
+    players slot is not a real players tuple (the test harnesses use a
+    float placeholder there; a float has no len, so the isinstance guard
+    must come first).
+    """
+    players = snap[0]
+    if not isinstance(players, (list, tuple)) or len(players) < 2:
+        return None
+    ship = players[1]
+    if not isinstance(ship, (list, tuple)) or len(ship) < 2:
+        return None
+    return (ship[0], ship[1])
+
+
+def serialize_snapshot(snap, tracker=None, cull_center=None):
     """Game.snapshot() tuple -> the PRUNED wire structure.
 
     The remote peer is a PRESENTATION peer: it never runs the sim and never
@@ -317,6 +345,17 @@ def serialize_snapshot(snap, tracker=None):
     full verts — correct, just not bandwidth-optimal. The production send
     paths (NetWorker, net process) pass a per-connection tracker.
 
+    `cull_center` (a `(x, y)` tuple, optional) — plan_21 S2 wire culling:
+    when provided, rocks outside the cull rect centered on this point are
+    DROPPED from the wire (the remote peer can't see them). The cull rect is
+    the viewport (WIDTH x HEIGHT) inflated by WIRE_CULL_MARGIN on each side.
+    When None (default), no culling — all rocks are sent (backward-
+    compatible; the self-test and single-player paths don't cull). The
+    production 2P send path (net_process.py) passes
+    `_remote_player_pos(snap)`. A dropped rock simply leaves the wire (the
+    client's interpolation buffer drops it, like a field-culled rock); a
+    re-entering rock pops in ~WIRE_CULL_MARGIN px off-screen.
+
     Everything else (players, enemies, bullets, enemy_bullets, missiles,
     game_over, protect_timer, the two id counters) is passed through —
     tuples become JSON arrays on `json.dumps`, and every field is already a
@@ -337,6 +376,16 @@ def serialize_snapshot(snap, tracker=None):
     for a in snap[5]:
         # a = (id, x, y, vx, vy, size, angle, spin, verts)
         rid = a[0]
+        # Wire cull (plan_21 S2): drop rocks outside the cull rect. The
+        # client's interpolation buffer matches rocks by id, so a rock that
+        # leaves the rect is simply absent from this snapshot (dropped, like
+        # a field-culled rock) and one that re-enters reads as "new" (pops
+        # in at its curr values, ~WIRE_CULL_MARGIN px off-screen).
+        if cull_center is not None:
+            cx, cy = cull_center
+            if (abs(a[1] - cx) > WIDTH / 2 + WIRE_CULL_MARGIN or
+                    abs(a[2] - cy) > HEIGHT / 2 + WIRE_CULL_MARGIN):
+                continue
         if tracker is None or tracker.take(rid):
             verts = tuple((vx, vy) for (vx, vy) in a[8])
         else:

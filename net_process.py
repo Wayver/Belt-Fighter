@@ -151,6 +151,7 @@ def net_process_main(status_conn, net_queue, remote_input_conn,
 
     from .net import (Host, do_handshake_host, serialize_hull,
                       serialize_loadout, serialize_snapshot,
+                      _remote_player_pos,
                       RockShapeTracker,
                       deserialize_input, T_SNAP, T_INPUT, T_RESPAWN, T_PONG)
 
@@ -346,8 +347,15 @@ def net_process_main(status_conn, net_queue, remote_input_conn,
             if latest_snap is not None:
                 m = latest_snap
                 latest_snap = None
+                # plan_21 S2: cull rocks to the REMOTE player's (the
+                # client's) viewport before serializing — the host is
+                # player 0, the client is player 1, so the cull center is
+                # player 1's pos in the snapshot. None (1P snapshot) -> no
+                # culling.
                 conn.send({"type": T_SNAP, "sim_time": m[1],
-                           "snap": serialize_snapshot(m[2], rock_tracker)})
+                           "snap": serialize_snapshot(
+                               m[2], rock_tracker,
+                               cull_center=_remote_player_pos(m[2]))})
                 if snap_log_f is not None:
                     snap_seq += 1
                     snap_log_f.write("%.3f,%.3f,%.4f,%d\n" % (

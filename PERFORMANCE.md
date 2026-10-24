@@ -191,3 +191,30 @@ filter to the existing `_local_incoming_hit_fx` bullet scan (a `kind` /
 beams, an id-set membership test each). Host-side, `_targetable_candidates`
 adds at most ONE extra candidate (the other player) to the existing
 nearest-in-range loop. All negligible against the fog's ~3 ms.
+
+## 2P asteroid field (plan_21)
+
+The 2P asteroid field was a single centroid-anchored blob (5x5 sectors,
+DESPAWN_RADIUS 2600 px from the centroid). In 2P the centroid sits between
+the players, so the field was off-center, sparse, and churning (wink-out /
+pop-in). Plan 21 S1 replaced it with a per-player union field (3x3 sectors
+per player, FIELD_KEEP_RADIUS 2200 px per-player min-distance). Plan 21 S2
+added wire culling: the host drops rocks outside the client's viewport
+(+ WIRE_CULL_MARGIN 640 px) before serializing.
+
+Measured (2P, players 1500 px apart, real wire path
+snapshot -> serialize -> json.dumps, 600-tick warm + 300-tick sample,
+`tools/_plan21_bw.py`):
+
+| Config | total rocks | rocks on wire | B/snap | KB/s @60 Hz |
+|---|---|---|---|---|
+| baseline (5x5, keep 2600, no cull) | 144.5 | 144.5 | 8873 | 520 |
+| S1 (3x3 per-player, keep 2200) | 41.2 | 41.2 | 4215 | 247 |
+| S1+S2 (3x3 + wire cull 640) | 41.2 | 23.2 | 3560 | 209 |
+
+Total reduction: **60%** vs baseline (52% from the field change alone, a
+further ~16% from the wire cull). The byte reduction is smaller than the
+rock-count reduction (44% of rocks) because the snapshot has fixed
+overhead (players, etc.) and first-sight rocks carry their full vert list.
+At 4000 px separation the wire stays flat (~23.7 rocks, 3623 B/snap) — the
+cull rect, not the field size, bounds the wire.

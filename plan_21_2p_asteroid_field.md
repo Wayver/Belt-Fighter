@@ -2,11 +2,14 @@
 
 **Status:** S1 DONE (commit 3513ebc, per-player 3×3 field + test_21_2p_field
 4/4 + full regression green; headless 58 rocks, symmetric). S2 DONE
-(commit below, wire culling + test_21_wire_cull 5/5 + test_net_process /
+(commit 66986d6, wire culling + test_21_wire_cull 5/5 + test_net_process /
 test_17 / test_interpolation / test_10_12 / test_snapshot green; measured
 58→31 rocks, 2328→1372 B/snap = 41% smaller, 139.7→80.6 KB/s @60 Hz). S3
-pending (integration + docs). Three sessions, each independently testable
-and comfortably inside a 64k context window. Sessions are strictly ordered:
+DONE (full 13-test suite green; combined bandwidth measured with
+tools/_plan21_bw.py: 144.5→23.2 rocks on the wire, 8873→3560 B/snap = 60%
+reduction @1500 px separation, wire flat at 4000 px; PERFORMANCE.md +
+ARCHITECTURE.md updated). Three sessions, each independently testable and
+comfortably inside a 64k context window. Sessions are strictly ordered:
 S1 fixes the field, S2 adds the wire cull, S3 integrates + verifies + docs.
 
 > S2 deviation from the plan: culling is OPT-IN (`cull_center=None`

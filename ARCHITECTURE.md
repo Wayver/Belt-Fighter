@@ -467,6 +467,39 @@ replaces the old hardcoded "loop over `self.enemies`".
   Presentation only: no sim, no authority (the authoritative hit + damage
   already come from the host snapshot).
 
+## 2P asteroid field (plan_21)
+The asteroid field is host-authoritative. In 2P, the field is the UNION of a
+3x3 sector region around each alive player (not a single centroid blob). A
+rock is kept if it is within FIELD_KEEP_RADIUS (2200 px) of at least one
+alive player. The host culls rocks outside the client's viewport
+(+ WIRE_CULL_MARGIN 640 px) before serializing the snapshot, reducing wire
+bandwidth by ~60% vs the original centroid field (measured: 144.5 -> 23.2
+rocks on the wire, 8873 -> 3560 B/snap, 2P at 1500 px separation — see
+PERFORMANCE.md for the table).
+
+- **Per-player field (S1)** — `spawning.update_field` takes the list of
+  ALIVE player positions and tops up the union of each player's 3x3 sector
+  region (overlapping regions are not double-filled; the global
+  MAX_SPAWNS_PER_TICK cap bounds the fill). Culling is per-player
+  min-distance, not centroid: a rock is kept if it is within
+  FIELD_KEEP_RADIUS of ANY alive player. With no alive players (2P, both
+  dead) the field is left as-is — no cull, no top-up.
+- **Wire culling (S2)** — `serialize_snapshot(snap, tracker, cull_center)`
+  drops rocks outside the cull rect (viewport + WIRE_CULL_MARGIN) centered
+  on the remote player's snapshot position. Only the production 2P send
+  path (`net_process.py`, via `_remote_player_pos`) passes `cull_center`;
+  the in-process `NetWorker` (self-test + test_10_12 only) and 1P keep the
+  default `cull_center=None` (no cull). The margin covers camera look-ahead
+  (312 px) + viewport cull margin (80) + interp delay x max rock speed (46)
+  + safety (200).
+
+The client is unaffected: it interpolates rocks by id and handles new/missing
+rocks gracefully (a rock that drops out of the wire is simply not drawn; a
+rock that re-enters the cull rect pops in at its current position, well
+off-screen due to the 640 px margin). `RockShapeTracker` keeps the id in
+`_sent` across a cull-rect exit/re-entry, so the immutable verts are never
+re-sent.
+
 ## Misc
 - Enemy proxies: the caller builds lightweight proxies from the buffer's
   enemy entries (`.pos`, `.vel`, `.id`, `.ship` with power fields) and

@@ -1722,6 +1722,14 @@ class PredictedShip:
         # next reconcile (when now > snap_time again).
         n = max(0, n)
         self._last_replay_ticks = n   # net-debug CSV
+        # Capture the existing bullet IDs before the replay. The replay
+        # double-advances them (they were already at `now` from advance(),
+        # and the replay advances them by n more ticks). We need to undo
+        # the double-advance after the replay, but only for the existing
+        # bullets (the new bullets fired during the replay are already at
+        # `now`).
+        _existing_bids = {tuple(b.id) for b in self.local_bullets
+                          if b.id is not None}
         for i in range(n):
             t = snap_time + i * TICK
             while j + 1 < len(buf) and buf[j + 1][0] <= t + 1e-9:
@@ -1756,6 +1764,21 @@ class PredictedShip:
         self._last_step_time = snap_time + n * TICK
         # Branch 3 free-runs at exactly 1x real time (see seed()).
         self._rate = 1.0
+        # Undo the double-advance of the EXISTING bullets. The replay
+        # stepped the bullets n times (step_local_bullets in the loop
+        # above), but they were already at `now` (advanced by advance()
+        # between snapshots). The ship was re-anchored to the snapshot by
+        # apply_snapshot and replayed to `now`, so it is at `now`. The
+        # bullets are at `now + n*TICK` (double-advanced). Shifting the
+        # existing bullets back by n*TICK re-anchors them to `now` (the
+        # same time as the ship). The NEW bullets (fired during the
+        # replay) are already at `now` (the replay advanced them from
+        # their fire tick to `now`), so they are NOT shifted.
+        if n > 0:
+            _dt_back = n * TICK
+            for b in self.local_bullets:
+                if b.id is not None and tuple(b.id) in _existing_bids:
+                    b.pos -= b.vel * _dt_back
         # Diagnostics: the replayed REC record.
         self._diag('REC', {'real_time': real_time, 'snap_time': snap_time,
                             'now': now, 'n': n,

@@ -47,7 +47,9 @@ _path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 _COLS = (
     "t", "event", "sim_t", "rp", "D", "delay", "rtt_ow",
     "ship_x", "ship_y", "ship_vx", "ship_vy",
+    "spos_x", "spos_y",
     "bid", "bx", "by", "bvx", "bvy", "bage",
+    "bpos_x", "bpos_y",
     "brelx", "brely", "bdship",
 )
 _HEADER = ",".join(_COLS)
@@ -97,11 +99,14 @@ def log_frame(game, gpos, rp, D, bullets):
     """Log one frame's ship state + each ghost bullet's DRAWN state.
 
     `game` is the Game (read for latency.delay, _rtt_ow, ghost._sim_time,
-    ghost.ship.vel). `gpos` is the ship's DRAWN pose (the smoothed render
-    pose). `rp` is the render point. `D` is the freeze-window gap
-    (ghost._last_step_time - rp). `bullets` is a list of
-    (id, bx, by, bvx, bvy, age) — the DRAWN position (bx,by) is what the
-    player sees (b.pos - b.vel*t_off), not the raw b.pos.
+    ghost.ship.vel, ghost.ship.pos). `gpos` is the ship's DRAWN pose (the
+    smoothed render pose). `rp` is the render point. `D` is the freeze-
+    window gap (ghost._last_step_time - rp). `bullets` is a list of
+    (id, bx, by, bvx, bvy, age, bpos_x, bpos_y) — (bx,by) is the DRAWN
+    position (what the player sees), (bpos_x,bpos_y) is the PHYSICS
+    position (b.pos, the ghost's own time domain). The physics-relative
+    offset (b.pos - s.pos) is the true muzzle alignment; the drawn-
+    relative offset (bx - gpos) is what the player sees.
 
     Writes one row per bullet (event=BUL); if there are no bullets, writes a
     single ship-only row (event=SHIP) so the ship's trajectory is still
@@ -114,33 +119,40 @@ def log_frame(game, gpos, rp, D, bullets):
     delay = getattr(game.latency, "delay", 0.0)
     rtt_ow = getattr(game, "_rtt_ow", 0.0)
     svx, svy = g.ship.vel.x, g.ship.vel.y
+    # The ship's PHYSICS pose (s.pos) — the bullet's b.pos is in this
+    # domain, so the physics-relative offset (b.pos - s.pos) is the
+    # true muzzle alignment. ship_x/ship_y (gpos) is the DRAWN pose.
+    spos_x, spos_y = g.ship.pos.x, g.ship.pos.y
     wall = "%.3f" % time.time()
     ship = (wall, sim_t, rp, D, delay, rtt_ow,
-            gpos.x, gpos.y, svx, svy)
+            gpos.x, gpos.y, svx, svy, spos_x, spos_y)
 
     if not bullets:
         row = {c: "" for c in _COLS}
         row["t"], row["event"] = wall, "SHIP"
         for c, v in zip(("sim_t", "rp", "D", "delay", "rtt_ow",
-                         "ship_x", "ship_y", "ship_vx", "ship_vy"), ship[1:]):
+                         "ship_x", "ship_y", "ship_vx", "ship_vy",
+                         "spos_x", "spos_y"), ship[1:]):
             row[c] = _fmt(v)
         _f.write(",".join(row[c] for c in _COLS) + "\n")
         _f.flush()
         return
 
-    for (bid, bx, by, bvx, bvy, age) in bullets:
+    for (bid, bx, by, bvx, bvy, age, bpos_x, bpos_y) in bullets:
         brelx = bx - gpos.x
         brely = by - gpos.y
         bdship = (brelx * brelx + brely * brely) ** 0.5
         row = {c: "" for c in _COLS}
         row["t"], row["event"] = wall, "BUL"
         for c, v in zip(("sim_t", "rp", "D", "delay", "rtt_ow",
-                         "ship_x", "ship_y", "ship_vx", "ship_vy"), ship[1:]):
+                         "ship_x", "ship_y", "ship_vx", "ship_vy",
+                         "spos_x", "spos_y"), ship[1:]):
             row[c] = _fmt(v)
         row["bid"] = _fmt_id(bid)
         row["bx"], row["by"] = _fmt(bx), _fmt(by)
         row["bvx"], row["bvy"] = _fmt(bvx), _fmt(bvy)
         row["bage"] = _fmt(age)
+        row["bpos_x"], row["bpos_y"] = _fmt(bpos_x), _fmt(bpos_y)
         row["brelx"], row["brely"], row["bdship"] = (
             _fmt(brelx), _fmt(brely), _fmt(bdship))
         _f.write(",".join(row[c] for c in _COLS) + "\n")

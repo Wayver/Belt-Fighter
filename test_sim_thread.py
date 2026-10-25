@@ -103,26 +103,32 @@ def _model(sim_time, step_alpha):
 
 
 def check_render_clock():
-    """The render thread's own interpolation alpha (the M3 #6 change):
-    derived from the render clock + the published model's stamp, NOT the
-    sim's acc. The model carries the prev+curr pose (the window
-    [T - STEP, T]), so the alpha = (t - T) / STEP, clamped to [0, 1]."""
+    """The render thread's own interpolation alpha (plan_22 S4): a
+    FREE-RUN clock with a gentle EMA correction toward the model's stamp +
+    a fixed half-step offset. The alpha = (t - T) / STEP, clamped to [0, 1].
+
+    The key property (the plan_22 S3 fix): the alpha must NOT track the
+    sim's acc. The old design re-anchored t = T + acc*STEP on every new
+    model, coupling the rendered pose to the sim's acc oscillation (the
+    local-ship stutter). The new design free-runs t at 1x real time and
+    only eases it toward T (offset 0), so the steady-state alpha is ~0
+    regardless of the sim's acc."""
     from .__main__ import _HostRenderClock
     ok = True
-    # Steady state: publishes arrive every STEP with the sim's acc
-    # fraction; the alpha must track the sim's current-time fraction
-    # (what the old sim-acc/STEP gave the render thread).
+    # Steady state: publishes arrive every STEP with a VARYING sim acc
+    # fraction; the alpha must stay at the fixed offset (~0), NOT track
+    # the acc. This is the plan_22 fix — decoupling from the sim's acc.
     rc = _HostRenderClock()
     worst = 0.0
     for i in range(1, 121):
         T = i * STEP
-        acc_frac = 0.3
+        acc_frac = (i % 10) / 10.0   # vary the sim's acc: 0.0, 0.1, ... 0.9
         m = _model(T, acc_frac)
         a = rc.advance(STEP, m)
-        worst = max(worst, abs(a - acc_frac))
-    ok &= check("render clock: steady-state alpha tracks the sim's "
-                "current-time fraction", worst < 1e-9,
-                "worst |a - acc/STEP| = %.2e" % worst)
+        worst = max(worst, abs(a - 0.0))
+    ok &= check("render clock: steady-state alpha is the fixed offset "
+                "(~0), NOT the sim's acc", worst < 1e-9,
+                "worst |a - 0| = %.2e" % worst)
     # Hiccup: the estimate must never extrapolate past the current pose
     # (alpha clamped to 1), and a render hiccup (dt clamped to 50 ms)
     # must not drag it forward faster than 1x.
@@ -132,18 +138,24 @@ def check_render_clock():
     a = rc.advance(0.05, m)   # SAME model object (no new publish), hiccup
     ok &= check("render clock: hiccup clamps alpha to 1 (no extrapolate)",
                 a == 1.0, "alpha=%.3f" % a)
-    # Backlog drop: the sim's hiccup policy DROPS time (ACC_BACKLOG_CAP),
-    # so the sim clock can JUMP BACKWARD relative to a free-running
-    # estimate. The re-anchor on each new model must correct it — the
-    # alpha must recover to the sim's fraction on the next publish.
+    # Recovery: after a hiccup the estimate is ahead of the sim clock. The
+    # gentle EMA must EASE it back to the offset over a few frames (no
+    # permanent clamp, and no snap — the first recovery frame is still
+    # clamped at 1, then it relaxes to ~0).
     rc = _HostRenderClock()
     m = _model(STEP, 0.0)
     rc.advance(STEP, m)
     rc.advance(0.05, m)                       # same model: estimate ~0.05 ahead
-    a = rc.advance(STEP, _model(2 * STEP, 0.4))   # new model (fresh stamp)
-    ok &= check("render clock: re-anchors on a new model after a backlog "
-                "drop (no permanent clamp)", abs(a - 0.4) < 1e-9,
-                "alpha=%.3f (want 0.4)" % a)
+    a_first = rc.advance(STEP, _model(2 * STEP, 0.4))   # new model (fresh stamp)
+    a_last = a_first
+    for k in range(3, 21):                    # keep feeding new models
+        a_last = rc.advance(STEP, _model(k * STEP, 0.4))
+    ok &= check("render clock: hiccup recovery eases (no snap: first frame "
+                "still clamped at 1)", a_first == 1.0,
+                "first recovery alpha=%.3f (want 1.0)" % a_first)
+    ok &= check("render clock: hiccup recovery converges to the offset "
+                "(no permanent clamp)", abs(a_last - 0.0) < 0.05,
+                "alpha=%.3f (want ~0)" % a_last)
     # No model yet: alpha 0 (draw the latest state, no interpolation).
     ok &= check("render clock: no model -> alpha 0",
                 _HostRenderClock().advance(STEP, None) == 0.0)

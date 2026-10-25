@@ -74,34 +74,50 @@ class _HostRenderClock:
     """The host render thread's own interpolation clock.
 
     With the sim on the SimThread, the render thread no longer owns the
-    sim's accumulator — so it computes its OWN interpolation alpha
-    instead of reading the model's `step_alpha` (the sim's acc/STEP at
-    publish time). The model still CARRIES step_alpha (the parity tests
-    read it), and it is also what this clock re-anchors on.
+    sim's accumulator — so it computes its OWN interpolation alpha. The
+    model carries the local ship's prev+curr pose (the window [T - STEP, T],
+    where T = model.sim_time), so the latest model alone spans the
+    interpolation window; the alpha = (t - T) / STEP, clamped to [0, 1].
 
-    The model carries the local ship's prev+curr pose (the window
-    [T - STEP, T], where T = model.sim_time), so no 2-deep model ring is
-    needed — the latest model alone spans the interpolation window. The
-    clock keeps an estimate of the sim's CURRENT time (sim_time + the
-    in-progress step's fraction):
+    The clock keeps an estimate `t` of the sim's current time and FREE-RUNS
+    it at 1x real time every frame. On each NEW published model it applies a
+    gentle EMA correction toward the model's stamp plus a FIXED half-step
+    offset (T + 0.5*STEP) — NOT toward the sim's acc.
 
-      * on each NEW published model: re-anchor on the data —
-        t = model.sim_time + model.step_alpha * STEP (the sim's current
-        time at publish, ~1-2 ms old). Re-anchoring (instead of
-        free-running) is what keeps the estimate honest: the sim's
-        hiccup policy DROPS backlog time (ACC_BACKLOG_CAP), so a
-        free-running 1x-real-time estimate would drift ahead of the sim
-        clock after any stall and stay clamped at alpha=1 forever.
-      * between publishes (the same model re-read): advance t by the
-        frame's real dt (1x real time — the host's sim rate).
+    WHY not re-anchor to the sim's acc (the old design, plan_22 S3): the sim's
+    acc oscillates (0.086 -> 1.0) because the render thread and sim thread are
+    both ~60 Hz but not phase-locked. Re-anchoring t = T + acc*STEP on every
+    new model coupled the rendered pose to that oscillation, so the pose
+    lerp(prev, curr, alpha) fell short by (dalpha)*v*STEP (~6.85 px at
+    520 px/s) whenever alpha dropped — the local-ship stutter. Free-running +
+    a gentle EMA toward a CONSTANT offset keeps t honest (no drift after a
+    stall, no permanent clamp) WITHOUT inheriting the acc oscillation, so the
+    rendered pose is smooth.
 
-    The alpha is then (t - T) / STEP, clamped to [0, 1] (on a hiccup
-    render the LATEST simulated state, never extrapolate past the
-    current pose). In steady state t - T equals the sim's acc at publish
-    (plus ~1 ms of publish latency), so the alpha matches the old
-    sim-acc/STEP behavior exactly — the rendered pose is sim_now - STEP,
-    one step behind the sim's current time.
+    The EMA gain A=0.2 is gentle: in steady state the per-frame correction is
+    sub-pixel (the free-run already tracks T), and after a hiccup the pose
+    eases back to the sim's clock over a few frames instead of snapping.
+
+    The offset is 0 (track T, not T + 0.5*STEP): the steady-state alpha is
+    ~0, so the rendered pose is T - STEP (one full step behind the sim's
+    current time — the SAME latency the old design had). This is deliberate:
+    the free-run advances alpha by dt/STEP (~0.96) per frame, so if the
+    steady-state alpha were 0.5, a same-model re-read frame would push alpha
+    to ~1.46 (clamped to 1.0) and the pose would advance only 0.5*STEP
+    instead of ~0.96*STEP — a fall-short stutter. With steady-state alpha ~0,
+    a re-read frame only pushes alpha to ~0.96 (just under the clamp), so the
+    advance is preserved and the pose is smooth. (Measured on the plan_22 SP
+    capture: offset 0 -> 0 slow frames; offset 0.5*STEP -> 38 slow frames.)
     """
+
+    # EMA gain for the correction toward the model's stamp. Gentle (0.2): a
+    # single frame's correction is sub-pixel in steady state, and a hiccup
+    # recovery eases over a few frames instead of snapping.
+    _A = 0.2
+    # Fixed offset from the model's stamp (T) that the clock tracks. 0 keeps
+    # the steady-state alpha ~0 (full-step latency, matching the old design)
+    # so a re-read frame's free-run doesn't hit the alpha=1 clamp (see above).
+    _OFFSET = 0.0
 
     def __init__(self):
         self._curr = None    # the newest published model
@@ -115,19 +131,70 @@ class _HostRenderClock:
         Returns the interpolation alpha for this frame."""
         if model is None:
             return 0.0
-        if model is not self._curr:
-            # A new model was published: re-anchor on its stamp + the
-            # sim's in-progress fraction (the sim's current time at
-            # publish). Do NOT also add dt — the anchor is fresh.
+        T = model["sim_time"]
+        if self._t is None:
+            # First model: start at the steady-state target (alpha ~0.5).
             self._curr = model
-            self._t = model["sim_time"] + model["step_alpha"] * STEP
+            self._t = T + self._OFFSET
         else:
-            # Same model as last frame: advance the estimate at 1x real
-            # time (the host's sim rate) until the next publish.
+            # Free-run at 1x real time (the host's sim rate).
             self._t += dt
-        T = self._curr["sim_time"]
+            if model is not self._curr:
+                # A new model was published: gentle EMA correction toward the
+                # model's stamp + the fixed offset. Keeps t honest (no drift
+                # after a stall, no permanent clamp) WITHOUT re-anchoring to
+                # the sim's acc (which oscillates and caused the stutter).
+                self._curr = model
+                self._t += self._A * (T + self._OFFSET - self._t)
         alpha = (self._t - T) / STEP
         return max(0.0, min(1.0, alpha))
+
+
+def _render_clock_log(game, t, raw_dt, dt, model, alpha):
+    """Per-frame render-clock diagnostic (plan_22 S1, F3-gated, additive).
+
+    One row per render frame capturing the host/SP render clock's state so
+    tools/analyze_render_clock.py can separate the three snap causes:
+      C1 re-anchor pull-back, C2 same-model re-read sawtooth, C3 batched-wake
+      T-jump. Columns:
+        model_gen       monotonic id that increments on each NEW model object
+                        (robust to Python id() reuse; the analyzer uses it to
+                        find same-model re-read runs)
+        model_sim_time  T = model["sim_time"] (the model's sim clock)
+        model_step_alpha the sim's acc/STEP at publish time
+        alpha           the render clock's alpha this frame
+        ship_x/ship_y   the RENDERED local-ship pose (the thing that snaps)
+        ship_speed      |pack["vel"]| (normalizes wobble by speed)
+    No-op when model is None (before the first publish). Writes to
+    game._dbg_rc_log_path, opened lazily on the first row.
+    """
+    if model is None:
+        return
+    f = game._dbg_rc_log_f
+    if f is None:
+        f = open(game._dbg_rc_log_path, "w", newline="")
+        f.write("t,raw_dt,dt,model_gen,model_sim_time,model_step_alpha,"
+                "alpha,ship_x,ship_y,ship_speed\n")
+        game._dbg_rc_log_f = f
+    try:
+        pack = model["players"][game.local_index]
+    except (IndexError, KeyError):
+        return
+    # A new model object bumps the generation (id() alone can be reused by
+    # the allocator once the previous model is freed).
+    if getattr(game, "_rc_model_id", None) != id(model):
+        game._rc_model_id = id(model)
+        game._rc_model_gen = getattr(game, "_rc_model_gen", 0) + 1
+    a = max(0.0, min(1.0, alpha))
+    p0 = pack["prev_pos"]
+    p1 = pack["pos"]
+    rx = p0[0] + (p1[0] - p0[0]) * a
+    ry = p0[1] + (p1[1] - p0[1]) * a
+    vx, vy = pack["vel"]
+    speed = (vx * vx + vy * vy) ** 0.5
+    f.write("%.3f,%.4f,%.4f,%d,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f\n" % (
+        t, raw_dt, dt, game._rc_model_gen, model["sim_time"],
+        model["step_alpha"], alpha, rx, ry, speed))
 
 
 def _drain_sim_model(sim_model_q):
@@ -516,6 +583,14 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
         game._dbg_sim_log_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "host_sim_debug.csv")
         game._dbg_sim_log_f = None
+        # Per-frame render-clock diagnostic (plan_22 S1, F3-gated, additive).
+        # The host/SP render clock's alpha + model stamp + rendered local-ship
+        # pose, one row per frame — the data the client-side CSVs never had.
+        game._dbg_rc_log_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "render_clock.csv")
+        game._dbg_rc_log_f = None
+        game._rc_model_id = None
+        game._rc_model_gen = 0
         # T/V/G/R/F -> the sim process (the command Pipe). The sim process
         # applies the command at the top of its next iteration (the pipe
         # analog of the in-process sim_thread.command queue). The render
@@ -640,6 +715,10 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
             # (not the per-frame drain) so a 0-model frame still advances
             # the clock off the freshest world, not the frozen shell.
             alpha = render_clock.advance(dt, last_model)
+            # Per-frame render-clock diagnostic (plan_22 S1, F3-gated).
+            if game.debug_net:
+                _render_clock_log(game, time.time(), raw_dt, dt,
+                                  last_model, alpha)
             # The per-frame sim-clock diagnostic (F3-toggled, additive)
             # reads the published model + the render thread's alpha. One
             # line per frame: t (wall clock), raw_dt (real frame time),
@@ -719,6 +798,10 @@ def run_host(screen, font, big_font, clock, sfx, menu, seed,
         if getattr(game, "_dbg_sim_log_f", None) is not None:
             game._dbg_sim_log_f.close()
             game._dbg_sim_log_f = None
+        # Close the per-frame render-clock diagnostic log (plan_22 S1).
+        if getattr(game, "_dbg_rc_log_f", None) is not None:
+            game._dbg_rc_log_f.close()
+            game._dbg_rc_log_f = None
         # plan_13 shutdown ordering: stop the NET process BEFORE the sim process.
         # The net process writes to the sim's remote_input Pipe (net -> sim);
         # the Pipe must not be written after the sim is gone. Stopping the
@@ -1596,6 +1679,13 @@ def main():
         sim_thread = SimThread(game)
         sim_thread.start()
         render_clock = _HostRenderClock()
+        # Per-frame render-clock diagnostic (plan_22 S1, F3-gated, additive).
+        # Same log as the host loop — SP and host share the render clock.
+        game._dbg_rc_log_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "render_clock.csv")
+        game._dbg_rc_log_f = None
+        game._rc_model_id = None
+        game._rc_model_gen = 0
         # GC tuning (PERFORMANCE.md rec C): freeze the long-lived baseline
         # (surfaces, hulls, the Game, fonts, textures) so the cyclic GC
         # only scans the small set of per-frame temporaries. Trims the
@@ -1625,12 +1715,20 @@ def main():
                 # thread's own interpolation alpha (see _HostRenderClock).
                 model = sim_thread.latest_model
                 alpha = render_clock.advance(dt, model)
+                # Per-frame render-clock diagnostic (plan_22 S1, F3-gated).
+                if game.debug_net:
+                    _render_clock_log(game, time.time(), raw_dt, dt,
+                                      model, alpha)
                 # Draw the PUBLISHED model with the render thread's alpha
                 # (the model still carries the sim's step_alpha for the
                 # M1/M2b parity tests; draw() uses the render thread's).
                 game.draw(dt, {**model, "step_alpha": alpha} if model else None)
                 pygame.display.flip()
         finally:
+            # Close the per-frame render-clock diagnostic log (plan_22 S1).
+            if getattr(game, "_dbg_rc_log_f", None) is not None:
+                game._dbg_rc_log_f.close()
+                game._dbg_rc_log_f = None
             # Stop the sim thread (join it) before the menu loop resumes —
             # it owns the Game, and the next mode's Game must not be built
             # while a live sim thread is still stepping the old one.

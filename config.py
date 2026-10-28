@@ -213,6 +213,7 @@ MAX_FRAME_DT = 0.25  # clamp frame dt so a hiccup can't trigger a catch-up spira
 SNAPSHOT_INTERVAL = 1    # sim ticks between snapshots (1 -> 60 Hz at 60 Hz sim)
 INTERP_DELAY = 0.1       # seconds the remote render lags the sim
 NET_PORT = 7777          # default host listen port (2P host/client)
+LOBBY_PORT = 7778        # default lobby server port (plan_23: match relay)
 
 # The client's interpolation buffer depth (max snapshots kept). The render
 # point is `newest - delay`, and the adaptive delay can grow to

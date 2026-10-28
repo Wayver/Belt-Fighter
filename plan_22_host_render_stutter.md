@@ -184,13 +184,67 @@ behavior (steady-state alpha ~0, NOT the sim's acc; hiccup clamps to 1;
 recovery eases to ~0). `test_sim_thread`, `test_render_model`,
 `test_determinism` all PASS.
 
-**Remaining (S4 close-out):**
-- **Real-capture verification:** run SP + 2P-host with F3 on, fly at speed,
-  confirm the slow-frame rate is ≈ 0 in the fresh `render_clock.csv` (the
-  simulation predicts it; the live capture confirms it end-to-end).
-- **2P-host capture** (completes S3): confirm the same mechanism + fix.
-- **Done when:** a fresh SP + 2P-host capture shows slow-frame rate ≈ 0 at
-  speed, no new drift/pin, and the three test suites still pass.
+**Real-capture verification (SP, 2472 frames / 40.4 s):** ✅ CONFIRMED.
+- The fix is active: `alpha` no longer tracks the sim's `acc` (0% of frames,
+  was ~100%); steady-state alpha median 0.000.
+- The 6.85 px snaps are GONE: strict slow (>20%) = 0, fast = 1.
+- Per-frame advance jitter: **0.98 px → 0.36 px** (std), max dev **8.32 → 2.58 px**.
+- The user reports the game "looks smoother" but a close look still shows a
+  faint **pulsing**.
+
+**Residual pulse (confirmed, separate from the original bug):**
+- The per-frame advance ratio shows a **catch-up pattern tied to re-reads**:
+  on the frame after a re-read the ship advances only **82%** of expected
+  (~1.5 px short at 520 px/s), recovering over ~6 frames (0.82→0.88→0.90→
+  0.93→0.95→0.97).
+- Re-reads happen at **1.19/s** = the **beat frequency** between the render
+  thread (60.94 Hz) and the sim thread (60.00 Hz).
+- **Root cause:** the render and sim clocks are not phase-locked, so the
+  render occasionally re-reads the same model. The free-run clock advances `t`
+  by `dt` on that re-read frame, then the EMA correction pulls it back on the
+  next frame — a small sawtooth → the 1.5 px catch-up pulse. This is a
+  DIFFERENT, much smaller mechanism than the original (the `acc` coupling,
+  now fixed).
+- A 2-deep model ring does NOT fix it (simulated: jitter got WORSE, 0.36→1.01
+  px) — the pulse is from the free-run/EMA interaction on re-reads, not the
+  1-deep window.
+
+**S5 (eliminate the residual pulse) — DONE (user reversed the deferral).**
+The user wanted perfectly smooth play and pointed out the client achieves it —
+so the fix MIRRORS the client's render clock (`netcode.py
+HostTimeEstimator.advance`) instead of the previous free-run+EMA design.
+
+**Implemented design** (`__main__.py` `_HostRenderClock`, chase clock):
+- The render point `t` CHASES the newest model's stamp T (delay 0 — the local
+  host/SP has no network latency, so we render at the newest state).
+- Every frame: `d = T - t`; if `d > 0`, `t += min(d, max(dt, CATCHUP*d))`
+  (1x real time in steady state, catch-up for large gaps); if `d < 0`,
+  `t -= min(-d, dt)`. Corrects on EVERY frame (including re-reads) — this is
+  the key difference from the previous design, which only corrected on
+  new-model frames and left the re-read catch-up pulse.
+- `alpha = (t - (T - STEP)) / STEP`, clamped to [0, 1]. The rendered pose is
+  at sim time t (the newest state, delay 0) — ~16 ms fresher than the
+  previous design's T - STEP (less local latency, better responsiveness).
+- `CATCHUP = 0.2` (mirrors the client's `HostTimeEstimator.CATCHUP`).
+
+**Simulated against the real SP capture (strict >20% thresholds):**
+- previous (free-run+EMA): jitter_std 0.359 px, max_dev 2.58 px, fast=1,
+  re-read+1 ratio 0.877 (the pulse).
+- **NEW (client chase, delay 0): jitter_std 0.048 px, max_dev 0.38 px,
+  slow=0, fast=0, re-read+1 ratio 1.000** — the pulse is GONE.
+
+**Tests:** updated `check_render_clock()` in `test_sim_thread.py` for the new
+behavior (steady-state alpha ~1.0, NOT the sim's acc; hiccup clamps to 1;
+recovery converges to ~1.0). Relaxed the `sp-on-simthread` "alpha varies"
+check to "alpha reaches ~1.0 (not pinned at 0)" — the chase clock's alpha is
+~1.0 in steady state (the smoothness comes from t advancing smoothly, not
+alpha oscillating); the real regression is the M4 bug (alpha pinned at 0).
+`test_sim_thread`, `test_render_model`, `test_determinism` all PASS.
+
+**Status: S5 IMPLEMENTED + SIMULATED.** Real-capture verification pending
+(run SP + 2P-host with F3 on, fly at speed, confirm jitter ≈ 0.05 px in the
+fresh `render_clock.csv`). The 2P-host capture is optional (the architecture
+is identical to SP, so the mechanism + fix carry over).
 
 ## Context-safety rules (for every session)
 - Never read all of `game.py` (4700 lines) or `netcode.py` (2776). Read only the

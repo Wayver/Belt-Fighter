@@ -500,6 +500,21 @@ off-screen due to the 640 px margin). `RockShapeTracker` keeps the id in
 `_sent` across a cull-rect exit/re-entry, so the immutable verts are never
 re-sent.
 
+## Lobby (plan_23)
+- A standalone lobby server (`lobby.py`, `python -m ship5.lobby [port]`,
+  default LOBBY_PORT 7778) lets two players find each other, then they play
+  the EXISTING host-authoritative 2P game DIRECTLY — the lobby is a one-shot
+  match relay, never on the game's critical path (no game state, no game
+  traffic). It reuses the game wire's framing (4-byte length + JSON via
+  net.Connection). One open room at a time: `create` (host, carries its game
+  ip:port) + `join` (client) -> both get `match` (the joiner's carries the
+  host's game address — what it dials; the creator's carries the joiner's
+  source address, informational). Error paths: `full` (no room), `error`
+  (room already open / malformed / unknown type). The client's lobby
+  connection runs in a SPAWNED process (`lobby_client_main`, own GIL,
+  status Pipe — the net_process.py pattern), short-lived, never coexisting
+  with the game's net process. See plan_23_lobby.md.
+
 ## Misc
 - Enemy proxies: the caller builds lightweight proxies from the buffer's
   enemy entries (`.pos`, `.vel`, `.id`, `.ship` with power fields) and

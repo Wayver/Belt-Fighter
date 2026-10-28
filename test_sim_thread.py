@@ -103,21 +103,24 @@ def _model(sim_time, step_alpha):
 
 
 def check_render_clock():
-    """The render thread's own interpolation alpha (plan_22 S4): a
-    FREE-RUN clock with a gentle EMA correction toward the model's stamp +
-    a fixed half-step offset. The alpha = (t - T) / STEP, clamped to [0, 1].
+    """The render thread's own interpolation alpha (plan_22 S5): a
+    CHASE clock that mirrors the client's HostTimeEstimator. The render
+    point `t` chases the newest model's stamp T (delay 0 — the local
+    host/SP has no network latency, so we render at the newest state).
+    The alpha = (t - (T - STEP)) / STEP, clamped to [0, 1].
 
-    The key property (the plan_22 S3 fix): the alpha must NOT track the
-    sim's acc. The old design re-anchored t = T + acc*STEP on every new
-    model, coupling the rendered pose to the sim's acc oscillation (the
-    local-ship stutter). The new design free-runs t at 1x real time and
-    only eases it toward T (offset 0), so the steady-state alpha is ~0
-    regardless of the sim's acc."""
+    The key property (the plan_22 S3/S5 fix): the alpha must NOT track
+    the sim's acc. The old design re-anchored t = T + acc*STEP on every
+    new model, coupling the rendered pose to the sim's acc oscillation
+    (the local-ship stutter). The new design chases T at 1x real time
+    (with catch-up for large gaps), so the steady-state alpha is ~1.0
+    (rendering at the newest state) regardless of the sim's acc."""
     from .__main__ import _HostRenderClock
     ok = True
     # Steady state: publishes arrive every STEP with a VARYING sim acc
-    # fraction; the alpha must stay at the fixed offset (~0), NOT track
-    # the acc. This is the plan_22 fix — decoupling from the sim's acc.
+    # fraction; the alpha must stay at ~1.0 (rendering at the newest
+    # state), NOT track the acc. This is the plan_22 fix — decoupling
+    # from the sim's acc.
     rc = _HostRenderClock()
     worst = 0.0
     for i in range(1, 121):
@@ -125,10 +128,10 @@ def check_render_clock():
         acc_frac = (i % 10) / 10.0   # vary the sim's acc: 0.0, 0.1, ... 0.9
         m = _model(T, acc_frac)
         a = rc.advance(STEP, m)
-        worst = max(worst, abs(a - 0.0))
-    ok &= check("render clock: steady-state alpha is the fixed offset "
-                "(~0), NOT the sim's acc", worst < 1e-9,
-                "worst |a - 0| = %.2e" % worst)
+        worst = max(worst, abs(a - 1.0))
+    ok &= check("render clock: steady-state alpha is ~1.0 (newest state), "
+                "NOT the sim's acc", worst < 1e-9,
+                "worst |a - 1.0| = %.2e" % worst)
     # Hiccup: the estimate must never extrapolate past the current pose
     # (alpha clamped to 1), and a render hiccup (dt clamped to 50 ms)
     # must not drag it forward faster than 1x.
@@ -139,9 +142,9 @@ def check_render_clock():
     ok &= check("render clock: hiccup clamps alpha to 1 (no extrapolate)",
                 a == 1.0, "alpha=%.3f" % a)
     # Recovery: after a hiccup the estimate is ahead of the sim clock. The
-    # gentle EMA must EASE it back to the offset over a few frames (no
+    # chase must EASE it back to the newest state over a few frames (no
     # permanent clamp, and no snap — the first recovery frame is still
-    # clamped at 1, then it relaxes to ~0).
+    # clamped at 1, then it relaxes to ~1.0).
     rc = _HostRenderClock()
     m = _model(STEP, 0.0)
     rc.advance(STEP, m)
@@ -153,9 +156,9 @@ def check_render_clock():
     ok &= check("render clock: hiccup recovery eases (no snap: first frame "
                 "still clamped at 1)", a_first == 1.0,
                 "first recovery alpha=%.3f (want 1.0)" % a_first)
-    ok &= check("render clock: hiccup recovery converges to the offset "
-                "(no permanent clamp)", abs(a_last - 0.0) < 0.05,
-                "alpha=%.3f (want ~0)" % a_last)
+    ok &= check("render clock: hiccup recovery converges to the newest state "
+                "(no permanent clamp)", abs(a_last - 1.0) < 0.05,
+                "alpha=%.3f (want ~1.0)" % a_last)
     # No model yet: alpha 0 (draw the latest state, no interpolation).
     ok &= check("render clock: no model -> alpha 0",
                 _HostRenderClock().advance(STEP, None) == 0.0)
@@ -300,14 +303,17 @@ def main():
                 "thread draws the published model",
                 frames > 10 and g.sim_time > 0.2,
                 "frames=%d sim_time=%.3f" % (frames, g.sim_time))
-    ok &= check("sp-on-simthread: the render clock's alpha varies "
-                "(interpolation is live, not pinned)",
-                len(alphas) > 10 and max(alphas) > 0.01
-                and len(set(round(a, 4) for a in alphas)) > 2,
-                "alpha: n=%d min=%.4f max=%.4f distinct=%d"
+    # The chase clock's alpha is ~1.0 in steady state (rendering at the
+    # newest state, delay 0) — the smoothness comes from t advancing
+    # smoothly, not from alpha oscillating. The real regression to
+    # guard against is the M4 bug (alpha pinned at 0). So check that
+    # alpha reaches a reasonable value (~1.0), not that it varies.
+    ok &= check("sp-on-simthread: the render clock's alpha reaches the "
+                "newest state (~1.0), not pinned at 0 (M4 regression)",
+                len(alphas) > 10 and max(alphas) > 0.5,
+                "alpha: n=%d min=%.4f max=%.4f"
                 % (len(alphas), min(alphas) if alphas else -1,
-                   max(alphas) if alphas else -1,
-                   len(set(round(a, 4) for a in alphas))))
+                   max(alphas) if alphas else -1))
 
     # --- 2. INPUT: local (published) + remote (reference swap) ----------
     g = make_game(screen, font, big_font, light_tex, fog_surf, light_surf,

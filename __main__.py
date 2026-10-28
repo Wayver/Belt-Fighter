@@ -73,55 +73,40 @@ CADENCE_CAPTURE = "--cadence" in sys.argv
 class _HostRenderClock:
     """The host render thread's own interpolation clock.
 
-    With the sim on the SimThread, the render thread no longer owns the
-    sim's accumulator — so it computes its OWN interpolation alpha. The
-    model carries the local ship's prev+curr pose (the window [T - STEP, T],
-    where T = model.sim_time), so the latest model alone spans the
-    interpolation window; the alpha = (t - T) / STEP, clamped to [0, 1].
+    Mirrors the client's render clock (netcode.py HostTimeEstimator.advance):
+    a free-running render point `t` that CHASES the newest model's stamp T
+    (delay 0 — the local host/SP has no network latency, so we render at the
+    newest state). The chase advances `t` at 1x real time (capped by `dt`)
+    and applies a gentle catch-up (CATCHUP * d) only when `t` is behind by
+    more than ~5 frames, so a hiccup closes in ~5 frames instead of snapping.
 
-    The clock keeps an estimate `t` of the sim's current time and FREE-RUNS
-    it at 1x real time every frame. On each NEW published model it applies a
-    gentle EMA correction toward the model's stamp plus a FIXED half-step
-    offset (T + 0.5*STEP) — NOT toward the sim's acc.
+    The alpha = (t - (T - STEP)) / STEP, clamped to [0, 1]. The model carries
+    the local ship's prev+curr pose (the window [T - STEP, T]), so the
+    rendered pose is lerp(prev, curr, alpha) = the ship's position at sim
+    time t. Since t advances smoothly (1x real time), the rendered pose is
+    smooth — no stutter, no pulse.
 
-    WHY not re-anchor to the sim's acc (the old design, plan_22 S3): the sim's
-    acc oscillates (0.086 -> 1.0) because the render thread and sim thread are
-    both ~60 Hz but not phase-locked. Re-anchoring t = T + acc*STEP on every
-    new model coupled the rendered pose to that oscillation, so the pose
-    lerp(prev, curr, alpha) fell short by (dalpha)*v*STEP (~6.85 px at
-    520 px/s) whenever alpha dropped — the local-ship stutter. Free-running +
-    a gentle EMA toward a CONSTANT offset keeps t honest (no drift after a
-    stall, no permanent clamp) WITHOUT inheriting the acc oscillation, so the
-    rendered pose is smooth.
-
-    The EMA gain A=0.2 is gentle: in steady state the per-frame correction is
-    sub-pixel (the free-run already tracks T), and after a hiccup the pose
-    eases back to the sim's clock over a few frames instead of snapping.
-
-    The offset is 0 (track T, not T + 0.5*STEP): the steady-state alpha is
-    ~0, so the rendered pose is T - STEP (one full step behind the sim's
-    current time — the SAME latency the old design had). This is deliberate:
-    the free-run advances alpha by dt/STEP (~0.96) per frame, so if the
-    steady-state alpha were 0.5, a same-model re-read frame would push alpha
-    to ~1.46 (clamped to 1.0) and the pose would advance only 0.5*STEP
-    instead of ~0.96*STEP — a fall-short stutter. With steady-state alpha ~0,
-    a re-read frame only pushes alpha to ~0.96 (just under the clamp), so the
-    advance is preserved and the pose is smooth. (Measured on the plan_22 SP
-    capture: offset 0 -> 0 slow frames; offset 0.5*STEP -> 38 slow frames.)
+    WHY this design (plan_22 S5): the previous design (free-run + EMA
+    correction on new-model frames only) left a residual ~1.5 px pulse at the
+    render/sim beat frequency (1.19 Hz), because the EMA only corrected on
+    new-model frames, so `t` drifted ahead on a re-read frame and the
+    catch-up pulse appeared. The client's chase corrects on EVERY frame
+    (including re-reads), so `t` is always pulled back toward T — no pulse.
+    Measured on the plan_22 SP capture: the client-chase design gives
+    jitter_std=0.048 px, max_dev=0.38 px, slow=0, fast=0, re-read+1=1.000
+    (vs the previous design's 0.359 px / 2.58 px / 0.877).
     """
 
-    # EMA gain for the correction toward the model's stamp. Gentle (0.2): a
-    # single frame's correction is sub-pixel in steady state, and a hiccup
-    # recovery eases over a few frames instead of snapping.
-    _A = 0.2
-    # Fixed offset from the model's stamp (T) that the clock tracks. 0 keeps
-    # the steady-state alpha ~0 (full-step latency, matching the old design)
-    # so a re-read frame's free-run doesn't hit the alpha=1 clamp (see above).
-    _OFFSET = 0.0
+    # Catch-up gain: when `t` is behind the target by more than ~5 frames
+    # (d > 5*dt), advance by CATCHUP * d per frame (20% of the gap) instead
+    # of just dt (1x real time), so a large gap closes in ~5 frames. For
+    # small gaps (d < 5*dt), the cap is dt (1x real time), so the staircase
+    # smoothing is unchanged and the point never teleports. Mirrors the
+    # client's HostTimeEstimator.CATCHUP.
+    _CATCHUP = 0.2
 
     def __init__(self):
-        self._curr = None    # the newest published model
-        self._t = None       # the render-thread estimate of the sim's current time
+        self._t = None       # the render point (sim time being rendered)
 
     def advance(self, dt, model):
         """One render frame of real time `dt` (the CLAMPED dt — a hiccup
@@ -133,20 +118,20 @@ class _HostRenderClock:
             return 0.0
         T = model["sim_time"]
         if self._t is None:
-            # First model: start at the steady-state target (alpha ~0.5).
-            self._curr = model
-            self._t = T + self._OFFSET
+            # First model: sit at the newest stamp (delay 0).
+            self._t = T
         else:
-            # Free-run at 1x real time (the host's sim rate).
-            self._t += dt
-            if model is not self._curr:
-                # A new model was published: gentle EMA correction toward the
-                # model's stamp + the fixed offset. Keeps t honest (no drift
-                # after a stall, no permanent clamp) WITHOUT re-anchoring to
-                # the sim's acc (which oscillates and caused the stutter).
-                self._curr = model
-                self._t += self._A * (T + self._OFFSET - self._t)
-        alpha = (self._t - T) / STEP
+            # Chase the newest stamp (delay 0). The step is bounded by d
+            # (never overshoot) and by max(dt, CATCHUP*d) (1x real time in
+            # steady state, catch-up for large gaps). Corrects on EVERY
+            # frame (including re-reads), so t is always pulled back toward
+            # T — no drift, no pulse.
+            d = T - self._t
+            if d > 0.0:
+                self._t += min(d, max(dt, self._CATCHUP * d))
+            elif d < 0.0:
+                self._t -= min(-d, dt)
+        alpha = (self._t - (T - STEP)) / STEP
         return max(0.0, min(1.0, alpha))
 
 
